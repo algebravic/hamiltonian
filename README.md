@@ -17,7 +17,7 @@ vertices are labeled $1, \dots, n$, and where $(i,j) \in E$ if and
 only if $i+j$ is a positive square. Then A090460 asks for the number
 of Hamiltonian paths in $G$.
 
-The graph package ~Graphillion~ using ZDD's (Zero suppressed binary
+The graph package `Graphillion` using ZDD's (Zero suppressed binary
 decision diagrams) to represent the set of all Hamiltonian paths in a
 graph. It then can easily (linear in the size of the ZDD) calculated
 the number of such paths.
