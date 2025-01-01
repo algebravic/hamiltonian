@@ -11,7 +11,7 @@ algorithm.
 If $G$ is a connected undirected graph, a *Hamiltonian Path* is path
 consisting of edges which visit every vertex. More specifically, if
 $G = (V,E)$, then a Hamiltonian path is a sequence of distinct vertices
-`$v_1, \dots, v_n$`, where `$n=\#V$`, such that `$(v_i, v_{i+1}) \in E$`
+$`v_1, \dots, v_n`$, where $`n=\#V`$, such that $`(v_i, v_{i+1}) \in E`$
 for $i=1,\dots, n-1$.  Given $n$, construct the graph $G$ whose
 vertices are labeled $1, \dots, n$, and where $(i,j) \in E$ if and
 only if $|i-j|$ is a positive square. Then A090460 asks for the number
@@ -26,9 +26,9 @@ Posa rotation
 ==========================
 
 If $G=(V,E)$ is a connected undirected graph of cardinality $n$ and
-`$(v_1, \dots, v_n)$` is a Hamiltonian path, if there is are edges
-`$(v_n, v_i) \in E$` for $j \ne i$, then
-`$(v_1, \dots, v_i, v_n, v_{n-1}, \dots, v_{i+1})$` is also a
+$`(v_1, \dots, v_n)`$ is a Hamiltonian path, if there is are edges
+$`(v_n, v_i) \in E`$ for $j \ne i$, then
+$`(v_1, \dots, v_i, v_n, v_{n-1}, \dots, v_{i+1})`$ is also a
 Hamiltonian path.
 
 Question: Is it possible to compute the number of equivalence classes
