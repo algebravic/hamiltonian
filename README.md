@@ -14,7 +14,7 @@ $G = (V,E)$, then a Hamiltonian path is a sequence of distinct vertices
 $`v_1, \dots, v_n`$, where $`n=\#V`$, such that $`(v_i, v_{i+1}) \in E`$
 for $i=1,\dots, n-1$.  Given $n$, construct the graph $G$ whose
 vertices are labeled $1, \dots, n$, and where $(i,j) \in E$ if and
-only if $|i-j|$ is a positive square. Then A090460 asks for the number
+only if $i+j$ is a positive square. Then A090460 asks for the number
 of Hamiltonian paths in $G$.
 
 The graph package ~Graphillion~ using ZDD's (Zero suppressed binary
