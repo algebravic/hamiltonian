@@ -7,7 +7,7 @@ from math import floor, sqrt, ceil
 from itertools import product
 import networkx as nx
 from graphillion import GraphSet
-from .util import use_networkx
+from .util import get_count, GraphOrder
 
 def hamming_graph(num: int) -> nx.Graph:
     """
@@ -20,7 +20,6 @@ def hamming_graph(num: int) -> nx.Graph:
                            for _ in range(num))
     return gph
 
-def get_hamming_count(num: int):
+def get_hamming_count(num: int, order: GraphOrder = GraphOrder.Decreasing, **kwds):
 
-    gph = hamming_graph(num)
-    return GraphSet.paths(None, None, is_hamilton=True).len()
+    return get_count(hamming_graph(num), order = order, **kwds)
