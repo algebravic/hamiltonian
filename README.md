@@ -25,18 +25,21 @@ the number of such paths.
 Posa rotation
 ==========================
 
-If $G=(V,E)$ is a connected undirected graph of cardinality $n$ and
-$`(v_1, \dots, v_n)`$ is a Hamiltonian path, if there is are edges
-$`(v_n, v_i) \in E`$ for $j \ne i$, then
+Let $G=(V,E)$ be a connected undirected graph of cardinality $n$ and
+$`(v_1, \dots, v_n)`$ be a Hamiltonian path. If there is an edge
+$`(v_n, v_i) \in E`$ for $i \ne n-1$, then
 $`(v_1, \dots, v_i, v_n, v_{n-1}, \dots, v_{i+1})`$ is also a
-Hamiltonian path.
+Hamiltonian path. Note that this process is invertible: since there is
+an edge $`(v_{i+1}, v_i)`$ we can rotate back. Thus the set generated
+by all valid Posa rotations of a path forms a subgroup of the
+permutations. Is there an easy way to find what this is?
 
 Question: Is it possible to compute the number of equivalence classes
 under Posa rotation?
 
 More generally: A set of edges of $G$ is *full* if every vertex in $G$
 is incident to at least one edge, the set has cardinality $n-1$, and
-$n-2$ of the vertices in $G$ is incident to at exactly 2 edges, and
+$n-2$ of the vertices in $G$ are incident to at exactly 2 edges, and
 the remaining 2 vertices only incident to 1 edge. A Posa rotation of
 a full set consists in taking one of the end edges (the two edges
 incident to the 2 end vertices), and replacing it with another edge
