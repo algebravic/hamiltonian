@@ -12,6 +12,8 @@ class GraphOrder(Enum):
     Increasing = 1
     Decreasing = 2
     PathWidth = 3
+    Dfs = 4
+    Bfs = 5
 
 ODICT = {GraphOrder.Default: "default",
          GraphOrder.Increasing: "increasing degree",
@@ -49,7 +51,7 @@ def degree_order(gph: nx.Graph, decreasing: bool = True) -> Iterable[Hashable]:
         xgph = nx.subgraph(xgph, list(nds))
 
 def get_count(gph: nx.Graph, order: GraphOrder = GraphOrder.Increasing, **kwds):
-
+    traversal = "as-is"
     match order:
         case GraphOrder.Increasing:
             edges = degree_order(gph, decreasing = False)
@@ -57,9 +59,15 @@ def get_count(gph: nx.Graph, order: GraphOrder = GraphOrder.Increasing, **kwds):
             edges = degree_order(gph, decreasing = True)
         case GraphOrder.PathWidth:
             _, edges = pathwidth_order(gph, **kwds)
+        case GraphOrder.Dfs:
+            edges = degree_order(gph, decreasing = True)
+            traversal = "dfs"
+        case GraphOrder.Bfs:
+            edges = degree_order(gph, decreasing = True)
+            traversal = "bfs"
         case _:
             print("Illegal order, using sorted")
             edges = sorted(gph.nodes)
     myedges = nx.to_edgelist(gph, nodelist = edges)
-    GraphSet.set_universe(myedges, traversal = 'as-is')
+    GraphSet.set_universe(myedges, traversal = traversal)
     return GraphSet.paths(None, None, is_hamilton=True).len()
