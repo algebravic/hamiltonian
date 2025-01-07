@@ -1,3 +1,4 @@
+
 """Use the MILP formulation given in
   https://doc.sagemath.org/html/en/reference/graphs/sage/graphs/graph_decompositions/vertex_separation.html
 
@@ -188,7 +189,8 @@ class VertexSeparation:
         maxsat_solver = RC2Stratified if stratified else RC2
         max_solver = maxsat_solver(self._cnf, solver = solver, **kwds)
         soln = max_solver.compute()
-        print(f"Time = {max_solver.oracle_time()}")
+        if kwds.get('verbose', 0) > 0:
+            print(f"Time = {max_solver.oracle_time()}")
         pos = [self._pool.obj(_) for _ in soln if _ > 0]
         zvals = [_[1] for _ in pos if _ is not None and _[0] == 'z']
         yvals = {_[1] for _ in pos if _ is not None and _[0] == 'y'}
