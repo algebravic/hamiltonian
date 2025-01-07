@@ -10,7 +10,7 @@ networkx = "^3.4.2"
 graphillion = {git = "https://github.com/takemaru/graphillion.git", rev = "v2.0rc0"}
 python-sat = "^1.8.dev13"
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.dev.dependencies]
 pytest = ">=5.2"
 
 [tool.poetry.scripts]
