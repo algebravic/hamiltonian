@@ -149,12 +149,12 @@ class VertexSeparation:
                 for node in self._graph.nodes
                 for nbr in nx.neighbors(self._graph, node)])
 
-            self._cnf.extend([
-                [-self._pool.id(('y', (node, tme))),
-                 self._pool.id(('u', (node, tme))),
-                 self._pool.id(('y', (nbr, tme)))]
-                for node in self._graph.nodes
-                for nbr in nx.neighbors(self._graph, node)])
+            # self._cnf.extend([
+            #     [-self._pool.id(('y', (node, tme))),
+            #      self._pool.id(('u', (node, tme))),
+            #      self._pool.id(('y', (nbr, tme)))]
+            #     for node in self._graph.nodes
+            #     for nbr in nx.neighbors(self._graph, node)])
 
             # Objective to be minimized
             self._cnf.append([-self._pool.id(('z', tme))], weight=1)
