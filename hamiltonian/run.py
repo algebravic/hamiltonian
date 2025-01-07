@@ -30,7 +30,7 @@ def main():
         'dfs' : GraphOrder.Dfs,
         'bfs' : GraphOrder.Bfs
         }
-    with Timer(f'Get Square Count {args.nval}') as tim:
+    with Timer(f'Get Square Count {args.nval} using {args.order}') as tim:
         
         res = get_square_count(args.nval,
             order = order.get(args.order, GraphOrder.PathWidth),
