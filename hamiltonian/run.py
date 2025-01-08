@@ -5,7 +5,7 @@ import argparse
 from .squares import get_square_count, GraphOrder
 from .timer import Timer
 
-def main():
+def square_run():
     """
       The main command line.
     """
@@ -41,4 +41,4 @@ def main():
         print(f"Number of Hamiltonian Paths in Square Graph({args.nval}) = {res}")
     
 if __name__ == '__main__':
-    main()
+    square_run()
