@@ -2,11 +2,8 @@
   Number of hamiltonian paths of the hamming cube.
 """
 
-from typing import List
-from math import floor, sqrt, ceil
 from itertools import product
 import networkx as nx
-from graphillion import GraphSet
 from .util import get_count, GraphOrder
 
 def hamming_graph(num: int) -> nx.Graph:

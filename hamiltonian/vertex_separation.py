@@ -105,7 +105,6 @@ import networkx as nx
 from pysat.formula import IDPool, WCNF
 from pysat.examples.rc2 import RC2, RC2Stratified
 from pysat.card import CardEnc, EncType
-from pysat.solvers import Solver
 
 class VertexSeparation:
 
@@ -149,13 +148,6 @@ class VertexSeparation:
                  self._pool.id(('y', (nbr, tme)))]
                 for node in self._graph.nodes
                 for nbr in nx.neighbors(self._graph, node)])
-
-            # self._cnf.extend([
-            #     [-self._pool.id(('y', (node, tme))),
-            #      self._pool.id(('u', (node, tme))),
-            #      self._pool.id(('y', (nbr, tme)))]
-            #     for node in self._graph.nodes
-            #     for nbr in nx.neighbors(self._graph, node)])
 
             # Objective to be minimized
             self._cnf.append([-self._pool.id(('z', tme))], weight=1)
