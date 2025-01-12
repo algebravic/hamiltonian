@@ -22,6 +22,8 @@ def square_run():
                         help='Whether to use the minz option for RC2')
     parser.add_argument('--exhaust', type=bool, default=False,
                         help='Whether to use the exhaust option for RC2')
+    parser.add_argument('--stratified', type=bool, default=False,
+                        help='Whether to use the stratified solver')
     args = parser.parse_args()
     order = {
         'path_width': GraphOrder.PathWidth,
@@ -37,7 +39,8 @@ def square_run():
             verbose = args.verbose,
             minz = args.minz,
             exhaust = args.exhaust,
-            adapt = args.adapt)
+            adapt = args.adapt,
+            stratified = args.stratified)
         print(f"Number of Hamiltonian Paths in Square Graph({args.nval}) = {res}")
     
 if __name__ == '__main__':
