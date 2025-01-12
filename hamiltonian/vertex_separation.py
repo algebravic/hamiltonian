@@ -179,6 +179,7 @@ class VertexSeparation:
               **kwds) -> Tuple[int, Dict[Hashable, int]]:
 
         maxsat_solver = RC2Stratified if stratified else RC2
+        print(f"{'' if stratified else 'un'}stratified")
         max_solver = maxsat_solver(self._cnf, solver = solver, **kwds)
         soln = max_solver.compute()
         if kwds.get('verbose', 0) > 0:
