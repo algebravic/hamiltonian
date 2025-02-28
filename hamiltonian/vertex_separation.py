@@ -2,7 +2,11 @@
 """Use the MILP formulation given in
   https://doc.sagemath.org/html/en/reference/graphs/sage/graphs/graph_decompositions/vertex_separation.html
 
-  Note: According to the paper of Kinnersley:
+  Note: According to the paper of Kinnersley
+  (https://www.sciencedirect.com/science/article/abs/pii/002001909290234M)
+  'The vertex separation number of a graph equals its path-width'
+  Information Processing Letters
+  Volume 42, Issue 6, 24 July 1992, Pages 345-350
 
   V_L(i) is the number of vertices of G mapped to integers <= i that are adjacent
   to integer greater than i.
@@ -11,7 +15,7 @@
   mapped to integers > i that are adjacent to vertices <= i.  This seems to be the reverse
 
   This model is due to David Coudert
-  
+  https://www-sop.inria.fr/members/David.Coudert/code/graph-linear-ordering.shtml
   rendered as a MaxSat Problem using RC2.
 
   We describe below a mixed integer linear program (MILP) for
@@ -65,16 +69,17 @@
   Variables:
 
   . y[v,t] – variable set to 1 if v in S[t], and 0 otherwise. The order
-  of in the layout is the smallest t such that y[v,t] = 1
+  of v in the layout is the smallest t such that y[v,t] = 1
 
   . u[v,t] – variable set to 1 if v not in S[t] and has an in-neighbor
-  in S[t]. It is set to 0 otherwise.
+  in S[t]. It is set to 0 otherwise. [u is "bad" at time t if it doesn't
+  occur by time t, but has a neighbor that does]
 
   . x[v,t] – variable set to 1 if either v in S[t] or if v has an
   in-neighbor in S[t]. It is set to 0 otherwise.
 
   . z – objective value to minimize. It is equal to the maximum over
-  all step t of the number of vertices such that y[v,t] = 1.
+  all step t of the number of vertices such that u[v,t] = 1.
 
   MILP formulation:
 
@@ -91,6 +96,29 @@
   y[v,t] in {0,1}
   0 <= z <= n
 
+  Rewrite for undirected graphs
+  y[w,t] => x[v,t] for all w in nbr(v)
+  x[v,t] => y[w',t] OR u[w',t] for all w' in nbr(v)
+
+  So it looks like this amounts to
+  y[w,t] => y[w',t] OR u[w',t] for all w != w' in nbr(v)
+
+  Starting from the definition of u[v,t]
+
+  u[v,t] <==> (~y[v,t]) AND (OR[w in nbr(v)] y[w,t])
+
+  This amounts to
+
+  u[v,t] => ~y[v,t]
+  ~u[v,t] OR (OR[w in nbr(v)] y[w,t])
+
+  (y[v,t] OR (AND[w in nbr(v)] ~y[w,t]) OR u[v,t]
+
+  Expanding by distributivity:
+
+  y[v,t] OR ~y[w,t] OR u[v,t] for all w in nbr(v)
+
+  Since we are upper bounding the sum of u[v,t] we only need the latter.
 
   The vertex separation of G is given by the value of z, and the order
   of vertex v in the optimal layout is given by the smallest t for
@@ -108,13 +136,20 @@ from pysat.card import CardEnc, EncType
 
 class VertexSeparation:
 
-    def __init__(self, gph: nx.Graph, encode='totalizer'):
+    def __init__(self, gph: nx.Graph | nx.DiGraph,
+                 # limit: int | None = None,
+                 encode='totalizer'):
 
         self._graph = gph
         self._pool = IDPool()
         self._cnf = WCNF()
         self._size = len(self._graph.nodes)
+        self._nbr = self._graph.neighbors if isinstance(gph, nx.Graph) else self._graph.predecessors
+        # encoding for general cardinality constraints
         self._encode = getattr(EncType, encode, EncType.totalizer)
+        # limit is an upper bound on the pathwidth.
+        #self._limit = self._size if limit is None else limit
+        self._limit = self._size
         self._model()
         
     def _model(self):
@@ -123,54 +158,69 @@ class VertexSeparation:
         # #   x[v,t] <= x[v,t+1] for v in V, 1 <= t <= n-1
         # self._cnf.extend([
         #     [-self._pool.id(('x', _)), self._pool.id(('x', _[0], _[1] + 1))]
-        #     for _ in product(self._graph.nodes, range(1, self._size))])
+        #     for _ in product(self._graph.nodes, range(1, self._limit))])
         #   y[v,t] <= x[v,t] for v in V, 1 <= t <= n-1
         # self._cnf.extend([
         #     [-self._pool.id(('y', _)), self._pool.id(('x', _))]
-        #     for _ in product(self._graph.nodes, range(1, self._size + 1))])
+        #     for _ in product(self._graph.nodes, range(1, self._limit + 1))])
         #   y[v,t] <= y[v,t+1] for v in V, 1 <= t <= n-1
+
+        # Every node v is allocated to a unique time t
+        # The pathwidith of that allocation is the maximum distance
+        # between neighbors.
+        # There are three families of variables
+        # 1) y[v,t]: True if vertex v occurs in the path at time <= t
+        # 2) u[v,t]: True if vertex v occurs in the path at time > t and has a neighbor at time <= t
+        # 3) z[t]: Used for upper bounding successive sums of u[v,t]
+        # (v occurs at time <= t) => (v occurs at time <= t+1)
         self._cnf.extend([
             [-self._pool.id(('y', _)), self._pool.id(('y', (_[0], _[1] + 1)))]
-            for _ in product(self._graph.nodes, range(1, self._size))])
+            for _ in product(self._graph.nodes, range(1, self._limit))])
         # #   y[v,t] <= x[w,t] for v in V, w in N+(v), 1 <= t <=n
         # self._cnf.extend([
         #     [-self._pool.id(('y', _)), self._pool.id(('x', (nbr, _[1])))]
-        #     for _ in product(self._graph.nodes, range(1, self._size + 1))
+        #     for _ in product(self._graph.nodes, range(1, self._limit + 1))
         #     for nbr in nx.neighbors(self._graph, _[0])])
         # z non-increasing
         self._cnf.extend([[self._pool.id(('z', _)), -self._pool.id(('z', _ + 1))]
-                          for _ in range(1, self._size)])
-        zneg = [-self._pool.id(('z', _)) for _ in range(1, self._size + 1)]
-        for tme in range(1, self._size + 1):
+                          for _ in range(1, self._limit)])
+        zneg = [-self._pool.id(('z', _)) for _ in range(1, self._limit + 1)]
+        # (v occurs at time <= t) => (w occurs at time > t) OR (w occurs at time <= t)
+        # where w is a neighbor of v
+        for tme in range(1, self._limit + 1):
             self._cnf.extend([
                 [-self._pool.id(('y', (node, tme))),
-                 self._pool.id(('u', (node, tme))),
+                 self._pool.id(('u', (nbr, tme))),
+                 # self._pool.id(('u', (node, tme))),
                  self._pool.id(('y', (nbr, tme)))]
                 for node in self._graph.nodes
-                for nbr in nx.neighbors(self._graph, node)])
+                for nbr in self._nbr(node)])
 
             # Objective to be minimized
+            # Objective = sum_t z[t] to be minimized: take complement for maxsat
             self._cnf.append([-self._pool.id(('z', tme))], weight=1)
             #   sum(v in V) y[v,t] = t for 1 <= t <= n
+            # Exactly t nodes are allocated from 1 to t
             ylits = [self._pool.id(('y', (_, tme))) for _ in self._graph.nodes]
             self._cnf.extend(CardEnc.equals(lits = ylits,
                                             bound = tme,
                                             encoding = self._encode,
                                             vpool = self._pool))
+            # sum_t z[t] >= sum_v u[v,t_0]: left hand sum is an upper bound
             ulits = [self._pool.id(('u', (_, tme))) for _ in self._graph.nodes]
             #   sum(v in V) u[v,t] <= z for 1 <= t <= n
             self._cnf.extend(CardEnc.atmost(lits = ulits + zneg,
-                                            bound = self._size,
+                                            bound = self._limit,
                                             encoding = self._encode,
                                             vpool = self._pool))
         #   x[v,t] - y[v,t] <= u[v,t] for v in V, 1 <= t <= n
         # self._cnf.extend([
         #     [self._pool.id(('y', _)), self._pool.id(('u', _)), - self._pool.id(('x', _))]
-        #     for _ in product(self._graph.nodes, range(1, self._size + 1))])
+        #     for _ in product(self._graph.nodes, range(1, self._limit + 1))])
         #   x[v,t] - y[v,t] <= u[v,t] for v in V, 1 <= t <= n
         # self._cnf.extend([
         #     [- self._pool.id(('y', _)), self._pool.id(('u', _)), self._pool.id(('x', _))]
-        #     for _ in product(self._graph.nodes, range(1, self._size + 1))])
+        #     for _ in product(self._graph.nodes, range(1, self._limit + 1))])
 
 
     def solve(self,
@@ -192,7 +242,7 @@ class VertexSeparation:
             for node in self._graph.nodes}
         return len(zvals), yorder
         
-def pathwidth_order(gph: nx.Graph, **kwds) -> Tuple[int, List[Hashable]]:
+def pathwidth_order(gph: nx.Graph | nx.DiGraph, **kwds) -> Tuple[int, List[Hashable]]:
 
     """
       Produce a renumbered graph by means of optimal pathwidth (the
@@ -203,28 +253,29 @@ def pathwidth_order(gph: nx.Graph, **kwds) -> Tuple[int, List[Hashable]]:
     sep, renumber = vsp.solve(**kwds)
     return sep, [_[0] for _ in sorted(renumber.items(), key=lambda _: _[1])]
 
-def separation(gph: nx.Graph) -> int:
+def separation(gph: nx.Graph | nx.DiGraph) -> int:
 
     snodes = sorted(gph.nodes)
-
+    nbr = gph.neighbors if isinstance(gph, nx.Graph) else gph.predecessors
     val = 0
     # Calculate V_L(i)
     for ind in range(len(gph.nodes)):
         tnodes = set(snodes[: ind + 1])
         bad = {node for node in tnodes
-            if not set(nx.neighbors(gph, node)).issubset(tnodes)}
+            if not set(nbr(node)).issubset(tnodes)}
         val = max(len(bad), val)
     return val
 
-def alt_separation(gph: nx.Graph) -> int:
+def alt_separation(gph: nx.Graph | nx.DiGraph) -> int:
 
     snodes = sorted(gph.nodes)
+    nbr = gph.neighbors if isinstance(gph, nx.Graph) else gph.predecessors
 
     val = 0
     # Calculate V_L(i)
     for ind in range(len(gph.nodes)):
         tnodes = set(snodes[: ind + 1])
-        bad = set(chain(*(set(nx.neighbors(gph,node)).difference(tnodes)
+        bad = set(chain(*(set(nbr(node)).difference(tnodes)
                         for node in tnodes)))
         val = max(len(bad), val)
     return val
