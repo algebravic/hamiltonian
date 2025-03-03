@@ -190,8 +190,8 @@ class VertexSeparation:
         for tme in range(1, self._limit + 1):
             self._cnf.extend([
                 [-self._pool.id(('y', (node, tme))),
-                 self._pool.id(('u', (nbr, tme))),
-                 # self._pool.id(('u', (node, tme))),
+                 # self._pool.id(('u', (nbr, tme))),
+                 self._pool.id(('u', (node, tme))),
                  self._pool.id(('y', (nbr, tme)))]
                 for node in self._graph.nodes
                 for nbr in self._nbr(node)])
