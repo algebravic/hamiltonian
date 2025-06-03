@@ -86,10 +86,10 @@ $1 \le t < n$, and $`\sum_t (u[v,t] + \overline{z[t]}) \le n`$, where
 $\overline{z[t]}$ denote the negation.
 
 Finally, since we are minimizing an upper bound on $`\sum_t u[v,t]`$
-we only need the constraint $f(v) > t \& (\exists_{(v,w) \in E(G)}
-f(w) \le t) \Rightarrow u[v,t]$. This is now the same as
-$x[v,t] \vee (\bigwedge_{(v,w) \in E(G)} \overline{x[w,t]}) \vee
-u[v,t]$. Expanding out by distributivity, this yields the following
+we only need the constraint $`f(v) > t \& (\exists_{(v,w) \in E(G)}
+f(w) \le t) \Rightarrow u[v,t]`$. This is now the same as
+$`x[v,t] \vee (\bigwedge_{(v,w) \in E(G)} \overline{x[w,t]}) \vee
+u[v,t]`$. Expanding out by distributivity, this yields the following
 constraints:
 
 $x[v,t] \vee \overline{x[w,t]} \vee u[v,t]$ for all $(v,w) \in E(G)$.
