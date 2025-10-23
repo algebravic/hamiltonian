@@ -68,6 +68,6 @@ def get_count(gph: nx.Graph, order: GraphOrder = GraphOrder.Increasing, **kwds):
         case _:
             print("Illegal order, using sorted")
             edges = sorted(gph.nodes)
-    myedges = nx.to_edgelist(gph, nodelist = edges)
+    myedges = [_[:2] for _ in nx.to_edgelist(gph, nodelist = edges)]
     GraphSet.set_universe(myedges, traversal = traversal)
     return GraphSet.paths(None, None, is_hamilton=True).len()
