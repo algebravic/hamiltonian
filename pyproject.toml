@@ -1,21 +1,26 @@
-[tool.poetry]
+[project]
 name = "hamiltonian"
 version = "0.1.0"
 description = ""
-authors = ["Victor S. Miller <victorsmiller@gmail.com>"]
+authors = [{ name = "Victor S. Miller", email = "victorsmiller@gmail.com" }]
+requires-python = ">=3.13"
+dependencies = [
+    "networkx>=3.4.2,<4",
+    "graphillion",
+    "python-sat~=1.8.dev13",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.13"
-networkx = "^3.4.2"
-graphillion = {git = "https://github.com/takemaru/graphillion.git", rev = "v2.0rc0"}
-python-sat = "^1.8.dev13"
-
-[tool.poetry.group.dev.dependencies]
-pytest = ">=5.2"
-
-[tool.poetry.scripts]
+[project.scripts]
 square_run = "hamiltonian.run:square_run"
 
+[dependency-groups]
+dev = ["pytest>=5.2"]
+
+[tool.uv]
+
+[tool.uv.sources]
+graphillion = { git = "https://github.com/takemaru/graphillion.git", rev = "v2.0rc0" }
+
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
