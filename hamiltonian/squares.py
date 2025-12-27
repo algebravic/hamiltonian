@@ -22,10 +22,8 @@ A071983
 
 """
 from typing import List
-from math import floor, sqrt, ceil
+from math import floor
 import networkx as nx
-from graphillion import GraphSet
-from .util import get_count, GraphOrder
 
 def square_graph(num: int) -> nx.Graph:
     """
@@ -47,10 +45,6 @@ def square_graph(num: int) -> nx.Graph:
                         for jind in range(ind + 1, num + 1)
                         if ind + jind in squares))
     return gph
-
-def get_square_count(num: int, order: GraphOrder = GraphOrder.Decreasing, **kwds):
-
-    return get_count(square_graph(num), order = order, **kwds)
 
 def square_sequence(gph: nx.Graph) -> List[int]:
 
