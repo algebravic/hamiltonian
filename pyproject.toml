@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-square_run = "hamiltonian.run:square_run"
+tours = "hamiltonian.run:run"
 
 [dependency-groups]
 dev = ["pytest>=5.2"]
