@@ -50,7 +50,8 @@ def degree_order(gph: nx.Graph, decreasing: bool = True) -> Iterable[Hashable]:
         nds.remove(nxt)
         xgph = nx.subgraph(xgph, list(nds))
 
-def get_count(gph: nx.Graph, order: GraphOrder = GraphOrder.Increasing, **kwds):
+def get_count(gph: nx.Graph, order: GraphOrder = GraphOrder.Increasing,
+              cycles: bool = False, **kwds):
     traversal = "as-is"
     match order:
         case GraphOrder.Increasing:
@@ -70,4 +71,5 @@ def get_count(gph: nx.Graph, order: GraphOrder = GraphOrder.Increasing, **kwds):
             edges = sorted(gph.nodes)
     myedges = [_[:2] for _ in nx.to_edgelist(gph, nodelist = edges)]
     GraphSet.set_universe(myedges, traversal = traversal)
-    return GraphSet.paths(None, None, is_hamilton=True).len()
+    return (GraphSet.cycles(is_hamilton=True).len() if cycles
+            else GraphSet.paths(None, None, is_hamilton=True).len())
