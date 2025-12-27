@@ -4,7 +4,6 @@
 
 from itertools import product
 import networkx as nx
-from .util import get_count, GraphOrder
 
 def hamming_graph(num: int) -> nx.Graph:
     """
@@ -16,7 +15,3 @@ def hamming_graph(num: int) -> nx.Graph:
         gph.add_edges_from((pnt, pnt[: _] + (1 - pnt[_],) + pnt[_ + 1: ])
                            for _ in range(num))
     return gph
-
-def get_hamming_count(num: int, order: GraphOrder = GraphOrder.Decreasing, **kwds):
-
-    return get_count(hamming_graph(num), order = order, **kwds)
