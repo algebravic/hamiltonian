@@ -34,7 +34,7 @@ def run():
     parser.add_argument('--type', type=str, default = 'paths',
                         help='Hamiltonian cycles or paths')
     info = {'square' : ('Square', square_graph, 1),
-            'knight' : ('Knight', knight_graph, 1),
+            'knight' : ('Knight', knight_graph, 2),
             'hamming' : ('Hamming', hamming_graph, 1),
             'grid'    : ('Grid', grid_graph, 2)
             }
