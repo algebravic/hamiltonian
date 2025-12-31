@@ -9,7 +9,7 @@ def hamming_graph(num: int) -> nx.Graph:
     """
       The Hamming cube of dimension n
     """
-    gph = nx.Graph()
+    gph = nx.Graph(name=f'hamming({num})')
     for pnt in product(range(2), repeat=num):
 
         gph.add_edges_from((pnt, pnt[: _] + (1 - pnt[_],) + pnt[_ + 1: ])

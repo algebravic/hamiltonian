@@ -38,7 +38,7 @@ def square_graph(num: int) -> nx.Graph:
       Note: i + j = r^2  <==> 0 < r < floor(sqrt(2 * n - 1))
       
     """
-    gph = nx.Graph()
+    gph = nx.Graph(name = f'squares({num})')
     squares = {_ ** 2 for _ in range(2, floor(2 * num - 1))}
     gph.add_edges_from(((ind, jind)
                         for ind in range(1, num)
