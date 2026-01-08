@@ -5,7 +5,7 @@ from typing import List, Hashable, Tuple, Iterable
 from enum import Enum
 import networkx as nx
 from graphillion import GraphSet
-from vertex_separation import pathwidth_order
+from separation import pathwidth_order
 
 class GraphOrder(Enum):
     Default = 0

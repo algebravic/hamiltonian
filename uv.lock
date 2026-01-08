@@ -24,6 +24,7 @@ dependencies = [
     { name = "graphillion" },
     { name = "networkx" },
     { name = "python-sat" },
+    { name = "separation" },
 ]
 
 [package.dev-dependencies]
@@ -36,6 +37,7 @@ requires-dist = [
     { name = "graphillion", git = "https://github.com/takemaru/graphillion.git?rev=v2.0rc0" },
     { name = "networkx", specifier = ">=3.4.2,<4" },
     { name = "python-sat", specifier = "~=1.8.dev13" },
+    { name = "separation", git = "https://github.com/algebravic/separation.git" },
 ]
 
 [package.metadata.requires-dev]
@@ -49,6 +51,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/d7/4b/cbd8e699e64a6f16c
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ef/a6/62565a6e1cf69e10f5727360368e451d4b7f58beeac6173dc9db836a5b46/iniconfig-2.0.0-py3-none-any.whl", hash = "sha256:b6a85871a79d2e3b22d2d1b94ac2824226a63c6b741c88f7ae975f18b6778374", size = 5892, upload-time = "2023-01-07T11:08:09.864Z" },
 ]
+
+[[package]]
+name = "network"
+version = "0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cb/72/0769291af36fb6020d000337ee219456ea779c03cf3124831e901f12ed13/network-0.1.tar.gz", hash = "sha256:786b171895c3ecaaf05948c29e206ab99285f328f799c3bbc5e22a2805bfc27f", size = 2765, upload-time = "2017-02-28T23:37:45.558Z" }
 
 [[package]]
 name = "networkx"
@@ -94,14 +102,41 @@ wheels = [
 
 [[package]]
 name = "python-sat"
-version = "1.8.dev14"
+version = "1.8.dev26"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "six" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3e/44/92239f998dca4bff108e1feb824c53bbba6c9f87c6d3625268c3887cb302/python_sat-1.8.dev14.tar.gz", hash = "sha256:bbec9e329f2fc5b19b1517a9476b632dc1df39a755b29ddb805b78fad5f5d722", size = 5679262, upload-time = "2025-01-06T23:45:01.291Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d2/86/ba88012e81531648ba06422ba0e80c9c90cd5fd01ffcfa678567bc5bb920/python_sat-1.8.dev26.tar.gz", hash = "sha256:097c98aaf9b48fd19b07c5957860bfa3aae346f24d0eab9a18b1864448087e87", size = 5074098, upload-time = "2025-12-20T10:16:08.592Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/0f/26e6a1dfb84f8923327c0112f3da8379eb60cb667cf06dbf3eeacbc2d1d7/python_sat-1.8.dev14-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:8528ccef025a78916bdc652c99db0d44181a6ba5a20b01161cd5d634c6b6eefb", size = 1627414, upload-time = "2025-01-06T23:44:35.902Z" },
+    { url = "https://files.pythonhosted.org/packages/40/ef/0b0e706bcc08daf544d681391cb5891abafea1f00c880ce761345654d657/python_sat-1.8.dev26-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:28f377f875165721674ff9219c7a200d6c4752fd32f30bc94a834880916f3775", size = 1761500, upload-time = "2025-12-20T10:15:22.205Z" },
+    { url = "https://files.pythonhosted.org/packages/41/47/d75901289995c888b2e192966ddec27b09fa721bc59618e59c3bf9ffd5d7/python_sat-1.8.dev26-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:e2425aadcb9ba46704eff414cbd42c05425925f6e0a73307bfd450e383159460", size = 1620984, upload-time = "2025-12-20T10:15:23.484Z" },
+    { url = "https://files.pythonhosted.org/packages/13/73/05592e292a320cf5f8b67f9ad5c650d95465f5defc6e4bdd3b2448ea3354/python_sat-1.8.dev26-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5752402ce40cc066be4b04af8387df73f7116351fe6b506a5f48a6f28aca41f4", size = 2768476, upload-time = "2025-12-20T10:15:24.657Z" },
+    { url = "https://files.pythonhosted.org/packages/81/27/054ddeae44155eb2b744dc6fcfd65596f7557c3ccde9c011181429dd4be0/python_sat-1.8.dev26-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:99d8254c76b73ef4854ed707b1628ff4b053b3070b37b8e2e7b70545e61180b9", size = 2858535, upload-time = "2025-12-20T10:15:25.949Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/58/0cffa822fd5d8141a169580a879749445daea6e56847c3439395b3cecf19/python_sat-1.8.dev26-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:f8f6bc4fea91cc94ab445f2e628161152b09ef8fb0c8541d738e77c757e0b552", size = 3736005, upload-time = "2025-12-20T10:15:27.326Z" },
+    { url = "https://files.pythonhosted.org/packages/de/e4/55ea2662fe77c8bc5664bab1f30dafeaa38191bddde6c1ceb799a534d262/python_sat-1.8.dev26-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:579af45b194051a88b87c50d82e24f1dffbf09faf1d9a281c9045c42e9864d92", size = 3868398, upload-time = "2025-12-20T10:15:28.856Z" },
+    { url = "https://files.pythonhosted.org/packages/08/70/b2ecc1951ba425c7af5555cdc23635ed23865e79f1e3137715368896ef62/python_sat-1.8.dev26-cp313-cp313-win_amd64.whl", hash = "sha256:86d6da543910252e98ee9c75456dc002294ddd949db834e7d64acd7c9a1c5b66", size = 1339821, upload-time = "2025-12-20T10:53:37.867Z" },
+    { url = "https://files.pythonhosted.org/packages/43/c0/ea837e81fec7eccc5592a21d9ef4b81253d3c80d44e59a97156b136065df/python_sat-1.8.dev26-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:c6ec2f8e5bd3725b1739bedd22b233ea4446903d289eb14709a3cb71322fcac1", size = 1761754, upload-time = "2025-12-20T10:15:30.441Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/b7/08bed9d6bcb7324c4d7b54e89cd76d892c8cb583b8484051018c2f234f30/python_sat-1.8.dev26-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:35b88f11cdf27ffa56876706b41cb18ca1118eb8a896842605c1864286c362a6", size = 1621140, upload-time = "2025-12-20T10:15:32.972Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/c1/84f4806cff2fbac84646bc33f54fb11b191a3c30bd0a1f0e4e32a5fdcc5c/python_sat-1.8.dev26-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6a4376619fcbfc9bbe46d8c65f41bab0678bdcda2118b6efbec76102245d2e25", size = 2768129, upload-time = "2025-12-20T10:15:34.616Z" },
+    { url = "https://files.pythonhosted.org/packages/75/4d/6668bf3fe8598aad32ab1e1e0e6f50432aa8af8c5541277fe2eb93cf1d47/python_sat-1.8.dev26-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:99cd9fc7fc17e107c0128befb5ff34f7a3370fd7175519d767d8a37759f796ae", size = 2858595, upload-time = "2025-12-20T10:15:35.957Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/8e/63ad360f5cc453bb2f5a31e8297aec0bb58b462da35a4ea988c122aff64b/python_sat-1.8.dev26-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:4c0f8cf8659844684967eb23e67ec7288aa18a06fb8e69b917ee2cb52142a10a", size = 3736454, upload-time = "2025-12-20T10:15:37.371Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/8a/bd81174f8dc615157fa92d829789cee7f44f887c11a889e2ed872005c96c/python_sat-1.8.dev26-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:a6475ea7ea256c3f53c1bd2b8d75a2bc418dc99346d18fc6fb5cfad5be67c071", size = 3868778, upload-time = "2025-12-20T10:15:38.84Z" },
+    { url = "https://files.pythonhosted.org/packages/55/fe/75a68358c5a0b82342765412b9a0f636a8adb203bd4973c3fa2df0391745/python_sat-1.8.dev26-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:38fb4d1d131b568c45d2ad9d7c721d1977a856a80ae6b586a413af1a05c7282e", size = 1765062, upload-time = "2025-12-20T10:15:40.262Z" },
+    { url = "https://files.pythonhosted.org/packages/33/bb/8519cacda078aec5dbc075f49c4b7176ea7af7cfad708fe7313a6e5c1cc7/python_sat-1.8.dev26-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:29e64495d76e46ddbc3d8022b83916445610c4d8584aab60564f4f1666b5df80", size = 1623387, upload-time = "2025-12-20T10:15:41.547Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/a0/ed28c3c4e8fb59343edbdc97432add2d09db672dcafd5cf46410c110cdfb/python_sat-1.8.dev26-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8bbd11c5bc806286e3bd27efa4843035c4843f3a1ddbcfb438ef4639c3b11247", size = 2786679, upload-time = "2025-12-20T10:15:43.267Z" },
+    { url = "https://files.pythonhosted.org/packages/98/4a/782af821bfa6dc5ffdf7c6e2161403867108d40e27df1ac410e340c03295/python_sat-1.8.dev26-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:660e8e956134140fe36d4f1ab2cc7571697192f813b40f28cd53ea2a802088df", size = 2878998, upload-time = "2025-12-20T10:15:45.158Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/ab/401670561f99e040d7540755e690a79e05bcf592e89b342abf9b002dc45a/python_sat-1.8.dev26-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:21cd05a1dff39ed8f965c79237727ad5800f6704e889c83ab6c0ce0f0e99ad6b", size = 3751468, upload-time = "2025-12-20T10:15:46.539Z" },
+    { url = "https://files.pythonhosted.org/packages/f9/f5/917a295c060f8de1bb9f1a99fbcacc885ea1187371a3d3c337f7f3fa3d49/python_sat-1.8.dev26-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:9635ec47443dd8b8d96a71eec170268a7e4eb62d75486859a19b45f1a7047e77", size = 3883858, upload-time = "2025-12-20T10:15:48.005Z" },
+]
+
+[[package]]
+name = "separation"
+version = "0.1.0"
+source = { git = "https://github.com/algebravic/separation.git#56a21e6b6c43138f8b8718674332a3e503d12e52" }
+dependencies = [
+    { name = "network" },
+    { name = "python-sat" },
 ]
 
 [[package]]
