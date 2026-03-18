@@ -474,6 +474,102 @@ static inline u64 apply_elim_seq(u64 nk, int cur_fs,
    ====================================================================== */
 #define FUSED_MIN_STATES 200000
 
+
+/* ======================================================================
+   Write-combining buffer for ht_add_capped
+   -----------------------------------------------------------------------
+   Random writes to a large sparse hash table cause DRAM thrashing because
+   each write hashes to a different cache line across gigabytes of memory.
+
+   Instead of writing directly to nxt on every ht_add_capped call, we
+   accumulate writes in small per-bucket FIFO buffers.  Each bucket covers
+   1/WBUF_BUCKETS of the table's hash range, so when we flush a bucket we
+   touch a contiguous 1/WBUF_BUCKETS slice of the table — small enough to
+   reside in L3 cache after the first flush.
+
+   Subsequent flushes of the same bucket are warm L3 hits rather than cold
+   DRAM accesses.  The buffer itself (WBUF_BUCKETS × WBUF_DEPTH × 24 B)
+   fits in L2 cache, so accumulation and intra-bucket deduplication are
+   essentially free.
+
+   Only enabled when the target table is large enough that random writes
+   are likely to miss L3 (cap > WBUF_THRESH slots ≈ threshold where the
+   table exceeds ~4× L3 size at 24 B/slot).
+   ====================================================================== */
+
+#define WBUF_BUCKETS   1024    /* must be a power of 2                    */
+#define WBUF_DEPTH       16    /* entries per bucket before auto-flush     */
+#define WBUF_THRESH  (1<<23)   /* 8M slots ≈ 192 MB → enable buffering    */
+
+typedef struct { u64 key; u128 val; } WEntry;
+
+typedef struct {
+    WEntry  buf[WBUF_BUCKETS][WBUF_DEPTH];
+    int     cnt[WBUF_BUCKETS];
+    int     b_shift;      /* shift so (hash >> b_shift) & mask = bucket   */
+    size_t  mask;         /* WBUF_BUCKETS - 1                             */
+    HT     *ht;
+    size_t  slot_cap;
+} WriteBuf;
+
+static void wbuf_init(WriteBuf *wb, HT *ht, size_t slot_cap)
+{
+    memset(wb->cnt, 0, sizeof(wb->cnt));
+    wb->ht       = ht;
+    wb->slot_cap = slot_cap;
+    wb->mask     = WBUF_BUCKETS - 1;
+    /* Compute shift so that (ht_hash(key, cap) >> b_shift) gives the bucket.
+       cap is a power of 2; we want the top log2(WBUF_BUCKETS) bits of the
+       table index as the bucket number.                                    */
+    size_t cap = ht->cap;
+    int cap_bits = 0; while ((size_t)(1 << cap_bits) < cap) cap_bits++;
+    int b_bits   = 0; while ((size_t)(1 << b_bits) < WBUF_BUCKETS) b_bits++;
+    wb->b_shift  = (cap_bits > b_bits) ? (cap_bits - b_bits) : 0;
+}
+
+static void wbuf_flush_bucket(WriteBuf *wb, int b)
+{
+    int n = wb->cnt[b];
+    for (int i = 0; i < n; i++)
+        ht_add_capped(wb->ht, wb->buf[b][i].key, wb->buf[b][i].val, wb->slot_cap);
+    wb->cnt[b] = 0;
+}
+
+static void wbuf_flush_all(WriteBuf *wb)
+{
+    for (int b = 0; b < WBUF_BUCKETS; b++)
+        if (wb->cnt[b]) wbuf_flush_bucket(wb, b);
+}
+
+/* wbuf_add: accumulate a write.  Checks for the key in the bucket first so
+   duplicate keys are merged without hitting the table.  Flushes the bucket
+   to the table when it is full, then adds the new entry.                   */
+static void wbuf_add(WriteBuf *wb, u64 key, u128 val)
+{
+    int b   = (int)((ht_hash(key, wb->ht->cap) >> wb->b_shift) & wb->mask);
+    int n   = wb->cnt[b];
+    WEntry *bucket = wb->buf[b];
+
+    /* Check for existing key in buffer → accumulate in-place (L1 hit). */
+    for (int i = 0; i < n; i++) {
+        if (bucket[i].key == key) { bucket[i].val += val; return; }
+    }
+
+    /* Buffer has room: add entry. */
+    if (n < WBUF_DEPTH) {
+        bucket[n].key = key;
+        bucket[n].val = val;
+        wb->cnt[b]    = n + 1;
+        return;
+    }
+
+    /* Bucket full: flush to table, then add the new entry. */
+    wbuf_flush_bucket(wb, b);
+    bucket[0].key = key;
+    bucket[0].val = val;
+    wb->cnt[b]    = 1;
+}
+
 static void fused_sweep(HT *curr, HT *nxt,
                         int fs, int v_idx,
                         const int *widxs, int n_back,
@@ -484,9 +580,15 @@ static void fused_sweep(HT *curr, HT *nxt,
     int n_subsets = 1 << n_back;
     int final_fs  = fs - n_elim;
 
-    /* Pre-allocate at 1.5× curr->cnt, respecting the slot cap.  ht_add_capped
-       will grow if needed but never exceed slot_cap slots. */
+    /* Pre-allocate at 1.5× curr->cnt, respecting the slot cap. */
     ht_ensure_clear(nxt, curr->cnt + curr->cnt / 2 + 16, slot_cap);
+
+    /* Use write-combining buffer when nxt is large enough that random writes
+       would be DRAM-bound.  The buffer groups writes by hash-table region so
+       consecutive flushes of the same bucket stay warm in L3 cache.        */
+    int use_wbuf = (nxt->cap >= WBUF_THRESH);
+    WriteBuf wb;
+    if (use_wbuf) wbuf_init(&wb, nxt, slot_cap);
 
     for (size_t i = 0; i < curr->cap; i++) {
         if (!curr->keys[i]) continue;
@@ -497,7 +599,6 @@ static void fused_sweep(HT *curr, HT *nxt,
             u64 nk    = base;
             int valid = 1;
 
-            /* Apply selected back-edges for subset S. */
             for (int j = 0; j < n_back && valid; j++) {
                 if (!(S & (1 << j))) continue;
                 int nc_inc = 0;
@@ -507,17 +608,25 @@ static void fused_sweep(HT *curr, HT *nxt,
             }
             if (!valid) continue;
 
-            /* Apply elimination sequence (returns 0 if invalid or counted). */
             if (n_elim > 0) {
                 nk = apply_elim_seq(nk, fs, elim_idxs_desc, n_elim,
                                     step, n, cnt, total);
                 if (!nk) continue;
             }
 
-            ht_add_capped(nxt, nk, cnt, slot_cap);
-            if (ht_overflow) return;    /* abort: table cap exceeded */
+            if (use_wbuf)
+                wbuf_add(&wb, nk, cnt);
+            else
+                ht_add_capped(nxt, nk, cnt, slot_cap);
+
+            if (ht_overflow) {
+                if (use_wbuf) wbuf_flush_all(&wb);
+                return;
+            }
         }
     }
+
+    if (use_wbuf) wbuf_flush_all(&wb);
 }
 
 /* ======================================================================
