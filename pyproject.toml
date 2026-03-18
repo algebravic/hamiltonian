@@ -9,11 +9,13 @@ dependencies = [
     "graphillion",
     "python-sat~=1.8.dev13",
     "separation",
+    "cffi>=2.0.0",
 ]
 
 [project.scripts]
 tours = "hamiltonian.run:run_tours"
 write = "hamiltonian.run:write_graph"
+count = "hamiltonian.claude.ham_count:main"
 
 [dependency-groups]
 dev = ["pytest>=5.2"]
