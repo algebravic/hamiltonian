@@ -49,7 +49,7 @@ import pickle
 import os
 from collections import defaultdict
 
-from ham_ordering import build_graph, best_order, frontier_stats
+from .ham_ordering import build_graph, best_order, frontier_stats
 
 
 # ---------------------------------------------------------------------------
