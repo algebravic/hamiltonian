@@ -178,6 +178,11 @@ static void *ht_calloc_huge(size_t n, size_t sz)
     return p;
 }
 
+/* Set to 1 by ht_add_capped when the table hits the slot cap at ≥90%% load.
+   The main DP loop checks this flag after every fused_sweep and aborts
+   early if it is set, returning UINT64_MAX as a sentinel to Python.    */
+static volatile int ht_overflow = 0;
+
 static HT *ht_alloc(size_t cap)
 {
     HT *t   = (HT *)malloc(sizeof(HT));
@@ -209,8 +214,16 @@ static void ht_clear(HT *t)
    75% load vs old 50% load halves the wasted capacity, saving ~cap/2 slots
    = (8+16) * cap/2 bytes = 12 bytes/state in memory.
    Resize both UP and DOWN so post-peak steps don't keep giant tables. */
-#define LOAD_NUM 4   /* cap >= entries * LOAD_NUM / LOAD_DEN */
-#define LOAD_DEN 3   /* i.e. 75% load factor: cap = ceil(entries*4/3)  */
+/* Load-factor numerator/denominator (runtime-settable).
+   Default 4/3 → 75% load.  Pass --load-factor 85 to use 6/5 → 85%.
+   Higher load = smaller tables (saves memory) but more probes per insert.
+   Supported named values:
+     75  →  4/3   (2.5 avg probes, default)
+     80  →  5/4   (3.4 avg probes)
+     85  →  6/5   (5.5 avg probes)
+     90  →  9/8  (10.5 avg probes)                                       */
+static int LOAD_NUM = 4;
+static int LOAD_DEN = 3;
 
 /* ht_ensure_clear: size and clear t to hold at least min_entries at LOAD_DEN/LOAD_NUM
    load, but never exceed max_slots (the memory budget for this table).
@@ -276,6 +289,13 @@ static void ht_add_capped(HT *t, u64 key, u128 val, size_t max_slots)
                 t->cnt++;
             }
             free(ok); free(ov);
+        } else if (max_slots > 0 && t->cnt * 10 >= t->cap * 9) {
+            /* Resize was refused because we are already at the cap, and the
+               table has now reached ≥90%% occupancy.  At this load factor
+               linear probing degrades (avg >5 probes) and the risk of an
+               infinite loop approaches.  Set the global flag so the DP loop
+               can abort cleanly and report the problem to the caller.       */
+            ht_overflow = 1;
         }
     }
     size_t idx = ht_hash(key, t->cap);
@@ -495,6 +515,7 @@ static void fused_sweep(HT *curr, HT *nxt,
             }
 
             ht_add_capped(nxt, nk, cnt, slot_cap);
+            if (ht_overflow) return;    /* abort: table cap exceeded */
         }
     }
 }
@@ -648,8 +669,12 @@ void count_ham_paths_c(
     int        verbose,           /* 0 = silent; 1 = per-step stats to stderr */
     size_t     max_table_slots,   /* per-table slot cap (0 = unlimited)        */
     const char *checkpoint_path,  /* path for checkpoint file (NULL = disabled)*/
-    double     checkpoint_secs    /* save checkpoint every N seconds (0 = never)*/
+    double     checkpoint_secs,   /* save checkpoint every N seconds (0 = never)*/
+    int        load_num,          /* load factor numerator   (e.g. 4 for 75%)  */
+    int        load_den           /* load factor denominator (e.g. 3 for 75%)  */
 ) {
+    /* Apply caller-specified load factor (e.g. 4/3 = 75%, 6/5 = 85%). */
+    if (load_num > 0 && load_den > 0) { LOAD_NUM = load_num; LOAD_DEN = load_den; }
     size_t slot_cap = max_table_slots;
     int  frontier[MAX_FS_FAST + 2];
     int *fidx = (int *)malloc((size_t)(n + 1) * sizeof(int));
@@ -761,6 +786,13 @@ void count_ham_paths_c(
                         widxs, n_back,
                         elim_idxs_desc, n_elim,
                         step, n, &total, slot_cap);
+                if (ht_overflow) {
+                    fprintf(stderr,
+                        "# ERROR: slot cap overflow at step %d "
+                        "(table >=90%%%% full).\n"
+                        "# Increase --mem-reserve and rerun.\n", step);
+                    *res_lo = *res_hi = UINT64_MAX; goto cleanup;
+                }
             { HT *tmp = curr; curr = nxt; nxt = tmp; }
         } else {
             /* Separate: sequential edge passes then elimination. */
@@ -965,7 +997,8 @@ def _get_lib():
             const int *adj_off, const int *adj_dat,
             uint64_t *res_lo, uint64_t *res_hi,
             int verbose, size_t max_table_slots,
-            const char *checkpoint_path, double checkpoint_secs);
+            const char *checkpoint_path, double checkpoint_secs,
+            int load_num, int load_den);
     """)
     lib = ffi.dlopen(so_path)
     _LIB_CACHE[src_hash] = (lib, ffi)
@@ -1022,9 +1055,18 @@ def _compute_slot_cap(reserve_bytes: int = 2 << 30) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Named load-factor presets: percent → (num, den)
+_LOAD_FACTOR_PRESETS = {
+    75: (4, 3),
+    80: (5, 4),
+    85: (6, 5),
+    90: (9, 8),
+}
+
 def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
                               verbose: bool = False,
                               mem_reserve_gb: float = 2.0,
+                              load_factor: int = 75,
                               checkpoint_path: str = "",
                               checkpoint_secs: float = 300.0) -> int:
     """Count undirected Hamiltonian paths in G_n via the optimised C DP.
@@ -1049,6 +1091,11 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
 
     # Compute per-table slot cap from available RAM
     max_slots = _compute_slot_cap(reserve_bytes=int(mem_reserve_gb * (1 << 30)))
+    lf_num, lf_den = _LOAD_FACTOR_PRESETS.get(load_factor, (4, 3))
+    load_num, load_den = lf_num, lf_den
+    if verbose and load_factor != 75:
+        import sys
+        print(f"# Load factor: {load_factor}% ({lf_num}/{lf_den})", file=sys.stderr)
     if verbose and max_slots:
         import sys
         avail_gb = _available_ram_bytes() / (1 << 30)
@@ -1085,6 +1132,7 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
         n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
         c_res_lo, c_res_hi, int(verbose), ffi.cast("size_t", max_slots),
         c_ckpt, ffi.cast("double", checkpoint_secs),
+        load_num, load_den,
     )
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:

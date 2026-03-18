@@ -214,6 +214,12 @@ def parse_args():
                    help="Path for checkpoint file.")
     p.add_argument("--checkpoint-interval", type=float, default=300.0, metavar="SECS",
                    help="Save a checkpoint at most every SECS seconds (default 300).")
+    p.add_argument("--load-factor", type=int, default=75, metavar="PCT",
+                   choices=[75, 80, 85, 90],
+                   help="Hash-table load factor %% (75/80/85/90, default 75). "
+                        "Higher values reduce memory usage at the cost of more "
+                        "hash probes per insert.  85 is recommended on machines "
+                        "where peak two-table memory exceeds available RAM.")
     return p.parse_args()
 
 
@@ -281,6 +287,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
         verbose=verbose,
         checkpoint_path=ckpt_path,
         checkpoint_secs=args.checkpoint_interval,
+        load_factor=args.load_factor,
     )
     t_dp = time.time() - t_dp
 
