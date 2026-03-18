@@ -7,6 +7,7 @@ from .util import GraphOrder, get_count, use_networkx, relabeled_graph
 from .squares import square_graph
 from .knights import knight_graph
 from .hamming import hamming_graph
+from .kings import king_graph
 from .grid import grid_graph
 from .timer import Timer
 from .to_sgb import write_sgb
@@ -28,7 +29,8 @@ def write_graph():
     families = {'knight': (knight_graph, 2),
                 'square': (square_graph, 1),
                 'hamming': (hamming_graph, 1),
-                'grid'   : (grid_graph, 2)
+                'grid'   : (grid_graph, 2),
+                'king'   : (king_graph, 2)
                 }
     args = parser.parse_args()
     if args.graph not in families:
@@ -71,7 +73,8 @@ def run_tours():
     info = {'square' : ('Square', square_graph, 1),
             'knight' : ('Knight', knight_graph, 2),
             'hamming' : ('Hamming', hamming_graph, 1),
-            'grid'    : ('Grid', grid_graph, 2)
+            'grid'    : ('Grid', grid_graph, 2),
+            'king'   : ('King', king_graph, 2)
             }
     args = parser.parse_args()
     name, fcn, nargs = info.get(args.graph, info['square'])
