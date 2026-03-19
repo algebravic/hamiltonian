@@ -165,9 +165,11 @@ static inline u64 eliminate_slot(u64 key, int u_idx, int fs)
      Starts at gd=4 (16 entries).  Doubles lazily during splits.
    ====================================================================== */
 
-#define EH_BKT_CAP   128     /* entries per bucket: 128×24B = 3072B data   */
+#define EH_BKT_CAP    32     /* entries per bucket: 32×24B = 768B data       */
+                             /* avg scan = 12 keys/insert @ 75%% fill        */
+                             /* bucket = 776B → fits two L1 cache lines      */
 #define EH_INIT_GD     4     /* initial global depth → 16 root buckets       */
-#define EH_SLAB_N   4096     /* buckets per slab (≈12.6 MB per slab)         */
+#define EH_SLAB_N   4096     /* buckets per slab (≈3.2 MB per slab)          */
 
 typedef struct EHBkt {
     u64  k[EH_BKT_CAP];     /* keys:   1024 bytes                           */
@@ -292,7 +294,7 @@ static void eh_split(EHT *t, size_t dir_idx) {
         free(t->dir);
         t->dir = nd;
         t->gd++;
-        /* old pointer is still valid (it's a bucket, not a dir slot). */
+        dir_idx <<= 1;   /* both 2*old and 2*old+1 point to old; use either */
     }
 
     /* 2. Allocate sibling bucket and increment local depths. */
@@ -302,9 +304,7 @@ static void eh_split(EHT *t, size_t dir_idx) {
     old->ld = new_ld;
 
     /* 3. Redistribute entries based on bit (64 - new_ld) of their hash.
-          Entries with that bit = 0 stay in old; bit = 1 go to nw.
-          We write kept entries into temporary arrays then copy back,
-          avoiding aliasing issues when nw aliases old's slab region.     */
+          Entries with that bit = 0 stay in old; bit = 1 go to nw.      */
     u64  ks[EH_BKT_CAP];
     u128 vs[EH_BKT_CAP];
     int  nkept = 0;
@@ -324,16 +324,25 @@ static void eh_split(EHT *t, size_t dir_idx) {
     memcpy(old->k, ks, (size_t)nkept * sizeof(u64));
     memcpy(old->v, vs, (size_t)nkept * sizeof(u128));
 
-    /* 4. Update directory.
-          Entry i covers hashes whose top-gd bits equal i.
-          Bit (gd - new_ld) of i is the newly split bit.
-          Entries pointing to old with that bit = 1 → redirect to nw.    */
-    size_t dsz  = (size_t)1 << t->gd;
-    int    sbit = t->gd - new_ld;   /* >= 0: guaranteed by step 1 */
-    for (size_t i = 0; i < dsz; i++) {
-        if (t->dir[i] == old && ((i >> sbit) & 1ULL))
-            t->dir[i] = nw;
-    }
+    /* 4. O(range/2) directory update — the critical fix.
+          Previously we scanned all 2^gd directory entries looking for
+          pointers to old (O(2^gd) per split → O(n_states * gd) total).
+          With 141K splits at gd=18, that was 37 billion iterations.
+
+          Correct approach: the directory entries pointing to old form a
+          contiguous power-of-2-aligned range of size 2^(gd-ld).
+          After the split we only need to redirect the upper half to nw.
+
+          range = 2^(gd - ld)   entries formerly pointing to old
+          base  = dir_idx & ~(range-1)  first such entry
+          upper half [base + range/2, base + range) → redirect to nw
+
+          Total amortised work: O(n_final_buckets) across all splits,
+          because each directory entry is redirected at most once.        */
+    size_t range = (size_t)1 << (t->gd - ld);
+    size_t base  = dir_idx & ~(range - 1);
+    for (size_t i = base + (range >> 1); i < base + range; i++)
+        t->dir[i] = nw;
 }
 
 /* Insert key → accumulate val.  Splits automatically if bucket is full.
