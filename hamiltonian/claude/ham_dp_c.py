@@ -383,68 +383,81 @@ static u128 *eh_lookup(EHT *t, u64 key) {
 }
 
 /* ======================================================================
-   Write-combining buffer for eh_insert
+   Radix-sort insert buffer (RSortBuf)
    -----------------------------------------------------------------------
-   At large state counts the EHT bucket pool exceeds L3 (24 MB on M3 Pro).
-   Every eh_insert on a cold table causes a full bucket load from DRAM
-   (776B = 12 cache lines), even though only ~12 of the 32 keys are live.
+   Root problem: EH buckets are allocated in insertion order, not hash
+   order.  Even if we group writes by hash prefix (write buffer), flushing
+   a slot still causes ~1024 independent cold DRAM loads — one per bucket
+   in that hash range — because those buckets are scattered across slabs.
 
-   The write buffer groups pending inserts by the top WBUF_BITS bits of
-   eh_hash(key).  When a buffer slot is flushed all its entries share the
-   same hash prefix, so they map to the same contiguous slice of directory
-   entries and EH buckets.  That slice stays warm in L2/L3 across the
-   flush, turning cold-DRAM loads into cache hits for subsequent entries.
+   The write buffer therefore gave only 1.20× speedup instead of the
+   expected ~2×, because the locality benefit was deferred to flush time
+   and then lost to the non-contiguous layout.
 
-   At WBUF_BUCKETS=1024 and gd=20, each flush touches 2^10 = 1K EH
-   buckets = 793 KB — fits in the M3 Pro's 16 MB L2.
-   The buffer itself (1024 × 16 × 24 B = 384 KB) stays in L1/L2.
+   FIX: collect ALL outputs from a sweep into 1024 dynamic slot arrays
+   keyed by the top RSORT_BITS bits of eh_hash(key).  After the sweep,
+   flush slots 0 → 1023 in order.  When slot b is flushed, every entry
+   maps to an EH bucket in directory range [b·2^(gd-10), (b+1)·2^(gd-10)).
+   All entries for a given EH bucket are consecutive in the slot array
+   (same hash prefix → same bucket), so each bucket is loaded from DRAM
+   exactly once and stays warm for all its entries before we move on.
 
-   Enabled when curr->cnt > WBUF_THRESH (= 512 K states), beyond which
-   the bucket pool exceeds L3 and random inserts become DRAM-bound.
+   Cost:  O(N) pointer writes during collect + O(N) reads during flush.
+   Reads are sequential within each slot (prefetchable).
+   Memory: N × 24 B total across all slots (proportional to output).
+   Splits are deferred to the flush phase — each bucket is fully populated
+   in one pass, minimising split count.
+
+   Enabled when curr->cnt ≥ RSORT_THRESH.  Below that the bucket pool
+   fits in L3 and direct eh_insert is faster (no allocation overhead).
    ====================================================================== */
-#define WBUF_BUCKETS    1024          /* must be a power of 2              */
-#define WBUF_DEPTH        16          /* entries per slot before flush      */
-#define WBUF_BITS         10          /* log2(WBUF_BUCKETS)                 */
-#define WBUF_THRESH   (1 << 19)       /* 512 K states → enable buffering    */
+#define RSORT_BITS    10
+#define RSORT_SLOTS   (1 << RSORT_BITS)   /* 1024 */
+#define RSORT_THRESH  (1 << 19)            /* 512 K states */
 
 typedef struct { u64 key; u128 val; } WEntry;
 
 typedef struct {
-    WEntry  buf[WBUF_BUCKETS][WBUF_DEPTH];
-    int     cnt[WBUF_BUCKETS];
-    EHT    *t;
-} EHWriteBuf;
+    WEntry *e;
+    int     cnt;
+    int     cap;
+} RSortSlot;
 
-static void ehwb_init(EHWriteBuf *wb, EHT *t) {
-    memset(wb->cnt, 0, sizeof(wb->cnt));
-    wb->t = t;
+typedef struct {
+    RSortSlot slots[RSORT_SLOTS];
+    EHT      *t;
+} RSortBuf;
+
+static void rsort_init(RSortBuf *rb, EHT *t) {
+    memset(rb->slots, 0, sizeof rb->slots);
+    rb->t = t;
 }
 
-static void ehwb_flush_slot(EHWriteBuf *wb, int b) {
-    int n = wb->cnt[b];
-    for (int i = 0; i < n; i++)
-        eh_insert(wb->t, wb->buf[b][i].key, wb->buf[b][i].val);
-    wb->cnt[b] = 0;
-}
-
-static void ehwb_flush_all(EHWriteBuf *wb) {
-    for (int b = 0; b < WBUF_BUCKETS; b++)
-        if (wb->cnt[b]) ehwb_flush_slot(wb, b);
-}
-
-/* Buffer a write, pre-deduplicating within the slot (L1-resident scan). */
-static inline void ehwb_add(EHWriteBuf *wb, u64 key, u128 val) {
-    int     b    = (int)(eh_hash(key) >> (64 - WBUF_BITS));
-    int     n    = wb->cnt[b];
-    WEntry *slot = wb->buf[b];
-    for (int i = 0; i < n; i++) {
-        if (slot[i].key == key) { slot[i].val += val; return; }
+static inline void rsort_add(RSortBuf *rb, u64 key, u128 val) {
+    int        b  = (int)(eh_hash(key) >> (64 - RSORT_BITS));
+    RSortSlot *sl = &rb->slots[b];
+    if (sl->cnt == sl->cap) {
+        sl->cap = sl->cap ? sl->cap * 2 : 256;
+        sl->e   = (WEntry *)realloc(sl->e, (size_t)sl->cap * sizeof(WEntry));
     }
-    if (n < WBUF_DEPTH) {
-        slot[n].key = key; slot[n].val = val; wb->cnt[b] = n + 1; return;
+    sl->e[sl->cnt].key = key;
+    sl->e[sl->cnt].val = val;
+    sl->cnt++;
+}
+
+/* Flush all slots in ascending order (0 → 1023) then free their memory.
+   Slot b covers EH directory range [b·2^(gd-10), (b+1)·2^(gd-10)).
+   Entries within a slot are inserted sequentially: each distinct EH bucket
+   in that range is loaded from DRAM once and stays warm for all its entries
+   before we advance to the next range.                                     */
+static void rsort_flush(RSortBuf *rb) {
+    for (int b = 0; b < RSORT_SLOTS; b++) {
+        RSortSlot *sl = &rb->slots[b];
+        for (int i = 0; i < sl->cnt; i++)
+            eh_insert(rb->t, sl->e[i].key, sl->e[i].val);
+        free(sl->e);
+        sl->e = NULL; sl->cnt = sl->cap = 0;
     }
-    ehwb_flush_slot(wb, b);
-    slot[0].key = key; slot[0].val = val; wb->cnt[b] = 1;
 }
 
 /* Iterate all unique buckets via pool traversal (no directory dedup needed).
@@ -573,9 +586,9 @@ static void fused_sweep(EHT *curr, EHT *nxt,
 
     eh_reset(nxt);
 
-    int use_wbuf = (curr->cnt >= WBUF_THRESH);
-    EHWriteBuf wb;
-    if (use_wbuf) ehwb_init(&wb, nxt);
+    int use_rsort = (curr->cnt >= RSORT_THRESH);
+    RSortBuf rb;
+    if (use_rsort) rsort_init(&rb, nxt);
 
     EH_FOR(curr, bkt) {
         for (int i = 0; i < bkt->cnt; i++) {
@@ -601,13 +614,13 @@ static void fused_sweep(EHT *curr, EHT *nxt,
                     if (!nk) continue;
                 }
 
-                if (use_wbuf) ehwb_add(&wb, nk, cnt);
-                else          eh_insert(nxt, nk, cnt);
+                if (use_rsort) rsort_add(&rb, nk, cnt);
+                else           eh_insert(nxt, nk, cnt);
             }
         }
     } EH_END
 
-    if (use_wbuf) ehwb_flush_all(&wb);
+    if (use_rsort) rsort_flush(&rb);
 }
 
 /* ======================================================================
@@ -801,18 +814,18 @@ void count_ham_paths_c(
 
         /* ---- A. Introduce v ------------------------------------------ */
         {
-            int use_wbuf_a = (curr->cnt >= WBUF_THRESH);
-            EHWriteBuf wb_a;
+            int use_rsort_a = (curr->cnt >= RSORT_THRESH);
+            RSortBuf rb_a;
             eh_reset(nxt);
-            if (use_wbuf_a) ehwb_init(&wb_a, nxt);
+            if (use_rsort_a) rsort_init(&rb_a, nxt);
             EH_FOR(curr, bkt) {
                 for (int i = 0; i < bkt->cnt; i++) {
                     u64 nk = introduce(bkt->k[i], fs);
-                    if (use_wbuf_a) ehwb_add(&wb_a, nk, bkt->v[i]);
-                    else            eh_insert(nxt, nk, bkt->v[i]);
+                    if (use_rsort_a) rsort_add(&rb_a, nk, bkt->v[i]);
+                    else             eh_insert(nxt, nk, bkt->v[i]);
                 }
             } EH_END
-            if (use_wbuf_a) ehwb_flush_all(&wb_a);
+            if (use_rsort_a) rsort_flush(&rb_a);
         }
         { EHT *tmp = curr; curr = nxt; nxt = tmp; }
         frontier[fs] = v;
@@ -855,17 +868,17 @@ void count_ham_paths_c(
             /* B: sequential per-back-edge sweeps. */
             for (int j = 0; j < n_back; j++) {
                 int w_idx = widxs[j];
-                int use_wbuf_b = (curr->cnt >= WBUF_THRESH);
-                EHWriteBuf wb_b;
+                int use_rsort_b = (curr->cnt >= RSORT_THRESH);
+                RSortBuf rb_b;
                 eh_reset(nxt);
-                if (use_wbuf_b) ehwb_init(&wb_b, nxt);
+                if (use_rsort_b) rsort_init(&rb_b, nxt);
                 EH_FOR(curr, bkt) {
                     for (int i = 0; i < bkt->cnt; i++) {
                         u64    key = bkt->k[i];
                         u128   cnt = bkt->v[i];
                         int8_t sv  = slot_get(key, v_idx);
                         int8_t sw  = slot_get(key, w_idx);
-#define BINSERT(k_) do { if(use_wbuf_b) ehwb_add(&wb_b,(k_),cnt); \
+#define BINSERT(k_) do { if(use_rsort_b) rsort_add(&rb_b,(k_),cnt); \
                          else eh_insert(nxt,(k_),cnt); } while(0)
                         BINSERT(key);     /* always copy base */
                         if (sv == -1 || sw == -1) { (void)0; } else {
@@ -905,18 +918,18 @@ void count_ham_paths_c(
 #undef BINSERT
                     }
                 } EH_END
-                if (use_wbuf_b) ehwb_flush_all(&wb_b);
+                if (use_rsort_b) rsort_flush(&rb_b);
                 { EHT *tmp = curr; curr = nxt; nxt = tmp; }
             }
 
             /* C: eliminate vertices one at a time (ascending order). */
             for (int e = 0; e < n_elim; e++) {
                 int u_idx = elim_idxs_asc[e];
-                int use_wbuf_c = (curr->cnt >= WBUF_THRESH);
-                EHWriteBuf wb_c;
+                int use_rsort_c = (curr->cnt >= RSORT_THRESH);
+                RSortBuf rb_c;
                 eh_reset(nxt);
-                if (use_wbuf_c) ehwb_init(&wb_c, nxt);
-#define CINSERT(k_,v_) do { if(use_wbuf_c) ehwb_add(&wb_c,(k_),(v_)); \
+                if (use_rsort_c) rsort_init(&rb_c, nxt);
+#define CINSERT(k_,v_) do { if(use_rsort_c) rsort_add(&rb_c,(k_),(v_)); \
                             else eh_insert(nxt,(k_),(v_)); } while(0)
                 EH_FOR(curr, bkt) {
                     for (int i = 0; i < bkt->cnt; i++) {
@@ -946,7 +959,7 @@ void count_ham_paths_c(
                     }
                 } EH_END
 #undef CINSERT
-                if (use_wbuf_c) ehwb_flush_all(&wb_c);
+                if (use_rsort_c) rsort_flush(&rb_c);
                 { EHT *tmp = curr; curr = nxt; nxt = tmp; }
                 fs--;
                 int u = frontier[u_idx];
