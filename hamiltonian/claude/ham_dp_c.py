@@ -382,6 +382,71 @@ static u128 *eh_lookup(EHT *t, u64 key) {
     return NULL;
 }
 
+/* ======================================================================
+   Write-combining buffer for eh_insert
+   -----------------------------------------------------------------------
+   At large state counts the EHT bucket pool exceeds L3 (24 MB on M3 Pro).
+   Every eh_insert on a cold table causes a full bucket load from DRAM
+   (776B = 12 cache lines), even though only ~12 of the 32 keys are live.
+
+   The write buffer groups pending inserts by the top WBUF_BITS bits of
+   eh_hash(key).  When a buffer slot is flushed all its entries share the
+   same hash prefix, so they map to the same contiguous slice of directory
+   entries and EH buckets.  That slice stays warm in L2/L3 across the
+   flush, turning cold-DRAM loads into cache hits for subsequent entries.
+
+   At WBUF_BUCKETS=1024 and gd=20, each flush touches 2^10 = 1K EH
+   buckets = 793 KB — fits in the M3 Pro's 16 MB L2.
+   The buffer itself (1024 × 16 × 24 B = 384 KB) stays in L1/L2.
+
+   Enabled when curr->cnt > WBUF_THRESH (= 512 K states), beyond which
+   the bucket pool exceeds L3 and random inserts become DRAM-bound.
+   ====================================================================== */
+#define WBUF_BUCKETS    1024          /* must be a power of 2              */
+#define WBUF_DEPTH        16          /* entries per slot before flush      */
+#define WBUF_BITS         10          /* log2(WBUF_BUCKETS)                 */
+#define WBUF_THRESH   (1 << 19)       /* 512 K states → enable buffering    */
+
+typedef struct { u64 key; u128 val; } WEntry;
+
+typedef struct {
+    WEntry  buf[WBUF_BUCKETS][WBUF_DEPTH];
+    int     cnt[WBUF_BUCKETS];
+    EHT    *t;
+} EHWriteBuf;
+
+static void ehwb_init(EHWriteBuf *wb, EHT *t) {
+    memset(wb->cnt, 0, sizeof(wb->cnt));
+    wb->t = t;
+}
+
+static void ehwb_flush_slot(EHWriteBuf *wb, int b) {
+    int n = wb->cnt[b];
+    for (int i = 0; i < n; i++)
+        eh_insert(wb->t, wb->buf[b][i].key, wb->buf[b][i].val);
+    wb->cnt[b] = 0;
+}
+
+static void ehwb_flush_all(EHWriteBuf *wb) {
+    for (int b = 0; b < WBUF_BUCKETS; b++)
+        if (wb->cnt[b]) ehwb_flush_slot(wb, b);
+}
+
+/* Buffer a write, pre-deduplicating within the slot (L1-resident scan). */
+static inline void ehwb_add(EHWriteBuf *wb, u64 key, u128 val) {
+    int     b    = (int)(eh_hash(key) >> (64 - WBUF_BITS));
+    int     n    = wb->cnt[b];
+    WEntry *slot = wb->buf[b];
+    for (int i = 0; i < n; i++) {
+        if (slot[i].key == key) { slot[i].val += val; return; }
+    }
+    if (n < WBUF_DEPTH) {
+        slot[n].key = key; slot[n].val = val; wb->cnt[b] = n + 1; return;
+    }
+    ehwb_flush_slot(wb, b);
+    slot[0].key = key; slot[0].val = val; wb->cnt[b] = 1;
+}
+
 /* Iterate all unique buckets via pool traversal (no directory dedup needed).
    Usage:
        EH_FOR(t, bkt) {
@@ -508,6 +573,10 @@ static void fused_sweep(EHT *curr, EHT *nxt,
 
     eh_reset(nxt);
 
+    int use_wbuf = (curr->cnt >= WBUF_THRESH);
+    EHWriteBuf wb;
+    if (use_wbuf) ehwb_init(&wb, nxt);
+
     EH_FOR(curr, bkt) {
         for (int i = 0; i < bkt->cnt; i++) {
             u64  base = bkt->k[i];
@@ -532,10 +601,13 @@ static void fused_sweep(EHT *curr, EHT *nxt,
                     if (!nk) continue;
                 }
 
-                eh_insert(nxt, nk, cnt);
+                if (use_wbuf) ehwb_add(&wb, nk, cnt);
+                else          eh_insert(nxt, nk, cnt);
             }
         }
     } EH_END
+
+    if (use_wbuf) ehwb_flush_all(&wb);
 }
 
 /* ======================================================================
@@ -728,11 +800,20 @@ void count_ham_paths_c(
         }
 
         /* ---- A. Introduce v ------------------------------------------ */
-        eh_reset(nxt);
-        EH_FOR(curr, bkt) {
-            for (int i = 0; i < bkt->cnt; i++)
-                eh_insert(nxt, introduce(bkt->k[i], fs), bkt->v[i]);
-        } EH_END
+        {
+            int use_wbuf_a = (curr->cnt >= WBUF_THRESH);
+            EHWriteBuf wb_a;
+            eh_reset(nxt);
+            if (use_wbuf_a) ehwb_init(&wb_a, nxt);
+            EH_FOR(curr, bkt) {
+                for (int i = 0; i < bkt->cnt; i++) {
+                    u64 nk = introduce(bkt->k[i], fs);
+                    if (use_wbuf_a) ehwb_add(&wb_a, nk, bkt->v[i]);
+                    else            eh_insert(nxt, nk, bkt->v[i]);
+                }
+            } EH_END
+            if (use_wbuf_a) ehwb_flush_all(&wb_a);
+        }
         { EHT *tmp = curr; curr = nxt; nxt = tmp; }
         frontier[fs] = v;
         fidx[v]      = fs;
@@ -774,57 +855,69 @@ void count_ham_paths_c(
             /* B: sequential per-back-edge sweeps. */
             for (int j = 0; j < n_back; j++) {
                 int w_idx = widxs[j];
+                int use_wbuf_b = (curr->cnt >= WBUF_THRESH);
+                EHWriteBuf wb_b;
                 eh_reset(nxt);
+                if (use_wbuf_b) ehwb_init(&wb_b, nxt);
                 EH_FOR(curr, bkt) {
                     for (int i = 0; i < bkt->cnt; i++) {
                         u64    key = bkt->k[i];
                         u128   cnt = bkt->v[i];
                         int8_t sv  = slot_get(key, v_idx);
                         int8_t sw  = slot_get(key, w_idx);
-                        eh_insert(nxt, key, cnt);       /* always copy base */
-                        if (sv == -1 || sw == -1) continue;
+#define BINSERT(k_) do { if(use_wbuf_b) ehwb_add(&wb_b,(k_),cnt); \
+                         else eh_insert(nxt,(k_),cnt); } while(0)
+                        BINSERT(key);     /* always copy base */
+                        if (sv == -1 || sw == -1) { (void)0; } else {
                         u64 nk = key;
                         if (sv == 0 && sw == 0) {
                             int8_t L = label_max(key, fs) + 1;
                             nk = slot_set(nk, v_idx, L);
                             nk = slot_set(nk, w_idx, L);
-                            eh_insert(nxt, canon(nk, fs), cnt);
+                            BINSERT(canon(nk, fs));
                         } else if (sv == 0) {
                             nk = slot_set(nk, w_idx, -1);
                             nk = slot_set(nk, v_idx, sw);
-                            eh_insert(nxt, canon(nk, fs), cnt);
+                            BINSERT(canon(nk, fs));
                         } else if (sw == 0) {
                             nk = slot_set(nk, v_idx, -1);
                             nk = slot_set(nk, w_idx, sv);
-                            eh_insert(nxt, canon(nk, fs), cnt);
-                        } else if (sv == sw) {
-                            /* cycle: skip */
-                        } else {
+                            BINSERT(canon(nk, fs));
+                        } else if (sv != sw) {
                             int sv_c = label_count(key, fs, sv);
                             int sw_c = label_count(key, fs, sw);
                             nk = slot_set(nk, v_idx, -1);
                             nk = slot_set(nk, w_idx, -1);
                             nk = label_rename(nk, fs, sw, sv);
                             if (sv_c == 1 && sw_c == 1) {
-                                if (nc_get(nk) >= 1) continue;
+                                if (nc_get(nk) >= 1) goto bskip;
                                 int ok = 1;
                                 for (int k2 = 0; k2 < fs; k2++)
                                     if (slot_get(nk, k2) != -1) { ok = 0; break; }
-                                if (!ok) continue;
-                                eh_insert(nxt, canon(nc_set_1(nk), fs), cnt);
+                                if (!ok) goto bskip;
+                                BINSERT(canon(nc_set_1(nk), fs));
                             } else {
-                                eh_insert(nxt, canon(nk, fs), cnt);
+                                BINSERT(canon(nk, fs));
                             }
                         }
+                        }
+                        bskip:;
+#undef BINSERT
                     }
                 } EH_END
+                if (use_wbuf_b) ehwb_flush_all(&wb_b);
                 { EHT *tmp = curr; curr = nxt; nxt = tmp; }
             }
 
             /* C: eliminate vertices one at a time (ascending order). */
             for (int e = 0; e < n_elim; e++) {
                 int u_idx = elim_idxs_asc[e];
+                int use_wbuf_c = (curr->cnt >= WBUF_THRESH);
+                EHWriteBuf wb_c;
                 eh_reset(nxt);
+                if (use_wbuf_c) ehwb_init(&wb_c, nxt);
+#define CINSERT(k_,v_) do { if(use_wbuf_c) ehwb_add(&wb_c,(k_),(v_)); \
+                            else eh_insert(nxt,(k_),(v_)); } while(0)
                 EH_FOR(curr, bkt) {
                     for (int i = 0; i < bkt->cnt; i++) {
                         u64    key = bkt->k[i];
@@ -834,13 +927,13 @@ void count_ham_paths_c(
                         if (su == 0) continue;
                         u64 rk = eliminate_slot(key, u_idx, fs);
                         if (su == -1) {
-                            eh_insert(nxt, canon(rk, fs - 1), cnt);
+                            CINSERT(canon(rk, fs - 1), cnt);
                         } else {
                             int partner = 0;
                             for (int k2 = 0; k2 < fs - 1; k2++)
                                 if (slot_get(rk, k2) == su) { partner = 1; break; }
                             if (partner) {
-                                eh_insert(nxt, canon(rk, fs - 1), cnt);
+                                CINSERT(canon(rk, fs - 1), cnt);
                             } else {
                                 if (nc + 1 > 1) continue;
                                 int ok = 1;
@@ -852,6 +945,8 @@ void count_ham_paths_c(
                         }
                     }
                 } EH_END
+#undef CINSERT
+                if (use_wbuf_c) ehwb_flush_all(&wb_c);
                 { EHT *tmp = curr; curr = nxt; nxt = tmp; }
                 fs--;
                 int u = frontier[u_idx];
