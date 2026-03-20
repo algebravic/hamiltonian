@@ -165,11 +165,10 @@ static inline u64 eliminate_slot(u64 key, int u_idx, int fs)
      Starts at gd=4 (16 entries).  Doubles lazily during splits.
    ====================================================================== */
 
-#define EH_BKT_CAP    32     /* entries per bucket: 32×24B = 768B data       */
-                             /* avg scan = 12 keys/insert @ 75%% fill        */
-                             /* bucket = 776B → fits two L1 cache lines      */
+#define EH_BKT_CAP    32     /* entries per bucket: tuned at compile time    */
+                             /* default 32; overridden via -DEH_BKT_CAP=N   */
 #define EH_INIT_GD     4     /* initial global depth → 16 root buckets       */
-#define EH_SLAB_N   4096     /* buckets per slab (≈3.2 MB per slab)          */
+#define EH_SLAB_N   4096     /* buckets per slab                             */
 
 typedef struct EHBkt {
     u64  k[EH_BKT_CAP];     /* keys:   1024 bytes                           */
@@ -411,9 +410,9 @@ static u128 *eh_lookup(EHT *t, u64 key) {
    Enabled when curr->cnt ≥ RSORT_THRESH.  Below that the bucket pool
    fits in L3 and direct eh_insert is faster (no allocation overhead).
    ====================================================================== */
-#define RSORT_BITS    10
-#define RSORT_SLOTS   (1 << RSORT_BITS)   /* 1024 */
-#define RSORT_THRESH  (1 << 19)            /* 512 K states */
+#define RSORT_BITS    10                    /* tuned at compile time           */
+#define RSORT_SLOTS   (1 << RSORT_BITS)    /* number of sort partitions        */
+#define RSORT_THRESH  (1 << 19)            /* states threshold; tuned at build */
 
 typedef struct { u64 key; u128 val; } WEntry;
 
@@ -1032,14 +1031,127 @@ cleanup:
 """
 
 # ---------------------------------------------------------------------------
+# Cache geometry detection and compile-time constant derivation
+# ---------------------------------------------------------------------------
+
+def _detect_cache_sizes():
+    """Return (l1d_bytes, l2_bytes, l3_bytes, cacheline_bytes).
+
+    Tries:
+      macOS  — sysctl hw.l1dcachesize / hw.l2cachesize / hw.l3cachesize
+               Apple Silicon exposes hw.l3cachesize directly; older Macs may
+               not have L3, so we fall back to hw.cachesize (total).
+      Linux  — /sys/devices/system/cpu/cpu0/cache/index*/  (most reliable)
+               then /proc/cpuinfo 'cache size' line as a fallback.
+    Falls back to conservative x86 defaults on failure.
+    """
+    import platform, re
+    defaults = (32 << 10, 512 << 10, 8 << 20, 64)   # 32KB / 512KB / 8MB / 64B
+
+    def sysctl_int(key):
+        r = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True)
+        try: return int(r.stdout.strip()) if r.returncode == 0 else None
+        except ValueError: return None
+
+    sys_ = platform.system()
+    if sys_ == "Darwin":
+        l1  = sysctl_int("hw.l1dcachesize")
+        l2  = sysctl_int("hw.l2cachesize")
+        l3  = sysctl_int("hw.l3cachesize") or sysctl_int("hw.cachesize")
+        cl  = sysctl_int("hw.cachelinesize")
+        return (l1 or defaults[0], l2 or defaults[1],
+                l3 or defaults[2], cl or defaults[3])
+
+    elif sys_ == "Linux":
+        l1d = l2 = l3 = None
+        cl = 64
+        for idx in range(8):
+            base = f"/sys/devices/system/cpu/cpu0/cache/index{idx}"
+            if not os.path.exists(base):
+                break
+            try:
+                level  = int(open(f"{base}/level").read())
+                ctype  = open(f"{base}/type").read().strip()
+                s_str  = open(f"{base}/size").read().strip()
+                cl     = int(open(f"{base}/coherency_line_size").read())
+                mult   = (1 << 20) if s_str.endswith("M") else (1 << 10)
+                size   = int(s_str.rstrip("KMG")) * mult
+                if level == 1 and "Data" in ctype: l1d = size
+                elif level == 2:                   l2  = size
+                elif level == 3:                   l3  = size
+            except Exception:
+                continue
+        if l3 is None:                              # /proc/cpuinfo fallback
+            try:
+                for line in open("/proc/cpuinfo"):
+                    m = re.search(r"cache size\s*:\s*(\d+)\s*KB", line)
+                    if m: l3 = int(m.group(1)) << 10; break
+            except Exception:
+                pass
+        return (l1d or defaults[0], l2 or defaults[1],
+                l3 or defaults[2], cl)
+
+    return defaults
+
+
+def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
+    """Derive EH / rsort compile-time constants from cache geometry.
+
+    EH_BKT_CAP:
+        A bucket must fit comfortably in L1 so the sequential key scan is
+        cache-resident.  32 entries × 24 B = 768 B (12 cache lines at 64 B)
+        is well within any L1 ≥ 16 KB.  We use 64 only if L1 ≥ 64 KB
+        (uncommon, but some server parts have this).
+
+    RSORT_THRESH:
+        Activate the radix-sort buffer when the EH bucket pool would exceed
+        L3 — at that point random eh_insert calls become DRAM-bound.
+        pool_bytes ≈ states × (bkt_cap × 24 + 8) / (bkt_cap × 0.75)
+        Solve for states: thresh = L3 / bytes_per_state, rounded to pow2.
+
+    RSORT_BITS (→ RSORT_SLOTS = 2^RSORT_BITS):
+        Each rsort flush processes all entries for a contiguous range of
+        2^(gd - RSORT_BITS) EH buckets.  We want that flush region to fit
+        in L2 with ~16 regions simultaneously warm.
+        Sizing at the 30 M-state design point (covers n=58 peak; conservative
+        for n=61):
+            flush_bytes = (30M / fill / 2^bits) × bkt_bytes
+            target      = L2 / 16
+        Clamped to [8, 12] (256 … 4096 slots) to avoid excessive malloc.
+    """
+    import math
+    bkt_cap = 64 if l1d >= (64 << 10) else 32
+    bkt_bytes = bkt_cap * 24 + 8
+    bps = bkt_bytes / (bkt_cap * 0.75)           # bytes per state in pool
+
+    thresh_raw = int(l3 / bps)
+    thresh = 1 << max(0, thresh_raw.bit_length() - 1)   # round down to pow2
+
+    design_peak  = 30_000_000
+    total_pool   = design_peak / (bkt_cap * 0.75) * bkt_bytes
+    flush_target = max(l2 // 16, 64 << 10)        # L2/16, floor 64 KB
+    bits_raw     = math.ceil(math.log2(total_pool / flush_target))
+    bits         = max(8, min(12, bits_raw))
+
+    return {"EH_BKT_CAP": bkt_cap, "RSORT_THRESH": thresh, "RSORT_BITS": bits}
+
+
+# ---------------------------------------------------------------------------
 _LIB_CACHE: dict = {}
 
 def _get_lib():
-    src_hash = hashlib.md5(C_SOURCE.encode()).hexdigest()[:12]
-    if src_hash in _LIB_CACHE:
-        return _LIB_CACHE[src_hash]
+    # Detect cache sizes once; derive -D flags; fold both into the cache key
+    # so that recompilation happens automatically on a different machine.
+    l1d, l2, l3, cl = _detect_cache_sizes()
+    consts = _derive_build_constants(l1d, l2, l3, cl)
 
-    build_dir = os.path.join(tempfile.gettempdir(), f"ham_dp_c_{src_hash}")
+    src_hash = hashlib.md5(C_SOURCE.encode()).hexdigest()[:12]
+    const_sig = "_".join(f"{k}{v}" for k, v in sorted(consts.items()))
+    cache_key = f"{src_hash}_{const_sig}"
+    if cache_key in _LIB_CACHE:
+        return _LIB_CACHE[cache_key]
+
+    build_dir = os.path.join(tempfile.gettempdir(), f"ham_dp_c_{cache_key}")
     os.makedirs(build_dir, exist_ok=True)
     c_path  = os.path.join(build_dir, "ham_dp.c")
     so_path = os.path.join(build_dir, "ham_dp.so")
@@ -1047,9 +1159,11 @@ def _get_lib():
     if not os.path.exists(so_path):
         with open(c_path, "w") as f:
             f.write(C_SOURCE)
+        d_flags = [f"-D{k}={v}" for k, v in consts.items()]
         result = subprocess.run(
-            ["gcc", "-O3", "-march=native", "-shared", "-fPIC", "-std=c11",
-             "-o", so_path, c_path],
+            ["gcc", "-O3", "-march=native", "-shared", "-fPIC", "-std=c11"]
+            + d_flags
+            + ["-o", so_path, c_path],
             capture_output=True,
         )
         if result.returncode != 0:
@@ -1065,7 +1179,7 @@ def _get_lib():
             const char *checkpoint_path, double checkpoint_secs);
     """)
     lib = ffi.dlopen(so_path)
-    _LIB_CACHE[src_hash] = (lib, ffi)
+    _LIB_CACHE[cache_key] = (lib, ffi)
     return lib, ffi
 
 
