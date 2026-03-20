@@ -166,7 +166,9 @@ static inline u64 eliminate_slot(u64 key, int u_idx, int fs)
      Starts at gd=4 (16 entries).  Doubles lazily during splits.
    ====================================================================== */
 
+#ifndef EH_BKT_CAP
 #define EH_BKT_CAP    32     /* entries per bucket: tuned at compile time    */
+#endif
                              /* default 32; overridden via -DEH_BKT_CAP=N   */
 #define EH_INIT_GD     4     /* initial global depth → 16 root buckets       */
 #define EH_SLAB_N   4096     /* buckets per slab                             */
@@ -249,12 +251,22 @@ static void eh_free(EHT *t) {
 }
 
 /* Reset t for reuse: rewind the pool and reinitialise the directory.
-   Does NOT free any slab memory — it is reused in-place on the next step.
-   Cost: O(n_slabs) pointer resets + 16 bucket initialisations.           */
+   Slab memory is not freed but we advise the OS that the physical pages
+   can be reclaimed.  On macOS/Linux, MADV_FREE releases physical pages
+   under memory pressure while keeping the virtual mapping intact.  Pages
+   fault back in cheaply when reused on the next step.  This prevents
+   slab memory from accumulating as swap at large state counts (n≥61).    */
 static void eh_reset(EHT *t) {
-    /* Rewind pool: all slabs become empty again. */
-    for (EHSlab *sl = t->sl_head; sl; sl = sl->next)
+    /* Advise the OS that slab bucket data is reclaimable.  Walk the chain
+       BEFORE rewinding so we can tell the OS about the full extent.       */
+    for (EHSlab *sl = t->sl_head; sl; sl = sl->next) {
         sl->used = 0;
+#if defined(MADV_FREE)
+        madvise(sl->bkts, (size_t)EH_SLAB_N * sizeof(EHBkt), MADV_FREE);
+#elif defined(MADV_DONTNEED)
+        madvise(sl->bkts, (size_t)EH_SLAB_N * sizeof(EHBkt), MADV_DONTNEED);
+#endif
+    }
     t->sl_cur = t->sl_head;
     t->cnt    = 0;
 
@@ -410,9 +422,13 @@ static u128 *eh_lookup(EHT *t, u64 key) {
    - Fixed per-slot capacity: if a slot overflows, flush immediately.
    - Total footprint: RSORT_FLAT_N × 24 B ≈ 480 MB (constant, no growth).
    ====================================================================== */
+#ifndef RSORT_BITS
 #define RSORT_BITS       10                     /* tuned at compile time     */
+#endif
 #define RSORT_SLOTS      (1 << RSORT_BITS)      /* 1024 partitions           */
+#ifndef RSORT_THRESH
 #define RSORT_THRESH     (1 << 19)              /* states threshold           */
+#endif
 #define RSORT_SLOT_CAP   (20 * 1024)            /* entries per slot: 20K     */
 #define RSORT_FLAT_N     (RSORT_SLOTS * RSORT_SLOT_CAP) /* 20M entries total */
 #define RSORT_FLUSH_THRESH (RSORT_FLAT_N / 2)   /* flush at ~10M total       */
@@ -425,10 +441,7 @@ static WEntry *g_rsort_flat = NULL;
 static void rsort_global_init(void) {
     if (g_rsort_flat) return;
     size_t sz = (size_t)RSORT_FLAT_N * sizeof(WEntry);
-    g_rsort_flat = (WEntry *)mmap(NULL, sz,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (g_rsort_flat == MAP_FAILED) { g_rsort_flat = NULL; }
+    g_rsort_flat = (WEntry *)malloc(sz);
 }
 
 typedef struct {
