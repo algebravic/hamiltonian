@@ -206,19 +206,34 @@ static inline u64 eh_hash(u64 k) {
 
 /* Allocate one bucket from the pool.  cnt is set to 0; caller sets ld.
    k[] and v[] may contain stale data from a previous step but are safe
-   because they are only read/written within [0, cnt).                    */
+   because they are only read/written within [0, cnt).
+   If the current slab's bkts array was freed by eh_reset, re-allocate it
+   now — this ensures the OS actually reclaims pages between steps.        */
 static EHBkt *eh_bkt_alloc(EHT *t) {
     if (!t->sl_cur || t->sl_cur->used >= EH_SLAB_N) {
-        EHSlab *sl = (EHSlab *)malloc(sizeof(EHSlab));
-        sl->bkts   = (EHBkt  *)malloc((size_t)EH_SLAB_N * sizeof(EHBkt));
-        sl->used   = 0;
-        sl->next   = NULL;
-        if (!t->sl_head) t->sl_head = sl;
-        else             t->sl_cur->next = sl;
-        t->sl_cur = sl;
+        /* Need a new (or recycled) slab.  Walk forward to find one whose
+           bkts may already be allocated, or create a fresh slab.          */
+        EHSlab *next = t->sl_cur ? t->sl_cur->next : NULL;
+        if (next) {
+            t->sl_cur = next;
+        } else {
+            EHSlab *sl = (EHSlab *)malloc(sizeof(EHSlab));
+            sl->bkts   = NULL;   /* allocated on demand below              */
+            sl->used   = 0;
+            sl->next   = NULL;
+            if (!t->sl_head) t->sl_head = sl;
+            else             t->sl_cur->next = sl;
+            t->sl_cur = sl;
+        }
+    }
+    /* Re-allocate bkts if freed by eh_reset.  Large mallocs on macOS use
+       mmap internally, so a matching free() actually unmaps the pages.    */
+    if (!t->sl_cur->bkts) {
+        t->sl_cur->bkts = (EHBkt *)malloc((size_t)EH_SLAB_N * sizeof(EHBkt));
+        t->sl_cur->used = 0;
     }
     EHBkt *b = &t->sl_cur->bkts[t->sl_cur->used++];
-    b->cnt = 0;    /* only the count needs zeroing; stale k/v beyond cnt are never read */
+    b->cnt = 0;
     return b;
 }
 
@@ -250,22 +265,19 @@ static void eh_free(EHT *t) {
     free(t);
 }
 
-/* Reset t for reuse: rewind the pool and reinitialise the directory.
-   Slab memory is not freed but we advise the OS that the physical pages
-   can be reclaimed.  On macOS/Linux, MADV_FREE releases physical pages
-   under memory pressure while keeping the virtual mapping intact.  Pages
-   fault back in cheaply when reused on the next step.  This prevents
-   slab memory from accumulating as swap at large state counts (n≥61).    */
+/* Reset t for reuse: free all slab bucket arrays and reinitialise directory.
+   Freeing the bkts arrays (each ~3.2 MB) is the only reliable way to return
+   pages to the OS on macOS: madvise(MADV_FREE) on malloc-backed memory is
+   advisory and macOS ignores it in practice.  Large mallocs use mmap
+   internally on macOS, so free() calls munmap and the OS actually reclaims
+   the physical pages immediately, preventing 70+ GB swap accumulation.
+   The EHSlab structs themselves (tiny: just used/next) are kept so the
+   slab chain can be reused without rebuilding it from scratch.            */
 static void eh_reset(EHT *t) {
-    /* Advise the OS that slab bucket data is reclaimable.  Walk the chain
-       BEFORE rewinding so we can tell the OS about the full extent.       */
     for (EHSlab *sl = t->sl_head; sl; sl = sl->next) {
+        free(sl->bkts);   /* releases pages back to OS on macOS/Linux      */
+        sl->bkts = NULL;
         sl->used = 0;
-#if defined(MADV_FREE)
-        madvise(sl->bkts, (size_t)EH_SLAB_N * sizeof(EHBkt), MADV_FREE);
-#elif defined(MADV_DONTNEED)
-        madvise(sl->bkts, (size_t)EH_SLAB_N * sizeof(EHBkt), MADV_DONTNEED);
-#endif
     }
     t->sl_cur = t->sl_head;
     t->cnt    = 0;
