@@ -53,6 +53,7 @@ C_SOURCE = r"""
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -382,93 +383,104 @@ static u128 *eh_lookup(EHT *t, u64 key) {
 }
 
 /* ======================================================================
-   Radix-sort insert buffer (RSortBuf)  — memory-bounded edition
+   Radix-sort insert buffer (RSortBuf)  — flat mmap edition
    -----------------------------------------------------------------------
-   Collects outputs into 1024 slot arrays keyed by the top RSORT_BITS bits
-   of eh_hash(key), then flushes slots 0 → RSORT_SLOTS-1 in order.  Each
-   slot flush touches only the EH directory range for that prefix, keeping
-   that region warm in L2/L3 for all entries before advancing.
+   Groups outputs by top RSORT_BITS hash bits, then flushes slots 0…P-1
+   in order so each EH directory range is warmed once per flush pass.
 
-   MEMORY BOUND (required for n≥61):
-   The original design used dynamic slot arrays starting at cap=256.  At
-   100M output states, each slot doubles 9 times.  macOS retains freed pages
-   in the heap rather than returning them to the OS, so virtual memory
-   ballooned to ~88 GB of swap even though only ~2.4 GB was live data.
+   MEMORY PROBLEM WITH malloc/free (root cause of 85 GB swap at n=61):
+   The previous design called malloc(hint × 1024 × 24B) at the start of
+   each sweep and free() at the end.  macOS's allocator retains freed pages
+   in the heap rather than returning them to the OS, so over 33 steps with
+   hint ≈ 50M/1024, this accumulated 33 × 2 sweeps × 1.2 GB = 79 GB of
+   virtual memory, all of which macOS swapped to disk.
 
-   Two-level fix:
-   1. Pre-alloc each slot at hint = si/RSORT_SLOTS at init time.  This
-      eliminates all realloc doubling for typical steps (so ≈ si).
-   2. Periodic flush: when total buffered entries exceeds RSORT_FLUSH_THRESH,
-      flush all slots in hash order (preserving locality) and reset counts
-      WITHOUT freeing backing arrays.  Caps peak buffer memory at
-      RSORT_FLUSH_THRESH × 24 B ≈ 480 MB regardless of output count.
+   FIX: allocate ONE flat buffer with mmap() at program startup.
+   mmap(MAP_ANONYMOUS) pages are returned to the OS as soon as the mapping
+   is released (munmap) or declared unneeded (madvise MADV_FREE / DONTNEED).
+   We call madvise(MADV_FREE) after each flush pass so the OS can reclaim
+   the physical pages immediately, even though the virtual mapping persists.
+
+   Design:
+   - Flat array of RSORT_FLAT_N WEntry objects, split into RSORT_SLOTS
+     equal-sized partitions of RSORT_SLOT_CAP entries each.
+   - Slot b owns entries [b*RSORT_SLOT_CAP … (b+1)*RSORT_SLOT_CAP).
+   - Periodic flush triggers at RSORT_FLUSH_THRESH total entries and after
+     every sweep, preserving hash-order locality.
+   - Fixed per-slot capacity: if a slot overflows, flush immediately.
+   - Total footprint: RSORT_FLAT_N × 24 B ≈ 480 MB (constant, no growth).
    ====================================================================== */
-#define RSORT_BITS    10                    /* tuned at compile time           */
-#define RSORT_SLOTS   (1 << RSORT_BITS)    /* number of sort partitions        */
-#define RSORT_THRESH  (1 << 19)            /* states threshold; tuned at build */
-
-/* Flush when total buffered entries exceeds this: 20M × 24B = 480 MB.     */
-#define RSORT_FLUSH_THRESH  (20 * 1024 * 1024)
+#define RSORT_BITS       10                     /* tuned at compile time     */
+#define RSORT_SLOTS      (1 << RSORT_BITS)      /* 1024 partitions           */
+#define RSORT_THRESH     (1 << 19)              /* states threshold           */
+#define RSORT_SLOT_CAP   (20 * 1024)            /* entries per slot: 20K     */
+#define RSORT_FLAT_N     (RSORT_SLOTS * RSORT_SLOT_CAP) /* 20M entries total */
+#define RSORT_FLUSH_THRESH (RSORT_FLAT_N / 2)   /* flush at ~10M total       */
 
 typedef struct { u64 key; u128 val; } WEntry;
 
-typedef struct {
-    WEntry *e;
-    int     cnt;
-    int     cap;
-} RSortSlot;
+/* Global flat buffer — allocated once with mmap, reused every step.        */
+static WEntry *g_rsort_flat = NULL;
+
+static void rsort_global_init(void) {
+    if (g_rsort_flat) return;
+    size_t sz = (size_t)RSORT_FLAT_N * sizeof(WEntry);
+    g_rsort_flat = (WEntry *)mmap(NULL, sz,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_rsort_flat == MAP_FAILED) { g_rsort_flat = NULL; }
+}
 
 typedef struct {
-    RSortSlot slots[RSORT_SLOTS];
-    EHT      *t;
-    size_t    total;   /* total live entries across all slots */
+    int    cnt[RSORT_SLOTS];   /* live count in each slot                    */
+    size_t total;              /* total live entries                          */
+    EHT   *t;
 } RSortBuf;
 
-/* Init with hint = si/RSORT_SLOTS to avoid realloc doubling.              */
 static void rsort_init(RSortBuf *rb, EHT *t, size_t hint) {
+    (void)hint;   /* ignored: slot capacity is now fixed at RSORT_SLOT_CAP  */
     rb->t     = t;
     rb->total = 0;
-    int h = (hint > 0) ? (int)hint : 256;
-    for (int b = 0; b < RSORT_SLOTS; b++) {
-        rb->slots[b].cnt = 0;
-        rb->slots[b].cap = h;
-        rb->slots[b].e   = (WEntry *)malloc((size_t)h * sizeof(WEntry));
-    }
+    memset(rb->cnt, 0, sizeof rb->cnt);
 }
 
-/* Flush all slots in hash order, then reset counts (keep backing arrays). */
+/* Flush all slots in hash order, reset counts, advise OS to free pages.    */
 static void rsort_flush_reset(RSortBuf *rb) {
     for (int b = 0; b < RSORT_SLOTS; b++) {
-        RSortSlot *sl = &rb->slots[b];
-        for (int i = 0; i < sl->cnt; i++)
-            eh_insert(rb->t, sl->e[i].key, sl->e[i].val);
-        sl->cnt = 0;
+        int n = rb->cnt[b];
+        if (!n) continue;
+        WEntry *base = g_rsort_flat + (size_t)b * RSORT_SLOT_CAP;
+        for (int i = 0; i < n; i++)
+            eh_insert(rb->t, base[i].key, base[i].val);
+        rb->cnt[b] = 0;
     }
     rb->total = 0;
+    /* Advise the OS that the flat buffer pages are no longer needed.
+       Physical pages are reclaimed; virtual mapping stays.                  */
+#if defined(MADV_FREE)
+    madvise(g_rsort_flat,
+            (size_t)RSORT_FLAT_N * sizeof(WEntry), MADV_FREE);
+#elif defined(MADV_DONTNEED)
+    madvise(g_rsort_flat,
+            (size_t)RSORT_FLAT_N * sizeof(WEntry), MADV_DONTNEED);
+#endif
 }
 
-/* Final flush + free called at end of sweep.                              */
-static void rsort_flush(RSortBuf *rb) {
-    rsort_flush_reset(rb);
-    for (int b = 0; b < RSORT_SLOTS; b++) {
-        free(rb->slots[b].e);
-        rb->slots[b].e = NULL; rb->slots[b].cap = 0;
-    }
-}
+static void rsort_flush(RSortBuf *rb) { rsort_flush_reset(rb); }
 
 static inline void rsort_add(RSortBuf *rb, u64 key, u128 val) {
-    int        b  = (int)(eh_hash(key) >> (64 - RSORT_BITS));
-    RSortSlot *sl = &rb->slots[b];
-    if (sl->cnt == sl->cap) {
-        sl->cap = sl->cap ? sl->cap * 2 : 256;
-        sl->e   = (WEntry *)realloc(sl->e, (size_t)sl->cap * sizeof(WEntry));
+    int b = (int)(eh_hash(key) >> (64 - RSORT_BITS));
+    int n = rb->cnt[b];
+    if (n == RSORT_SLOT_CAP) {
+        /* Slot full: flush everything in hash order then retry.             */
+        rsort_flush_reset(rb);
+        n = 0;
     }
-    sl->e[sl->cnt].key = key;
-    sl->e[sl->cnt].val = val;
-    sl->cnt++;
+    WEntry *base = g_rsort_flat + (size_t)b * RSORT_SLOT_CAP;
+    base[n].key = key;
+    base[n].val = val;
+    rb->cnt[b]  = n + 1;
     rb->total++;
-    /* Periodic flush when buffer is full: flushes in hash order then
-       resets counts, bounding peak buffer memory at ~480 MB.              */
     if (rb->total >= RSORT_FLUSH_THRESH)
         rsort_flush_reset(rb);
 }
@@ -601,7 +613,7 @@ static void fused_sweep(EHT *curr, EHT *nxt,
 
     int use_rsort = (curr->cnt >= RSORT_THRESH);
     RSortBuf rb = {0};
-    if (use_rsort) rsort_init(&rb,   nxt, curr->cnt / RSORT_SLOTS);
+    if (use_rsort) rsort_init(&rb,   nxt, 0);
 
     EH_FOR(curr, bkt) {
         for (int i = 0; i < bkt->cnt; i++) {
@@ -782,6 +794,7 @@ void count_ham_paths_c(
     const char *checkpoint_path,
     double     checkpoint_secs
 ) {
+    rsort_global_init();   /* ensure flat rsort buffer is mmap'd             */
     int  frontier[MAX_FS_FAST + 2];
     int *fidx = (int *)malloc((size_t)(n + 1) * sizeof(int));
     int  fs   = 0;
@@ -830,7 +843,7 @@ void count_ham_paths_c(
             int use_rsort_a = (curr->cnt >= RSORT_THRESH);
             RSortBuf rb_a = {0};
             eh_reset(nxt);
-            if (use_rsort_a) rsort_init(&rb_a, nxt, curr->cnt / RSORT_SLOTS);
+            if (use_rsort_a) rsort_init(&rb_a, nxt, 0);
             EH_FOR(curr, bkt) {
                 for (int i = 0; i < bkt->cnt; i++) {
                     u64 nk = introduce(bkt->k[i], fs);
@@ -884,7 +897,7 @@ void count_ham_paths_c(
                 int use_rsort_b = (curr->cnt >= RSORT_THRESH);
                 RSortBuf rb_b = {0};
                 eh_reset(nxt);
-                if (use_rsort_b) rsort_init(&rb_b, nxt, curr->cnt / RSORT_SLOTS);
+                if (use_rsort_b) rsort_init(&rb_b, nxt, 0);
                 EH_FOR(curr, bkt) {
                     for (int i = 0; i < bkt->cnt; i++) {
                         u64    key = bkt->k[i];
@@ -941,7 +954,7 @@ void count_ham_paths_c(
                 int use_rsort_c = (curr->cnt >= RSORT_THRESH);
                 RSortBuf rb_c = {0};
                 eh_reset(nxt);
-                if (use_rsort_c) rsort_init(&rb_c, nxt, curr->cnt / RSORT_SLOTS);
+                if (use_rsort_c) rsort_init(&rb_c, nxt, 0);
 #define CINSERT(k_,v_) do { if(use_rsort_c) rsort_add(&rb_c,(k_),(v_)); \
                             else eh_insert(nxt,(k_),(v_)); } while(0)
                 EH_FOR(curr, bkt) {
