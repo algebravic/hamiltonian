@@ -382,37 +382,33 @@ static u128 *eh_lookup(EHT *t, u64 key) {
 }
 
 /* ======================================================================
-   Radix-sort insert buffer (RSortBuf)
+   Radix-sort insert buffer (RSortBuf)  — memory-bounded edition
    -----------------------------------------------------------------------
-   Root problem: EH buckets are allocated in insertion order, not hash
-   order.  Even if we group writes by hash prefix (write buffer), flushing
-   a slot still causes ~1024 independent cold DRAM loads — one per bucket
-   in that hash range — because those buckets are scattered across slabs.
+   Collects outputs into 1024 slot arrays keyed by the top RSORT_BITS bits
+   of eh_hash(key), then flushes slots 0 → RSORT_SLOTS-1 in order.  Each
+   slot flush touches only the EH directory range for that prefix, keeping
+   that region warm in L2/L3 for all entries before advancing.
 
-   The write buffer therefore gave only 1.20× speedup instead of the
-   expected ~2×, because the locality benefit was deferred to flush time
-   and then lost to the non-contiguous layout.
+   MEMORY BOUND (required for n≥61):
+   The original design used dynamic slot arrays starting at cap=256.  At
+   100M output states, each slot doubles 9 times.  macOS retains freed pages
+   in the heap rather than returning them to the OS, so virtual memory
+   ballooned to ~88 GB of swap even though only ~2.4 GB was live data.
 
-   FIX: collect ALL outputs from a sweep into 1024 dynamic slot arrays
-   keyed by the top RSORT_BITS bits of eh_hash(key).  After the sweep,
-   flush slots 0 → 1023 in order.  When slot b is flushed, every entry
-   maps to an EH bucket in directory range [b·2^(gd-10), (b+1)·2^(gd-10)).
-   All entries for a given EH bucket are consecutive in the slot array
-   (same hash prefix → same bucket), so each bucket is loaded from DRAM
-   exactly once and stays warm for all its entries before we move on.
-
-   Cost:  O(N) pointer writes during collect + O(N) reads during flush.
-   Reads are sequential within each slot (prefetchable).
-   Memory: N × 24 B total across all slots (proportional to output).
-   Splits are deferred to the flush phase — each bucket is fully populated
-   in one pass, minimising split count.
-
-   Enabled when curr->cnt ≥ RSORT_THRESH.  Below that the bucket pool
-   fits in L3 and direct eh_insert is faster (no allocation overhead).
+   Two-level fix:
+   1. Pre-alloc each slot at hint = si/RSORT_SLOTS at init time.  This
+      eliminates all realloc doubling for typical steps (so ≈ si).
+   2. Periodic flush: when total buffered entries exceeds RSORT_FLUSH_THRESH,
+      flush all slots in hash order (preserving locality) and reset counts
+      WITHOUT freeing backing arrays.  Caps peak buffer memory at
+      RSORT_FLUSH_THRESH × 24 B ≈ 480 MB regardless of output count.
    ====================================================================== */
 #define RSORT_BITS    10                    /* tuned at compile time           */
 #define RSORT_SLOTS   (1 << RSORT_BITS)    /* number of sort partitions        */
 #define RSORT_THRESH  (1 << 19)            /* states threshold; tuned at build */
+
+/* Flush when total buffered entries exceeds this: 20M × 24B = 480 MB.     */
+#define RSORT_FLUSH_THRESH  (20 * 1024 * 1024)
 
 typedef struct { u64 key; u128 val; } WEntry;
 
@@ -425,11 +421,39 @@ typedef struct {
 typedef struct {
     RSortSlot slots[RSORT_SLOTS];
     EHT      *t;
+    size_t    total;   /* total live entries across all slots */
 } RSortBuf;
 
-static void rsort_init(RSortBuf *rb, EHT *t) {
-    memset(rb->slots, 0, sizeof rb->slots);
-    rb->t = t;
+/* Init with hint = si/RSORT_SLOTS to avoid realloc doubling.              */
+static void rsort_init(RSortBuf *rb, EHT *t, size_t hint) {
+    rb->t     = t;
+    rb->total = 0;
+    int h = (hint > 0) ? (int)hint : 256;
+    for (int b = 0; b < RSORT_SLOTS; b++) {
+        rb->slots[b].cnt = 0;
+        rb->slots[b].cap = h;
+        rb->slots[b].e   = (WEntry *)malloc((size_t)h * sizeof(WEntry));
+    }
+}
+
+/* Flush all slots in hash order, then reset counts (keep backing arrays). */
+static void rsort_flush_reset(RSortBuf *rb) {
+    for (int b = 0; b < RSORT_SLOTS; b++) {
+        RSortSlot *sl = &rb->slots[b];
+        for (int i = 0; i < sl->cnt; i++)
+            eh_insert(rb->t, sl->e[i].key, sl->e[i].val);
+        sl->cnt = 0;
+    }
+    rb->total = 0;
+}
+
+/* Final flush + free called at end of sweep.                              */
+static void rsort_flush(RSortBuf *rb) {
+    rsort_flush_reset(rb);
+    for (int b = 0; b < RSORT_SLOTS; b++) {
+        free(rb->slots[b].e);
+        rb->slots[b].e = NULL; rb->slots[b].cap = 0;
+    }
 }
 
 static inline void rsort_add(RSortBuf *rb, u64 key, u128 val) {
@@ -442,21 +466,11 @@ static inline void rsort_add(RSortBuf *rb, u64 key, u128 val) {
     sl->e[sl->cnt].key = key;
     sl->e[sl->cnt].val = val;
     sl->cnt++;
-}
-
-/* Flush all slots in ascending order (0 → 1023) then free their memory.
-   Slot b covers EH directory range [b·2^(gd-10), (b+1)·2^(gd-10)).
-   Entries within a slot are inserted sequentially: each distinct EH bucket
-   in that range is loaded from DRAM once and stays warm for all its entries
-   before we advance to the next range.                                     */
-static void rsort_flush(RSortBuf *rb) {
-    for (int b = 0; b < RSORT_SLOTS; b++) {
-        RSortSlot *sl = &rb->slots[b];
-        for (int i = 0; i < sl->cnt; i++)
-            eh_insert(rb->t, sl->e[i].key, sl->e[i].val);
-        free(sl->e);
-        sl->e = NULL; sl->cnt = sl->cap = 0;
-    }
+    rb->total++;
+    /* Periodic flush when buffer is full: flushes in hash order then
+       resets counts, bounding peak buffer memory at ~480 MB.              */
+    if (rb->total >= RSORT_FLUSH_THRESH)
+        rsort_flush_reset(rb);
 }
 
 /* Iterate all unique buckets via pool traversal (no directory dedup needed).
@@ -586,8 +600,8 @@ static void fused_sweep(EHT *curr, EHT *nxt,
     eh_reset(nxt);
 
     int use_rsort = (curr->cnt >= RSORT_THRESH);
-    RSortBuf rb;
-    if (use_rsort) rsort_init(&rb, nxt);
+    RSortBuf rb = {0};
+    if (use_rsort) rsort_init(&rb,   nxt, curr->cnt / RSORT_SLOTS);
 
     EH_FOR(curr, bkt) {
         for (int i = 0; i < bkt->cnt; i++) {
@@ -814,9 +828,9 @@ void count_ham_paths_c(
         /* ---- A. Introduce v ------------------------------------------ */
         {
             int use_rsort_a = (curr->cnt >= RSORT_THRESH);
-            RSortBuf rb_a;
+            RSortBuf rb_a = {0};
             eh_reset(nxt);
-            if (use_rsort_a) rsort_init(&rb_a, nxt);
+            if (use_rsort_a) rsort_init(&rb_a, nxt, curr->cnt / RSORT_SLOTS);
             EH_FOR(curr, bkt) {
                 for (int i = 0; i < bkt->cnt; i++) {
                     u64 nk = introduce(bkt->k[i], fs);
@@ -868,9 +882,9 @@ void count_ham_paths_c(
             for (int j = 0; j < n_back; j++) {
                 int w_idx = widxs[j];
                 int use_rsort_b = (curr->cnt >= RSORT_THRESH);
-                RSortBuf rb_b;
+                RSortBuf rb_b = {0};
                 eh_reset(nxt);
-                if (use_rsort_b) rsort_init(&rb_b, nxt);
+                if (use_rsort_b) rsort_init(&rb_b, nxt, curr->cnt / RSORT_SLOTS);
                 EH_FOR(curr, bkt) {
                     for (int i = 0; i < bkt->cnt; i++) {
                         u64    key = bkt->k[i];
@@ -925,9 +939,9 @@ void count_ham_paths_c(
             for (int e = 0; e < n_elim; e++) {
                 int u_idx = elim_idxs_asc[e];
                 int use_rsort_c = (curr->cnt >= RSORT_THRESH);
-                RSortBuf rb_c;
+                RSortBuf rb_c = {0};
                 eh_reset(nxt);
-                if (use_rsort_c) rsort_init(&rb_c, nxt);
+                if (use_rsort_c) rsort_init(&rb_c, nxt, curr->cnt / RSORT_SLOTS);
 #define CINSERT(k_,v_) do { if(use_rsort_c) rsort_add(&rb_c,(k_),(v_)); \
                             else eh_insert(nxt,(k_),(v_)); } while(0)
                 EH_FOR(curr, bkt) {
