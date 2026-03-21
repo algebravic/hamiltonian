@@ -318,12 +318,30 @@ def _dp_cost(adj: dict, order: list, pw_bound: int) -> float:
     # Sojourn cost: sojourn[v] × (fw_at_introduction / pw)^2.
     # This directly penalises placing v early when it has late last-neighbors.
 
-    # Geometric state-count proxy.  Multiplicative accumulation correctly
-    # captures compound growth across consecutive expanding steps, which
-    # additive/pressure-based tracking underestimates.  Long sojourns are
-    # penalised implicitly: a vertex in the frontier for k steps participates
-    # in k expand cycles, compounding the proxy geometrically.
-    proxy   = 1.0
+    # Hybrid cost function combining two complementary signals:
+    #
+    # 1. PROXY × 2^n_back (per-step sweep cost):
+    #    proxy is a running geometric estimate of the current state count.
+    #    Multiplying by 2^n_back gives the cost of the fused_sweep at this step:
+    #    (estimated states in table) × (edge subsets enumerated per state).
+    #    This correctly penalises a single high-nb step at large state counts
+    #    (e.g. nb=4 at 17M states costs 16× more than nb=2 at 17M states).
+    #
+    # 2. GEOMETRIC PROXY UPDATE (plateau penalty):
+    #    The proxy compresses on elimination steps and expands on back-edge steps.
+    #    Using multiplicative accumulation (not additive pressure) correctly
+    #    captures compound growth across a long plateau of expanding steps —
+    #    seven consecutive 1.5× expansions cost 1.5^7 = 17×, which additive
+    #    tracking underestimates.  Long sojourns are penalised implicitly.
+    #
+    # The two signals are complementary:
+    #   - Pure geometric (previous): great for plateau penalty, weak on isolated
+    #     high-nb steps (nb=4 vs nb=2 look equal after two steps).
+    #   - Pure 2^nb (original pressure): great for single-step cost, blind to
+    #     cumulative state-count growth across consecutive expansions.
+    #   - Hybrid: cost += proxy × 2^n_back × (fw/pw)² at each step.
+
+    proxy   = 1.0   # geometric state-count estimate (relative units)
     cost    = 0.0
     profile = 0
 
@@ -340,14 +358,23 @@ def _dp_cost(adj: dict, order: list, pw_bound: int) -> float:
                      if last_step[u] == step)
 
         fw_weight = (fw / pw_bound) ** 2
-        expand    = float(1 << min(n_back, 20)) * fw_weight
-        compress  = max(0.5 ** n_elim, 0.01)
-        proxy     = max(proxy * expand * compress, 1.0)
 
-        cost    += proxy
+        # Step cost = proxy × 2^n_back × fw_weight.
+        # This is the product of the estimated table size and the per-state
+        # subset enumeration cost, scaled by frontier width.
+        step_cost = proxy * float(1 << min(n_back, 20)) * fw_weight
+        cost += step_cost
+
+        # Update proxy geometrically for the NEXT step:
+        # expansion proportional to (expected output / input) = 2^n_back × fw_weight,
+        # compression from eliminations.
+        expand   = float(1 << min(n_back, 20)) * fw_weight
+        compress = max(0.5 ** n_elim, 0.01)
+        proxy    = max(proxy * expand * compress, 1.0)
+
         profile += fw
 
-    return cost + 0.001 * profile  # increased profile weight from 0.001
+    return cost + 0.001 * profile
 
 
 def sa_refine_order(
@@ -412,6 +439,160 @@ def sa_refine_order(
 
     return best_order
 
+
+
+def best_multistart_order(
+    adj: dict,
+    n: int,
+    G,                        # networkx Graph for separation
+    pw_bound: int,
+    n_iter: int = 100_000,
+    max_solutions: int = 50,
+    fast_threshold_s: float = 0.5,
+    consecutive_fast_stop: int = 10,
+    verbose: bool = True,
+) -> tuple:
+    """
+    Run SA refinement from every topologically distinct optimal-pw ordering
+    produced by the all_solutions generator.
+
+    Stopping criterion: generator inter-arrival time.  Solutions produced in
+    < fast_threshold_s seconds are cheap local variations reachable by SA
+    from any other start.  Stop after consecutive_fast_stop such solutions.
+
+    Returns
+    -------
+    (best_order, best_cost, all_candidates, n_distinct, n_total)
+
+    where all_candidates is a list of (sa_cost, order) for every solution
+    tried, sorted by sa_cost ascending.  Pass this to validate_multistart_orders
+    to re-rank by actual partial-DP time.
+    """
+    import time
+    try:
+        from separation.vertex_separation import pathwidth_order
+    except ImportError:
+        raise ImportError(
+            "The 'separation' package is not installed.\n"
+            "Clone https://github.com/algebravic/separation and pip install -e ."
+        )
+
+    best_order_out = None
+    best_cost = float('inf')
+    all_candidates = []   # (sa_cost, order) for every tried solution
+    n_distinct = 0
+    n_total = 0
+    consecutive_fast = 0
+
+    if verbose:
+        print(f"  Multi-start SA: pw={pw_bound}, SA iters={n_iter:,} per start",
+              flush=True)
+
+    gen = pathwidth_order(G, bound=pw_bound, all_solutions=True)
+    t_last = time.time()
+
+    for pw, order in gen:
+        t_gen = time.time()
+        gen_time = t_gen - t_last
+
+        n_total += 1
+
+        is_new_skeleton = (n_total == 1) or (gen_time >= fast_threshold_s)
+        if is_new_skeleton:
+            n_distinct += 1
+            consecutive_fast = 0
+        else:
+            consecutive_fast += 1
+
+        refined = sa_refine_order(adj, n, order, pw_bound,
+                                  n_iter=n_iter, seed=n_total * 17 + 42)
+        cost = _dp_cost(adj, refined, pw_bound)
+        all_candidates.append((cost, refined[:]))
+
+        is_best = (cost is not None and cost < best_cost)
+        if is_best:
+            best_cost = cost
+            best_order_out = refined[:]
+
+        if verbose:
+            marker = "***" if is_best else "   "
+            sk = "  [new skeleton]" if is_new_skeleton else f"  [fast {gen_time:.3f}s]"
+            print(f"  {marker} sol {n_total:3d}: SA cost={cost:.3e}  "
+                  f"best={best_cost:.3e}  gen={gen_time:.2f}s{sk}", flush=True)
+
+        if n_total > max_solutions:
+            if verbose:
+                print(f"  Reached max_solutions={max_solutions}, stopping.", flush=True)
+            break
+
+        if consecutive_fast >= consecutive_fast_stop:
+            if verbose:
+                print(f"  {consecutive_fast} consecutive fast solutions — "
+                      f"all {n_distinct} distinct skeletons found, stopping.", flush=True)
+            break
+
+        t_last = time.time()
+
+    all_candidates.sort(key=lambda x: x[0])   # sort by SA cost ascending
+
+    if verbose:
+        print(f"  Multi-start done: {n_total} solutions tried, "
+              f"{n_distinct} distinct skeletons, best cost={best_cost:.3e}", flush=True)
+
+    return best_order_out, best_cost, all_candidates, n_distinct, n_total
+
+
+def validate_multistart_orders(
+    candidates: list,
+    adj: dict,
+    n: int,
+    step_limit: int,
+    verbose: bool = True,
+) -> list:
+    """
+    Rank candidate orderings by actual partial-DP wall-clock time, running
+    only the first *step_limit* steps of the frontier DP.
+
+    Corrects proxy miscalibration: orderings that score well on _dp_cost but
+    are slower in practice (e.g. due to bad tail behaviour) are re-ranked by
+    measured early-phase cost.  step_limit = n // 2 typically captures the
+    expensive peak steps while running in a fraction of the full DP time.
+
+    Parameters
+    ----------
+    candidates  : list of (sa_cost, order) tuples from best_multistart_order
+    adj         : adjacency dict
+    n           : number of vertices
+    step_limit  : DP steps to run per candidate (n//2 is a good default)
+    verbose     : print per-candidate timing
+
+    Returns
+    -------
+    List of (partial_ms, sa_cost, order) sorted by partial_ms ascending.
+    """
+    from ham_dp_c import partial_dp_time_c
+
+    if verbose:
+        print(f"  Validating {len(candidates)} candidates: "
+              f"first {step_limit}/{n} DP steps each", flush=True)
+
+    results = []
+    for rank, (sa_cost, order) in enumerate(candidates):
+        ms = partial_dp_time_c(n, order, adj, step_limit)
+        results.append((ms, sa_cost, order))
+        if verbose:
+            marker = ""
+            if results and ms < results[0][0]:
+                marker = "  ***"
+            print(f"    candidate {rank+1:3d}: partial_dp={ms:8.1f}ms  "
+                  f"sa_cost={sa_cost:.3e}{marker}", flush=True)
+
+    results.sort(key=lambda x: x[0])
+    if verbose:
+        print(f"  Best by partial DP (step 0..{step_limit-1}): "
+              f"{results[0][0]:.1f}ms  (sa_cost={results[0][1]:.3e})",
+              flush=True)
+    return results
 
 
 def graphillion_edge_universe(adj: dict, n: int, order: list) -> list:

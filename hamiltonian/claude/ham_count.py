@@ -58,7 +58,7 @@ from math import isqrt
 import networkx as nx
 
 from .ham_dp_c import count_hamiltonian_paths_c, _get_lib
-from .ham_ordering import build_graph, best_bfs_order, frontier_stats, sa_refine_order
+from .ham_ordering import build_graph, best_bfs_order, frontier_stats, sa_refine_order, best_multistart_order, validate_multistart_orders
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +196,16 @@ def parse_args():
                    help="Use BFS ordering instead of MaxSAT pathwidth.")
     p.add_argument("--no-refine", action="store_true",
                    help="Skip the SA refinement of the MaxSAT ordering.")
+    p.add_argument("--multi-start", action="store_true",
+                   help="Run SA from all topologically distinct MaxSAT orderings "
+                        "and pick the best.  Implies --refine.  Prints per-solution "
+                        "cost so you can see whether extra starts help.")
+    p.add_argument("--multi-start-max", type=int, default=50, metavar="N",
+                   help="Max solutions to draw from the generator (default: 50).")
+    p.add_argument("--multi-start-validate", type=int, default=0, metavar="K",
+                   help="After multi-start SA, re-rank candidates by running the "
+                        "first K DP steps and pick the fastest. K=0 disables "
+                        "(default). Suggested: K = n//2.")
     p.add_argument("--refine-iters", type=int, default=100_000, metavar="N",
                    help="SA iterations for secondary refinement (default: 100000).")
     p.add_argument("--bound", type=int, default=None, metavar="K",
@@ -261,8 +271,29 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
 
     # --- SA refinement ---
     if pw is not None and not args.no_refine:
-        order = sa_refine_order(adj, n_vertices, order, pw,
-                                n_iter=args.refine_iters)
+        if getattr(args, 'multi_start', False):
+            order, ms_cost, ms_candidates, ms_distinct, ms_total = best_multistart_order(
+                adj, n_vertices, G, pw,
+                n_iter=args.refine_iters,
+                max_solutions=args.multi_start_max,
+                verbose=True,
+            )
+            print(f"  multi-start: {ms_total} solutions, {ms_distinct} distinct, "
+                  f"best SA cost={ms_cost:.3e}", flush=True)
+
+            # Optional: re-rank top candidates by actual partial-DP timing
+            k = getattr(args, 'multi_start_validate', 0)
+            if k > 0 and ms_candidates:
+                # Validate top-10 by SA cost (avoid re-running all if many)
+                top = ms_candidates[:min(10, len(ms_candidates))]
+                ranked = validate_multistart_orders(
+                    top, adj, n_vertices, step_limit=k, verbose=True)
+                order = ranked[0][2]
+                print(f"  validate: best by partial DP ({k} steps) "
+                      f"has SA cost={ranked[0][1]:.3e}", flush=True)
+        else:
+            order = sa_refine_order(adj, n_vertices, order, pw,
+                                    n_iter=args.refine_iters)
 
     t_ord = time.time() - t_ord
     mx, pr = frontier_stats(adj, order)

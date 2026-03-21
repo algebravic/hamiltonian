@@ -817,7 +817,8 @@ void count_ham_paths_c(
     uint64_t  *res_hi,
     int        verbose,
     const char *checkpoint_path,
-    double     checkpoint_secs
+    double     checkpoint_secs,
+    int        step_limit        /* -1 = full run; >=0 = stop after this many steps */
 ) {
     rsort_global_init();   /* ensure flat rsort buffer is mmap'd             */
     int  frontier[MAX_FS_FAST + 2];
@@ -1068,6 +1069,14 @@ void count_ham_paths_c(
                 }
             }
         }
+
+        if (step_limit >= 0 && step >= step_limit) {
+            double t_elapsed = now_ms() - t_start;
+            uint64_t tmp; memcpy(&tmp, &t_elapsed, sizeof tmp);
+            *res_lo = tmp;
+            *res_hi = UINT64_MAX - 1;  /* sentinel: partial run (distinct from overflow) */
+            goto cleanup;
+        }
     }
 
 cleanup:
@@ -1075,7 +1084,10 @@ cleanup:
     eh_free(nxt);
     free(fidx);
 
-    if (*res_lo != UINT64_MAX || *res_hi != UINT64_MAX) {
+    /* Write path count only if neither sentinel is present.
+       Overflow sentinel:     res_lo == res_hi == UINT64_MAX
+       Partial-run sentinel:  res_hi == UINT64_MAX - 1        */
+    if (*res_hi != UINT64_MAX && *res_hi != (UINT64_MAX - 1)) {
         *res_lo = (uint64_t) total;
         *res_hi = (uint64_t)(total >> 64);
     }
@@ -1228,7 +1240,8 @@ def _get_lib():
             const int *adj_off, const int *adj_dat,
             uint64_t *res_lo, uint64_t *res_hi,
             int verbose,
-            const char *checkpoint_path, double checkpoint_secs);
+            const char *checkpoint_path, double checkpoint_secs,
+            int step_limit);
     """)
     lib = ffi.dlopen(so_path)
     _LIB_CACHE[cache_key] = (lib, ffi)
@@ -1292,6 +1305,7 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
         n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
         c_res_lo, c_res_hi, int(verbose),
         c_ckpt, ffi.cast("double", checkpoint_secs),
+        ffi.cast("int", -1),   # step_limit: -1 = full run
     )
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
@@ -1301,8 +1315,75 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
         )
     return (hi << 64) | lo
 
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
+
+def partial_dp_time_c(n: int, order: list, adj: dict,
+                      step_limit: int) -> float:
+    """Run the frontier DP for at most *step_limit* steps and return elapsed ms.
+
+    Used to rank candidate orderings by early-phase DP cost without paying
+    for the full computation.  Typically step_limit = n // 2 captures the
+    expensive peak steps while running in a fraction of the full DP time.
+
+    Parameters
+    ----------
+    n          : graph size
+    order      : vertex ordering (1-indexed), length n
+    adj        : adjacency dict {v: iterable_of_neighbours}
+    step_limit : stop after this many steps (must be >= 1)
+
+    Returns
+    -------
+    Elapsed wall-clock time in milliseconds for those steps.
+    """
+    lib, ffi = _get_lib()
+
+    pos = [0] * (n + 1)
+    for i, v in enumerate(order): pos[v] = i
+
+    last_s = [0] * (n + 1)
+    for v in range(1, n + 1):
+        nbr_pos = [pos[w] for w in adj[v]]
+        last_s[v] = max(nbr_pos) if nbr_pos else pos[v]
+
+    adj_off_list = [0] * (n + 2)
+    for v in range(1, n + 1):
+        adj_off_list[v + 1] = adj_off_list[v] + len(adj[v])
+    adj_dat_list: list = []
+    for v in range(1, n + 1):
+        adj_dat_list.extend(sorted(adj[v]))
+
+    c_order   = ffi.new("int[]", list(order))
+    c_pos     = ffi.new("int[]", pos)
+    c_last_s  = ffi.new("int[]", last_s)
+    c_adj_off = ffi.new("int[]", adj_off_list)
+    c_adj_dat = ffi.new("int[]", adj_dat_list if adj_dat_list else [0])
+    c_res_lo  = ffi.new("uint64_t*")
+    c_res_hi  = ffi.new("uint64_t*")
+    c_empty   = ffi.new("char[]", b"")
+
+    lib.count_ham_paths_c(
+        n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
+        c_res_lo, c_res_hi, 0,      # verbose=False
+        c_empty, ffi.cast("double", 0.0),
+        ffi.cast("int", step_limit),
+    )
+    # Decode result:
+    #   res_hi == UINT64_MAX-1 : partial-run sentinel — res_lo holds elapsed ms
+    #   res_hi == UINT64_MAX   : MAX_FS_FAST overflow (ordering exceeds pw limit)
+    #   otherwise              : step_limit >= n, full DP ran (shouldn't happen)
+    import struct
+    hi = int(c_res_hi[0])
+    if hi == 0xFFFFFFFFFFFFFFFE:       # UINT64_MAX - 1: partial run sentinel
+        elapsed_ms = struct.unpack('d', struct.pack('Q', int(c_res_lo[0])))[0]
+    elif hi == 0xFFFFFFFFFFFFFFFF:     # UINT64_MAX: overflow — ordering is unusable
+        elapsed_ms = float('inf')
+    else:
+        # step_limit >= n, so the full DP completed — measure elapsed via res_lo/hi
+        # This shouldn't happen in normal use but return inf to signal "use full DP"
+        elapsed_ms = float('inf')
+    return elapsed_ms
+
+
     import sys, time
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
