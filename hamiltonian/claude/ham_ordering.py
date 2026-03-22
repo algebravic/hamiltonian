@@ -342,29 +342,35 @@ def _dp_cost(adj: dict, order: list, pw_bound: int) -> float:
     #   - Hybrid: cost += proxy × 2^n_back × (fw/pw)² at each step.
 
 def _dp_cost(adj: dict, order: list, pw_bound: int,
-             expand_base: float = 1.55) -> float:
+             expand_base: float = 1.55,
+             density_alpha: float = 0.25) -> float:
     """
     Estimate DP cost given a vertex ordering, without running the DP.
 
-    The cost function is:
-        C(sigma) = sum_i  s_hat_i * expand_base^n_back(i) * (|F_i|/pw)^2
+    Cost function (V6):
+        C(sigma) = sum_i  s_hat_i * expand_base^nb(i) * (1 + alpha*e_bag(i)/fw(i))
+                                  * (fw(i)/pw)^2
 
-    where s_hat_i is a geometric proxy for the state count at step i,
-    updated as:
-        s_hat_{i+1} = max(s_hat_i * expand_base^n_back(i) * (|F_i|/pw)^2
-                                   * 0.5^n_elim(i),  1)
+    where:
+      nb(i)     = back-edges introduced at step i (edges from new vertex
+                  to already-placed frontier vertices)
+      e_bag(i)  = edges in the induced subgraph G[F_i] (intra-frontier edges)
+      fw(i)     = |F_i|, frontier size at step i
+      s_hat_i   = geometric proxy for state count, updated as:
+                  s_hat_{i+1} = max(s_hat_i * expand * 0.5^n_elim(i), 1)
 
-    expand_base controls the assumed expansion per back-edge.  The
-    theoretical maximum is 2 (every back-edge subset valid), but empirical
-    profiling shows the actual median expansion factor per back-edge is
-    ~1.1-1.15, with 1.5 being a conservative upper bound that covers most
-    expanding steps.  The optimal value minimises proxy miscalibration and
-    can be tuned via --expand-base.
+    The density amplifier (1 + alpha*e_bag/fw) captures your observation that
+    a denser frontier has richer internal connectivity constraints, which
+    amplifies state expansion beyond what nb alone predicts.  Calibrated at
+    alpha=0.25 from n=40 experiments; set alpha=0.0 to recover V5 behaviour.
+
+    expand_base: per-back-edge expansion factor (calibrated to 1.55 from
+                 n=59/61 profile data; theoretical max is 2.0).
 
     Returns None if the ordering exceeds pw_bound.
     """
     n = len(order)
-    pos   = {v: i for i, v in enumerate(order)}
+    pos       = {v: i for i, v in enumerate(order)}
     last_step = {v: max((pos[w] for w in adj[v]), default=pos[v])
                  for v in range(1, n + 1)}
 
@@ -372,27 +378,39 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
     cost    = 0.0
     profile = 0
 
+    # Track frontier incrementally (O(n*deg) total instead of O(n^2))
+    frontier = set()
+
     for step in range(n):
         v = order[step]
-        fw = sum(1 for u in order[:step + 1]
-                 if any(pos[nb] > step for nb in adj[u]))
+
+        # Introduce v; remove vertices whose last future neighbor is now placed
+        frontier.add(v)
+        frontier -= {u for u in frontier
+                     if last_step[u] == step - 1 or
+                     all(pos[w] <= step for w in adj[u])}
+        # Recompute cleanly: frontier = vertices placed so far with future neighbors
+        frontier = {u for u in order[:step + 1]
+                    if any(pos[w] > step for w in adj[u])}
+
+        fw = len(frontier)
         if fw > pw_bound:
             return None
 
-        n_back = sum(1 for w in adj[v]
-                     if pos[w] < step and w in set(order[:step]))
-        n_elim = sum(1 for u in order[:step + 1]
-                     if last_step[u] == step)
+        n_back = sum(1 for w in adj[v] if pos[w] < step)
+        n_elim = sum(1 for u in order[:step + 1] if last_step[u] == step)
 
-        fw_weight = (fw / pw_bound) ** 2
+        # Intra-frontier edges: G[frontier]
+        e_bag = sum(1 for u in frontier for w in adj[u]
+                    if w in frontier and pos[u] < pos[w])
 
-        expand   = (expand_base ** n_back) * fw_weight
-        compress = max(0.5 ** n_elim, 0.01)
+        fw_weight    = (fw / pw_bound) ** 2
+        density_amp  = 1.0 + density_alpha * (e_bag / fw) if fw > 0 else 1.0
+        expand       = (expand_base ** n_back) * fw_weight * density_amp
+        compress     = max(0.5 ** n_elim, 0.01)
 
-        step_cost = proxy * expand
-        cost += step_cost
-
-        proxy = max(proxy * expand * compress, 1.0)
+        cost  += proxy * expand
+        proxy  = max(proxy * expand * compress, 1.0)
         profile += fw
 
     return cost + 0.001 * profile
@@ -406,6 +424,7 @@ def sa_refine_order(
     n_iter: int = 100_000,
     seed: int = 42,
     expand_base: float = 1.55,
+    density_alpha: float = 0.25,
 ) -> list:
     """
     Refine *init_order* using simulated annealing while keeping
@@ -428,7 +447,8 @@ def sa_refine_order(
 
     rng = random.Random(seed)
     order = list(init_order)
-    cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base)
+    cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base,
+                     density_alpha=density_alpha)
     if cost is None:
         raise ValueError("init_order already exceeds pw_bound")
 
@@ -443,7 +463,8 @@ def sa_refine_order(
         i, j = sorted(rng.sample(range(n), 2))
         order[i], order[j] = order[j], order[i]
 
-        new_cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base)
+        new_cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base,
+                         density_alpha=density_alpha)
         if new_cost is None:
             order[i], order[j] = order[j], order[i]
             continue
@@ -473,6 +494,9 @@ def best_multistart_order(
     fast_threshold_s: float = 0.5,
     consecutive_fast_stop: int = 10,
     expand_base: float = 1.55,
+    density_alpha: float = 0.25,
+    stratified: bool = False,
+    solver: str = "cd195",
     verbose: bool = True,
 ) -> tuple:
     """
@@ -510,8 +534,13 @@ def best_multistart_order(
     if verbose:
         print(f"  Multi-start SA: pw={pw_bound}, SA iters={n_iter:,} per start",
               flush=True)
+        if stratified:
+            print(f"  stratified=True, solver={solver}", flush=True)
+        else:
+            print(f"  unstratified, solver={solver}", flush=True)
 
-    gen = pathwidth_order(G, bound=pw_bound, all_solutions=True)
+    gen = pathwidth_order(G, bound=pw_bound, all_solutions=True,
+                          stratified=stratified, solver=solver)
     t_last = time.time()
 
     for pw, order in gen:
@@ -529,8 +558,10 @@ def best_multistart_order(
 
         refined = sa_refine_order(adj, n, order, pw_bound,
                                   n_iter=n_iter, seed=n_total * 17 + 42,
-                                  expand_base=expand_base)
-        cost = _dp_cost(adj, refined, pw_bound, expand_base=expand_base)
+                                  expand_base=expand_base,
+                                  density_alpha=density_alpha)
+        cost = _dp_cost(adj, refined, pw_bound, expand_base=expand_base,
+                         density_alpha=density_alpha)
         all_candidates.append((cost, refined[:]))
 
         is_best = (cost is not None and cost < best_cost)

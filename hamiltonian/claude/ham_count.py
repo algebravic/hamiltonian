@@ -212,6 +212,10 @@ def parse_args():
                    help="Expansion base c in proxy cost c^n_back (default: 1.55). "
                         "Calibrated from n=59/61 profile data; c=2.0 gives original "
                         "behaviour. Empirical optimum ~1.55 (error valley 1.4–1.7).")
+    p.add_argument("--density-alpha", type=float, default=0.25, metavar="A",
+                   help="Weight of intra-bag edge density in proxy cost (default: 0.25). "
+                        "Adds (1 + A*e_bag/fw) as a density amplifier. "
+                        "Set 0.0 to disable (V5 behaviour).")
     p.add_argument("--bound", type=int, default=None, metavar="K",
                    help="Pathwidth upper bound hint for the MaxSAT solver.")
     p.add_argument("--stratified", action="store_true",
@@ -276,16 +280,21 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
     # --- SA refinement ---
     if pw is not None and not args.no_refine:
         eb = getattr(args, 'expand_base', 1.55)
+        da = getattr(args, 'density_alpha', 0.25)
         if getattr(args, 'multi_start', False):
             order, ms_cost, ms_candidates, ms_distinct, ms_total = best_multistart_order(
                 adj, n_vertices, G, pw,
                 n_iter=args.refine_iters,
                 max_solutions=args.multi_start_max,
                 expand_base=eb,
+                density_alpha=da,
+                stratified=args.stratified,
+                solver=args.solver,
                 verbose=True,
             )
             print(f"  multi-start: {ms_total} solutions, {ms_distinct} distinct, "
-                  f"best SA cost={ms_cost:.3e}  (expand_base={eb})", flush=True)
+                  f"best SA cost={ms_cost:.3e}  "
+                  f"(expand_base={eb}, density_alpha={da})", flush=True)
 
             # Optional: re-rank top candidates by actual partial-DP timing
             k = getattr(args, 'multi_start_validate', 0)
@@ -299,7 +308,8 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
         else:
             order = sa_refine_order(adj, n_vertices, order, pw,
                                     n_iter=args.refine_iters,
-                                    expand_base=eb)
+                                    expand_base=eb,
+                                    density_alpha=da)
 
     t_ord = time.time() - t_ord
     mx, pr = frontier_stats(adj, order)
