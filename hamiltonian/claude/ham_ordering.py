@@ -341,7 +341,34 @@ def _dp_cost(adj: dict, order: list, pw_bound: int) -> float:
     #     cumulative state-count growth across consecutive expansions.
     #   - Hybrid: cost += proxy × 2^n_back × (fw/pw)² at each step.
 
-    proxy   = 1.0   # geometric state-count estimate (relative units)
+def _dp_cost(adj: dict, order: list, pw_bound: int,
+             expand_base: float = 1.55) -> float:
+    """
+    Estimate DP cost given a vertex ordering, without running the DP.
+
+    The cost function is:
+        C(sigma) = sum_i  s_hat_i * expand_base^n_back(i) * (|F_i|/pw)^2
+
+    where s_hat_i is a geometric proxy for the state count at step i,
+    updated as:
+        s_hat_{i+1} = max(s_hat_i * expand_base^n_back(i) * (|F_i|/pw)^2
+                                   * 0.5^n_elim(i),  1)
+
+    expand_base controls the assumed expansion per back-edge.  The
+    theoretical maximum is 2 (every back-edge subset valid), but empirical
+    profiling shows the actual median expansion factor per back-edge is
+    ~1.1-1.15, with 1.5 being a conservative upper bound that covers most
+    expanding steps.  The optimal value minimises proxy miscalibration and
+    can be tuned via --expand-base.
+
+    Returns None if the ordering exceeds pw_bound.
+    """
+    n = len(order)
+    pos   = {v: i for i, v in enumerate(order)}
+    last_step = {v: max((pos[w] for w in adj[v]), default=pos[v])
+                 for v in range(1, n + 1)}
+
+    proxy   = 1.0
     cost    = 0.0
     profile = 0
 
@@ -359,19 +386,13 @@ def _dp_cost(adj: dict, order: list, pw_bound: int) -> float:
 
         fw_weight = (fw / pw_bound) ** 2
 
-        # Step cost = proxy × 2^n_back × fw_weight.
-        # This is the product of the estimated table size and the per-state
-        # subset enumeration cost, scaled by frontier width.
-        step_cost = proxy * float(1 << min(n_back, 20)) * fw_weight
+        expand   = (expand_base ** n_back) * fw_weight
+        compress = max(0.5 ** n_elim, 0.01)
+
+        step_cost = proxy * expand
         cost += step_cost
 
-        # Update proxy geometrically for the NEXT step:
-        # expansion proportional to (expected output / input) = 2^n_back × fw_weight,
-        # compression from eliminations.
-        expand   = float(1 << min(n_back, 20)) * fw_weight
-        compress = max(0.5 ** n_elim, 0.01)
-        proxy    = max(proxy * expand * compress, 1.0)
-
+        proxy = max(proxy * expand * compress, 1.0)
         profile += fw
 
     return cost + 0.001 * profile
@@ -384,6 +405,7 @@ def sa_refine_order(
     pw_bound: int,
     n_iter: int = 100_000,
     seed: int = 42,
+    expand_base: float = 1.55,
 ) -> list:
     """
     Refine *init_order* using simulated annealing while keeping
@@ -406,7 +428,7 @@ def sa_refine_order(
 
     rng = random.Random(seed)
     order = list(init_order)
-    cost = _dp_cost(adj, order, pw_bound)
+    cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base)
     if cost is None:
         raise ValueError("init_order already exceeds pw_bound")
 
@@ -421,8 +443,8 @@ def sa_refine_order(
         i, j = sorted(rng.sample(range(n), 2))
         order[i], order[j] = order[j], order[i]
 
-        new_cost = _dp_cost(adj, order, pw_bound)
-        if new_cost is None:                       # violates pathwidth
+        new_cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base)
+        if new_cost is None:
             order[i], order[j] = order[j], order[i]
             continue
 
@@ -444,12 +466,13 @@ def sa_refine_order(
 def best_multistart_order(
     adj: dict,
     n: int,
-    G,                        # networkx Graph for separation
+    G,
     pw_bound: int,
     n_iter: int = 100_000,
     max_solutions: int = 50,
     fast_threshold_s: float = 0.5,
     consecutive_fast_stop: int = 10,
+    expand_base: float = 1.55,
     verbose: bool = True,
 ) -> tuple:
     """
@@ -505,8 +528,9 @@ def best_multistart_order(
             consecutive_fast += 1
 
         refined = sa_refine_order(adj, n, order, pw_bound,
-                                  n_iter=n_iter, seed=n_total * 17 + 42)
-        cost = _dp_cost(adj, refined, pw_bound)
+                                  n_iter=n_iter, seed=n_total * 17 + 42,
+                                  expand_base=expand_base)
+        cost = _dp_cost(adj, refined, pw_bound, expand_base=expand_base)
         all_candidates.append((cost, refined[:]))
 
         is_best = (cost is not None and cost < best_cost)

@@ -208,6 +208,10 @@ def parse_args():
                         "(default). Suggested: K = n//2.")
     p.add_argument("--refine-iters", type=int, default=100_000, metavar="N",
                    help="SA iterations for secondary refinement (default: 100000).")
+    p.add_argument("--expand-base", type=float, default=1.55, metavar="C",
+                   help="Expansion base c in proxy cost c^n_back (default: 1.55). "
+                        "Calibrated from n=59/61 profile data; c=2.0 gives original "
+                        "behaviour. Empirical optimum ~1.55 (error valley 1.4–1.7).")
     p.add_argument("--bound", type=int, default=None, metavar="K",
                    help="Pathwidth upper bound hint for the MaxSAT solver.")
     p.add_argument("--stratified", action="store_true",
@@ -271,20 +275,21 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
 
     # --- SA refinement ---
     if pw is not None and not args.no_refine:
+        eb = getattr(args, 'expand_base', 1.55)
         if getattr(args, 'multi_start', False):
             order, ms_cost, ms_candidates, ms_distinct, ms_total = best_multistart_order(
                 adj, n_vertices, G, pw,
                 n_iter=args.refine_iters,
                 max_solutions=args.multi_start_max,
+                expand_base=eb,
                 verbose=True,
             )
             print(f"  multi-start: {ms_total} solutions, {ms_distinct} distinct, "
-                  f"best SA cost={ms_cost:.3e}", flush=True)
+                  f"best SA cost={ms_cost:.3e}  (expand_base={eb})", flush=True)
 
             # Optional: re-rank top candidates by actual partial-DP timing
             k = getattr(args, 'multi_start_validate', 0)
             if k > 0 and ms_candidates:
-                # Validate top-10 by SA cost (avoid re-running all if many)
                 top = ms_candidates[:min(10, len(ms_candidates))]
                 ranked = validate_multistart_orders(
                     top, adj, n_vertices, step_limit=k, verbose=True)
@@ -293,7 +298,8 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
                       f"has SA cost={ranked[0][1]:.3e}", flush=True)
         else:
             order = sa_refine_order(adj, n_vertices, order, pw,
-                                    n_iter=args.refine_iters)
+                                    n_iter=args.refine_iters,
+                                    expand_base=eb)
 
     t_ord = time.time() - t_ord
     mx, pr = frontier_stats(adj, order)
