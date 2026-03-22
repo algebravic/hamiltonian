@@ -570,7 +570,7 @@ def validate_multistart_orders(
     -------
     List of (partial_ms, sa_cost, order) sorted by partial_ms ascending.
     """
-    from ham_dp_c import partial_dp_time_c
+    from .ham_dp_c import partial_dp_time_c
 
     if verbose:
         print(f"  Validating {len(candidates)} candidates: "
