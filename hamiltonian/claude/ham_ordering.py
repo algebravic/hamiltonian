@@ -450,12 +450,13 @@ def sa_refine_order(
 
     best_order = order[:]
     best_cost = cost
+    best_iter = 0
     T = cost * 0.05
     if T == 0:
-        return order
+        return best_order
     decay = (cost * 1e-4 / T) ** (1.0 / n_iter)
 
-    for _ in range(n_iter):
+    for it in range(1, n_iter + 1):
         i, j = sorted(rng.sample(range(n), 2))
         order[i], order[j] = order[j], order[i]
 
@@ -464,6 +465,7 @@ def sa_refine_order(
                             spike_penalty=spike_penalty)
         if new_cost is None:
             order[i], order[j] = order[j], order[i]
+            T *= decay
             continue
 
         delta = new_cost - cost
@@ -472,12 +474,13 @@ def sa_refine_order(
             if new_cost < best_cost:
                 best_cost = new_cost
                 best_order = order[:]
+                best_iter = it
         else:
             order[i], order[j] = order[j], order[i]
 
         T *= decay
 
-    return best_order
+    return best_order, best_iter, best_cost
 
 
 
@@ -554,14 +557,13 @@ def best_multistart_order(
         else:
             consecutive_fast += 1
 
-        refined = sa_refine_order(adj, n, order, pw_bound,
+        refined, best_iter, sa_best_cost = sa_refine_order(
+                                  adj, n, order, pw_bound,
                                   n_iter=n_iter, seed=n_total * 17 + 42,
                                   expand_base=expand_base,
                                   density_alpha=density_alpha,
                                   spike_penalty=spike_penalty)
-        cost = _dp_cost(adj, refined, pw_bound, expand_base=expand_base,
-                         density_alpha=density_alpha,
-                         spike_penalty=spike_penalty)
+        cost = sa_best_cost   # already computed inside sa_refine_order
         all_candidates.append((cost, refined[:]))
 
         is_best = (cost is not None and cost < best_cost)
@@ -572,8 +574,10 @@ def best_multistart_order(
         if verbose:
             marker = "***" if is_best else "   "
             sk = "  [new skeleton]" if is_new_skeleton else f"  [fast {gen_time:.3f}s]"
+            pct = 100 * best_iter / n_iter
             print(f"  {marker} sol {n_total:3d}: SA cost={cost:.3e}  "
-                  f"best={best_cost:.3e}  gen={gen_time:.2f}s{sk}", flush=True)
+                  f"best={best_cost:.3e}  gen={gen_time:.2f}s  "
+                  f"best@{best_iter:,}/{n_iter:,} ({pct:.0f}%){sk}", flush=True)
 
         if n_total > max_solutions:
             if verbose:

@@ -315,11 +315,16 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
                 print(f"  validate: best by partial DP ({k} steps) "
                       f"has SA cost={ranked[0][1]:.3e}", flush=True)
         else:
-            order = sa_refine_order(adj, n_vertices, order, pw,
+            order, best_iter, _ = sa_refine_order(
+                                    adj, n_vertices, order, pw,
                                     n_iter=args.refine_iters,
                                     expand_base=eb,
                                     density_alpha=da,
                                     spike_penalty=sp)
+            if getattr(args, 'verbose', False) or True:
+                pct = 100 * best_iter / args.refine_iters
+                print(f"  SA best found at iter {best_iter:,}/{args.refine_iters:,} "
+                      f"({pct:.0f}%)", flush=True)
 
     t_ord = time.time() - t_ord
     mx, pr = frontier_stats(adj, order)
