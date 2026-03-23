@@ -850,6 +850,7 @@ void count_ham_paths_c(
         eh_insert(curr, KEY_MARKER, (u128)1);
 
     double t_start = now_ms(), t_prev = t_start, t_last_ckpt = t_start;
+    double t_ckpt_total = 0.0;  /* total time spent on checkpoint I/O, excluded from profile */
 
     if (verbose)
         fprintf(stderr,
@@ -1049,11 +1050,12 @@ void count_ham_paths_c(
 
         if (verbose) {
             double t_now = now_ms();
+            double dp_elapsed = t_now - t_start - t_ckpt_total;
             fprintf(stderr,
                 "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f\n",
                 step, v, fs, n_back,
                 states_in, curr->cnt,
-                t_now - t_prev, t_now - t_start);
+                t_now - t_prev, dp_elapsed);
             t_prev = t_now;
         }
 
@@ -1062,9 +1064,16 @@ void count_ham_paths_c(
             if ((t_now2 - t_last_ckpt) / 1000.0 >= checkpoint_secs) {
                 if (ckpt_save(checkpoint_path, n, order, step, fs,
                               frontier, total, curr)) {
+                    double t_ckpt_end = now_ms();
+                    double ckpt_ms = t_ckpt_end - t_now2;
+                    t_ckpt_total += ckpt_ms;
                     if (verbose)
-                        fprintf(stderr, "# Checkpoint saved at step %d (%zu states)\n",
-                                step, curr->cnt);
+                        fprintf(stderr, "# Checkpoint saved at step %d (%zu states)"
+                                " [ckpt_ms=%.1f, excluded from profile]\n",
+                                step, curr->cnt, ckpt_ms);
+                    /* Advance t_prev past checkpoint I/O so next step_ms
+                       reflects DP time only, not disk write latency.       */
+                    t_prev = t_ckpt_end;
                     t_last_ckpt = t_now2;
                 }
             }

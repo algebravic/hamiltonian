@@ -216,6 +216,12 @@ def parse_args():
                    help="Weight of intra-bag edge density in proxy cost (default: 0.25). "
                         "Adds (1 + A*e_bag/fw) as a density amplifier. "
                         "Set 0.0 to disable (V5 behaviour).")
+    p.add_argument("--spike-penalty", type=float, default=0.0, metavar="P",
+                   help="Soft-relax the pathwidth constraint in SA (default: 0.0 = hard). "
+                        "Steps exceeding pw are penalised by P^overage rather than "
+                        "rejected outright, letting SA trade early spikes for a smoother "
+                        "profile.  P=16 is a reasonable starting point.  "
+                        "The resulting ordering may exceed pw_bound.")
     p.add_argument("--bound", type=int, default=None, metavar="K",
                    help="Pathwidth upper bound hint for the MaxSAT solver.")
     p.add_argument("--stratified", action="store_true",
@@ -281,6 +287,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
     if pw is not None and not args.no_refine:
         eb = getattr(args, 'expand_base', 1.55)
         da = getattr(args, 'density_alpha', 0.25)
+        sp = getattr(args, 'spike_penalty', 0.0)
         if getattr(args, 'multi_start', False):
             order, ms_cost, ms_candidates, ms_distinct, ms_total = best_multistart_order(
                 adj, n_vertices, G, pw,
@@ -288,13 +295,15 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
                 max_solutions=args.multi_start_max,
                 expand_base=eb,
                 density_alpha=da,
+                spike_penalty=sp,
                 stratified=args.stratified,
                 solver=args.solver,
                 verbose=True,
             )
             print(f"  multi-start: {ms_total} solutions, {ms_distinct} distinct, "
                   f"best SA cost={ms_cost:.3e}  "
-                  f"(expand_base={eb}, density_alpha={da})", flush=True)
+                  f"(expand_base={eb}, density_alpha={da}, spike_penalty={sp})",
+                  flush=True)
 
             # Optional: re-rank top candidates by actual partial-DP timing
             k = getattr(args, 'multi_start_validate', 0)
@@ -309,7 +318,8 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
             order = sa_refine_order(adj, n_vertices, order, pw,
                                     n_iter=args.refine_iters,
                                     expand_base=eb,
-                                    density_alpha=da)
+                                    density_alpha=da,
+                                    spike_penalty=sp)
 
     t_ord = time.time() - t_ord
     mx, pr = frontier_stats(adj, order)
@@ -339,9 +349,10 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
     t_dp = time.time() - t_dp
 
     pw_str = f"pw={pw:2d}" if pw is not None else "pw= ?"
+    spike_str = f" [SPIKE +{mx-pw}]" if (pw is not None and mx > pw) else ""
     print(
         f"{label}  {pw_str}  max_fw={mx:2d}  profile={pr:5d}"
-        f"  ord={t_ord:.2f}s  dp={t_dp:.3f}s  ham_paths={count}",
+        f"  ord={t_ord:.2f}s  dp={t_dp:.3f}s  ham_paths={count}{spike_str}",
         flush=True,
     )
     return use_pw, count

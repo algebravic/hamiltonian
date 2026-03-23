@@ -343,31 +343,30 @@ def _dp_cost(adj: dict, order: list, pw_bound: int) -> float:
 
 def _dp_cost(adj: dict, order: list, pw_bound: int,
              expand_base: float = 1.55,
-             density_alpha: float = 0.25) -> float:
+             density_alpha: float = 0.25,
+             spike_penalty: float = 0.0) -> float:
     """
     Estimate DP cost given a vertex ordering, without running the DP.
 
     Cost function (V6):
         C(sigma) = sum_i  s_hat_i * expand_base^nb(i) * (1 + alpha*e_bag(i)/fw(i))
-                                  * (fw(i)/pw)^2
+                                  * fw_weight(i)
 
-    where:
-      nb(i)     = back-edges introduced at step i (edges from new vertex
-                  to already-placed frontier vertices)
-      e_bag(i)  = edges in the induced subgraph G[F_i] (intra-frontier edges)
-      fw(i)     = |F_i|, frontier size at step i
-      s_hat_i   = geometric proxy for state count, updated as:
-                  s_hat_{i+1} = max(s_hat_i * expand * 0.5^n_elim(i), 1)
+    where fw_weight(i) = (fw(i)/pw)^2 for fw <= pw_bound, and
+    (fw(i)/pw)^2 * spike_penalty^(fw(i)-pw_bound) for fw > pw_bound.
 
-    The density amplifier (1 + alpha*e_bag/fw) captures your observation that
-    a denser frontier has richer internal connectivity constraints, which
-    amplifies state expansion beyond what nb alone predicts.  Calibrated at
-    alpha=0.25 from n=40 experiments; set alpha=0.0 to recover V5 behaviour.
+    spike_penalty controls the relaxation of the pathwidth constraint:
+      0.0  = hard constraint (return None if fw > pw_bound), default
+      >0.0 = soft constraint: over-budget steps are penalised by
+             spike_penalty^overage per step, but the SA can explore them.
+             spike_penalty=16 means fw=pw+1 costs 16x more per unit proxy.
+             This lets the SA trade one early spike (cheap) for a smoother
+             overall profile, which can yield a lower total cost.
 
-    expand_base: per-back-edge expansion factor (calibrated to 1.55 from
-                 n=59/61 profile data; theoretical max is 2.0).
+    The optimal spike_penalty is problem-dependent; 8-32 is a reasonable
+    starting range (penalises spikes but does not make them prohibitive).
 
-    Returns None if the ordering exceeds pw_bound.
+    Returns None only when spike_penalty=0.0 and fw > pw_bound.
     """
     n = len(order)
     pos       = {v: i for i, v in enumerate(order)}
@@ -377,34 +376,31 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
     proxy   = 1.0
     cost    = 0.0
     profile = 0
-
-    # Track frontier incrementally (O(n*deg) total instead of O(n^2))
     frontier = set()
 
     for step in range(n):
         v = order[step]
 
-        # Introduce v; remove vertices whose last future neighbor is now placed
-        frontier.add(v)
-        frontier -= {u for u in frontier
-                     if last_step[u] == step - 1 or
-                     all(pos[w] <= step for w in adj[u])}
-        # Recompute cleanly: frontier = vertices placed so far with future neighbors
+        # Recompute frontier cleanly each step
         frontier = {u for u in order[:step + 1]
                     if any(pos[w] > step for w in adj[u])}
 
         fw = len(frontier)
         if fw > pw_bound:
-            return None
+            if spike_penalty == 0.0:
+                return None
+            # Soft penalty: scale fw_weight by spike_penalty^overage
+            overage = fw - pw_bound
+            fw_weight = (fw / pw_bound) ** 2 * (spike_penalty ** overage)
+        else:
+            fw_weight = (fw / pw_bound) ** 2
 
         n_back = sum(1 for w in adj[v] if pos[w] < step)
         n_elim = sum(1 for u in order[:step + 1] if last_step[u] == step)
 
-        # Intra-frontier edges: G[frontier]
         e_bag = sum(1 for u in frontier for w in adj[u]
                     if w in frontier and pos[u] < pos[w])
 
-        fw_weight    = (fw / pw_bound) ** 2
         density_amp  = 1.0 + density_alpha * (e_bag / fw) if fw > 0 else 1.0
         expand       = (expand_base ** n_back) * fw_weight * density_amp
         compress     = max(0.5 ** n_elim, 0.01)
@@ -425,30 +421,30 @@ def sa_refine_order(
     seed: int = 42,
     expand_base: float = 1.55,
     density_alpha: float = 0.25,
+    spike_penalty: float = 0.0,
 ) -> list:
     """
-    Refine *init_order* using simulated annealing while keeping
-    max_fw <= pw_bound (preserving the exact pathwidth).
+    Refine *init_order* using simulated annealing.
 
-    Minimises the estimated DP cost:
-      Σ_{peak-fw steps} 2^{n_back}  +  0.01 * profile
+    By default (spike_penalty=0.0) the exact pathwidth is preserved: any
+    swap that raises max_fw above pw_bound is rejected.
 
-    This directly penalises back-edges at maximum-frontier steps,
-    which drive the multi-edge subset enumeration cost.
+    With spike_penalty > 0, the constraint is relaxed to a soft penalty:
+    over-budget steps are penalised by spike_penalty^overage in the cost
+    function but not hard-rejected.  This lets SA trade a small number of
+    early spikes (cheap, because the proxy state count is low) for a
+    smoother overall profile.  spike_penalty=16 is a reasonable starting
+    point: fw=pw+1 costs 16x the normal rate at that proxy level.
 
-    Parameters
-    ----------
-    init_order : starting ordering (typically the MaxSAT pathwidth order)
-    pw_bound   : maximum allowed frontier width (= true pathwidth)
-    n_iter     : number of SA iterations
-    seed       : random seed
+    The returned ordering may have max_fw > pw_bound when spike_penalty > 0.
+    Use frontier_stats() to check the actual max after refinement.
     """
     import math
 
     rng = random.Random(seed)
     order = list(init_order)
     cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base,
-                     density_alpha=density_alpha)
+                    density_alpha=density_alpha, spike_penalty=spike_penalty)
     if cost is None:
         raise ValueError("init_order already exceeds pw_bound")
 
@@ -464,7 +460,8 @@ def sa_refine_order(
         order[i], order[j] = order[j], order[i]
 
         new_cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base,
-                         density_alpha=density_alpha)
+                            density_alpha=density_alpha,
+                            spike_penalty=spike_penalty)
         if new_cost is None:
             order[i], order[j] = order[j], order[i]
             continue
@@ -495,6 +492,7 @@ def best_multistart_order(
     consecutive_fast_stop: int = 10,
     expand_base: float = 1.55,
     density_alpha: float = 0.25,
+    spike_penalty: float = 0.0,
     stratified: bool = False,
     solver: str = "cd195",
     verbose: bool = True,
@@ -559,9 +557,11 @@ def best_multistart_order(
         refined = sa_refine_order(adj, n, order, pw_bound,
                                   n_iter=n_iter, seed=n_total * 17 + 42,
                                   expand_base=expand_base,
-                                  density_alpha=density_alpha)
+                                  density_alpha=density_alpha,
+                                  spike_penalty=spike_penalty)
         cost = _dp_cost(adj, refined, pw_bound, expand_base=expand_base,
-                         density_alpha=density_alpha)
+                         density_alpha=density_alpha,
+                         spike_penalty=spike_penalty)
         all_candidates.append((cost, refined[:]))
 
         is_best = (cost is not None and cost < best_cost)
