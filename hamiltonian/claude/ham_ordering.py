@@ -299,11 +299,19 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
     proxy   = 1.0
     cost    = 0.0
     profile = 0
+    frontier = set()
 
     for step in range(n):
         v = order[step]
-        frontier = frozenset(u for u in order[:step + 1]
-                             if any(pos[w] > step for w in adj[u]))
+
+        # Incremental frontier update: introduce v, then eliminate any vertex
+        # whose last future neighbour has now been placed.
+        # u leaves the frontier after step last_step[u] (its last neighbour's step),
+        # so it should be absent from step last_step[u]+1 onward — i.e. remove
+        # when last_step[u] <= current step.
+        frontier.add(v)
+        frontier -= {u for u in list(frontier) if last_step[u] <= step}
+
         fw = len(frontier)
 
         if fw > pw_bound:
