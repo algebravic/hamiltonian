@@ -256,91 +256,6 @@ def best_order(adj: dict, n: int, method: str = "bfs+sa",
 # Secondary optimisation: refine a pathwidth-optimal ordering
 # ---------------------------------------------------------------------------
 
-def _dp_cost(adj: dict, order: list, pw_bound: int) -> float:
-    """
-    Estimate DP cost given a vertex ordering, without running the DP.
-
-    Models the actual memory access pattern:
-
-      running_cap  tracks the table capacity (slots) that the C code will
-                   actually use, mirroring ht_ensure_clear's resize logic.
-                   When states_out < states_in the table shrinks; when it
-                   doesn't, the large table carries forward and the next
-                   step scans it at full size.
-
-      step cost  = running_cap × 2^n_back
-                   (table slots to scan) × (subsets per source state)
-
-    This correctly penalises a long plateau of net-expanding steps at peak
-    fw, where the table stays large and every step pays the full scan cost.
-    It also penalises n_back=2 at 20M states more than n_back=3 at 5M states,
-    matching empirical ns/state observations.
-
-    A small profile term encourages earlier eliminations as a tiebreaker.
-
-    Returns None if the ordering exceeds pw_bound.
-    """
-    n = len(order)
-    pos   = {v: i for i, v in enumerate(order)}
-    # last_step[v]: last step at which v is still in frontier
-    last_step = {v: max((pos[w] for w in adj[v]), default=pos[v])
-                 for v in range(1, n + 1)}
-
-    def _next_pow2(x):
-        if x < 1: return 1
-        x -= 1
-        x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16; x |= x >> 32
-        return x + 1
-
-    # Simulate state count progression (rough estimate using connectivity theory)
-    # We track running_cap: the C table capacity after each step's ht_ensure_clear.
-    # ht_ensure_clear sizes nxt to next_pow2(estimated_output / 0.75).
-    # The estimate for fused_sweep is 1.5 × states_in.
-    # If actual output > 1.5 × states_in × 0.75, resize fires → cap doubles.
-    # But we don't know the actual output without running the DP.
-    # Approximation: use the profile-observed expansion factor doesn't work for new orderings.
-    # Instead use the theoretical max: output ≤ 2^n_back × states_in (loose upper bound).
-    # Better: use 1.0 as a neutral estimate, but penalise scan cost regardless.
-    #
-    # Simpler and empirically validated: use states_in as a proxy for table size
-    # (since cap ≈ next_pow2(states_in / 0.75) ≈ 2 × states_in typically),
-    # and multiply by 2^n_back for subset cost.
-
-    # Simulate frontier sojourn costs.
-    # Key metrics:
-    # 1. pressure × 2^n_back × (fw/pw)^2: models table-scan cost (unchanged)
-    # 2. sojourn penalty: vertex that stays in frontier for many steps
-    #    at peak fw contributes O(sojourn × Bell(pw)) to cumulative cost.
-    #    Penalise long sojourns at near-peak frontier widths.
-    # 3. profile (Σ fw): tiebreaker — with higher weight than before.
-    #
-    # The sojourn of vertex v = last_step[v] - pos[v].
-    # Sojourn cost: sojourn[v] × (fw_at_introduction / pw)^2.
-    # This directly penalises placing v early when it has late last-neighbors.
-
-    # Hybrid cost function combining two complementary signals:
-    #
-    # 1. PROXY × 2^n_back (per-step sweep cost):
-    #    proxy is a running geometric estimate of the current state count.
-    #    Multiplying by 2^n_back gives the cost of the fused_sweep at this step:
-    #    (estimated states in table) × (edge subsets enumerated per state).
-    #    This correctly penalises a single high-nb step at large state counts
-    #    (e.g. nb=4 at 17M states costs 16× more than nb=2 at 17M states).
-    #
-    # 2. GEOMETRIC PROXY UPDATE (plateau penalty):
-    #    The proxy compresses on elimination steps and expands on back-edge steps.
-    #    Using multiplicative accumulation (not additive pressure) correctly
-    #    captures compound growth across a long plateau of expanding steps —
-    #    seven consecutive 1.5× expansions cost 1.5^7 = 17×, which additive
-    #    tracking underestimates.  Long sojourns are penalised implicitly.
-    #
-    # The two signals are complementary:
-    #   - Pure geometric (previous): great for plateau penalty, weak on isolated
-    #     high-nb steps (nb=4 vs nb=2 look equal after two steps).
-    #   - Pure 2^nb (original pressure): great for single-step cost, blind to
-    #     cumulative state-count growth across consecutive expansions.
-    #   - Hybrid: cost += proxy × 2^n_back × (fw/pw)² at each step.
-
 def _dp_cost(adj: dict, order: list, pw_bound: int,
              expand_base: float = 1.55,
              density_alpha: float = 0.25,
@@ -348,26 +263,34 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
     """
     Estimate DP cost given a vertex ordering, without running the DP.
 
-    Cost function (V6):
-        C(sigma) = sum_i  s_hat_i * expand_base^nb(i) * (1 + alpha*e_bag(i)/fw(i))
-                                  * fw_weight(i)
+    Cost function (V7): V6 with connected-component Bell correction.
 
-    where fw_weight(i) = (fw(i)/pw)^2 for fw <= pw_bound, and
-    (fw(i)/pw)^2 * spike_penalty^(fw(i)-pw_bound) for fw > pw_bound.
+    Key insight (Victor Miller): if G[F_i] has k connected components
+    C_1,...,C_k, the valid state count is bounded by ∏_j Bell(|C_j|),
+    not Bell(fw).  A fw=13 frontier with 10 components [2,2,2,1,...,1]
+    has ∏Bell=8 vs Bell(13)=27.6M — a 3.4M× overestimate.
 
-    spike_penalty controls the relaxation of the pathwidth constraint:
-      0.0  = hard constraint (return None if fw > pw_bound), default
-      >0.0 = soft constraint: over-budget steps are penalised by
-             spike_penalty^overage per step, but the SA can explore them.
-             spike_penalty=16 means fw=pw+1 costs 16x more per unit proxy.
-             This lets the SA trade one early spike (cheap) for a smoother
-             overall profile, which can yield a lower total cost.
+    V7 keeps the V6 proxy structure (numerical stability) and applies a
+    multiplicative component correction at each step:
 
-    The optimal spike_penalty is problem-dependent; 8-32 is a reasonable
-    starting range (penalises spikes but does not make them prohibitive).
+        step_cost = proxy × c^nb × (fw/pw)^2 × (1+α·e_bag/fw)
+                           × sqrt(∏Bell(|C_j|) / Bell(fw))
 
-    Returns None only when spike_penalty=0.0 and fw > pw_bound.
+    The sqrt is used for numerical stability (avoids extreme compression
+    of the proxy when the correction is very small).
+
+    Back-edges to isolated components (|C_j|=1) contribute no expansion
+    since Bell(1)=1 means they have exactly one connectivity state.
+
+    Returns None if fw > pw_bound and spike_penalty == 0.
     """
+    import math
+
+    BELL_PRE = [1,1,2,5,15,52,203,877,4140,21147,115975,678570,
+                4213597,27644437,190899322,1382958545]
+    def bell_n(k):
+        return BELL_PRE[min(k, len(BELL_PRE)-1)]
+
     n = len(order)
     pos       = {v: i for i, v in enumerate(order)}
     last_step = {v: max((pos[w] for w in adj[v]), default=pos[v])
@@ -376,34 +299,66 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
     proxy   = 1.0
     cost    = 0.0
     profile = 0
-    frontier = set()
 
     for step in range(n):
         v = order[step]
-
-        # Recompute frontier cleanly each step
-        frontier = {u for u in order[:step + 1]
-                    if any(pos[w] > step for w in adj[u])}
-
+        frontier = frozenset(u for u in order[:step + 1]
+                             if any(pos[w] > step for w in adj[u]))
         fw = len(frontier)
+
         if fw > pw_bound:
             if spike_penalty == 0.0:
                 return None
-            # Soft penalty: scale fw_weight by spike_penalty^overage
-            overage = fw - pw_bound
-            fw_weight = (fw / pw_bound) ** 2 * (spike_penalty ** overage)
+            extra_penalty = spike_penalty ** (fw - pw_bound)
         else:
-            fw_weight = (fw / pw_bound) ** 2
+            extra_penalty = 1.0
 
-        n_back = sum(1 for w in adj[v] if pos[w] < step)
-        n_elim = sum(1 for u in order[:step + 1] if last_step[u] == step)
+        # Connected components of G[frontier]
+        vset = frontier
+        visited = set()
+        comp_of   = {}
+        comp_sizes = []
+        for start in vset:
+            if start in visited:
+                continue
+            comp = set(); q = [start]
+            while q:
+                u = q.pop()
+                if u in comp: continue
+                comp.add(u)
+                for w in adj[u]:
+                    if w in vset and w not in comp: q.append(w)
+            ci = len(comp_sizes)
+            comp_sizes.append(len(comp))
+            for u in comp: comp_of[u] = ci
+            visited |= comp
 
+        # Component correction: sqrt(∏Bell(|C_j|) / Bell(fw))
+        # Applied to fw_weight to discount fragmented frontiers.
+        # Note: G[frontier] graph components overestimate DP state reduction
+        # (path connectivity can link components through non-frontier vertices)
+        # so sqrt rather than linear is used as a partial correction.
+        bell_prod = math.prod(bell_n(s) for s in comp_sizes)
+        bell_fw   = bell_n(fw)
+        log_correction = 0.5 * (math.log(max(bell_prod, 1)) -
+                                 math.log(max(bell_fw, 1)))
+        comp_correction = math.exp(log_correction)   # in (0, 1]
+
+        # fw_weight with component correction
+        fw_weight = (fw / pw_bound) ** 2 * extra_penalty * comp_correction
+
+        # nb: ALL back-edges contribute (path connectivity through already-
+        # placed vertices means even graph-isolated components can be linked)
+        n_back = sum(1 for w in adj[v] if pos[w] < step and w in frontier)
+
+        # Density amplifier
         e_bag = sum(1 for u in frontier for w in adj[u]
                     if w in frontier and pos[u] < pos[w])
+        density_amp = (1.0 + density_alpha * (e_bag / fw)) if fw > 0 else 1.0
 
-        density_amp  = 1.0 + density_alpha * (e_bag / fw) if fw > 0 else 1.0
-        expand       = (expand_base ** n_back) * fw_weight * density_amp
-        compress     = max(0.5 ** n_elim, 0.01)
+        expand  = (expand_base ** n_back) * fw_weight * density_amp
+        n_elim  = sum(1 for u in order[:step + 1] if last_step[u] == step)
+        compress = max(0.5 ** n_elim, 0.01)
 
         cost  += proxy * expand
         proxy  = max(proxy * expand * compress, 1.0)

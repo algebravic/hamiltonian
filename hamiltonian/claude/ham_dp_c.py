@@ -1397,7 +1397,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-        from ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):
