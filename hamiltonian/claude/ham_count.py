@@ -145,10 +145,18 @@ def get_pathwidth_order(
     bound: int = None,
     stratified: bool = False,
     solver: str = "cd195",
+    minimize_profile: bool = False,
 ) -> tuple:
     """
     Compute the exact pathwidth and an optimal vertex ordering for G
     using the MaxSAT-based solver from algebravic/separation.
+
+    If minimize_profile=True, a two-phase solve is performed:
+      1. Find pw* (the exact pathwidth) via primary MaxSAT minimisation.
+      2. Re-solve with bound=pw* and minimize_profile=True to find the
+         ordering that minimises Σ_t |F_t| (profile) among all orderings
+         achieving pw*.  This uses soft clauses on the u[v,t] variables
+         which already encode frontier membership.
 
     Returns (pathwidth : int, order : list of vertices).
     """
@@ -162,12 +170,27 @@ def get_pathwidth_order(
             "or pass --no-pw to use the BFS heuristic instead."
         )
 
+    # Phase 1: find optimal pathwidth (always needed)
     pw, order = pathwidth_order(
         G,
         bound=bound,
         solver=solver,
         stratified=stratified,
     )
+
+    # Phase 2 (optional): re-solve to minimise profile at fixed pw
+    if minimize_profile:
+        print(f"  minimize_profile: re-solving with bound={pw} to minimise Σ|F_t|",
+              flush=True)
+        pw2, order = pathwidth_order(
+            G,
+            bound=pw,
+            minimize_profile=True,
+            solver=solver,
+            stratified=stratified,
+        )
+        assert pw2 == pw, f"Profile minimisation changed pw: {pw2} != {pw}"
+
     return pw, order
 
 
@@ -226,6 +249,12 @@ def parse_args():
                    help="Pathwidth upper bound hint for the MaxSAT solver.")
     p.add_argument("--stratified", action="store_true",
                    help="Use RC2Stratified (sometimes faster for large n).")
+    p.add_argument("--minimize-profile", action="store_true",
+                   help="After finding pw*, re-solve with a secondary MaxSAT objective "
+                        "to minimise the profile (Σ_t |F_t|) among all pw*-optimal "
+                        "orderings.  Uses soft clauses on the u[v,t] frontier variables. "
+                        "Adds a second solver invocation but produces orderings with "
+                        "smaller total frontier exposure.")
     p.add_argument("--solver", default="cd195", metavar="NAME",
                    help="SAT solver for RC2 (default: cd195).")
 
@@ -275,6 +304,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
                 bound=args.bound,
                 stratified=args.stratified,
                 solver=args.solver,
+                minimize_profile=getattr(args, 'minimize_profile', False),
             )
         except ImportError as e:
             print(f"  WARNING: {e}\n  Falling back to BFS.", flush=True)
