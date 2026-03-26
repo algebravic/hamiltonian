@@ -542,7 +542,7 @@ wheels = [
 [[package]]
 name = "separation"
 version = "0.1.0"
-source = { git = "https://github.com/algebravic/separation.git#a2116ee0724332f361dd3b3d5e511a123d42156e" }
+source = { git = "https://github.com/algebravic/separation.git#e6161f33bde05274386d10093d71d120fabf3bb3" }
 dependencies = [
     { name = "network" },
     { name = "networkx" },

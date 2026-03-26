@@ -1101,6 +1101,491 @@ cleanup:
         *res_hi = (uint64_t)(total >> 64);
     }
 }
+
+/* ======================================================================
+   SORT-MERGE DP IMPLEMENTATION
+   -----------------------------------------------------------------------
+   Alternative to EH+rsort: sorted flat array + parallel map + buffered
+   8-bit radix sort + P-way merge-with-dedup.
+
+   All memory access patterns are sequential; no hash table, no random
+   writes to large structures.
+
+   State table: SMEntry[] sorted by key.  Two alternating arrays (ping/pong).
+
+   Per DP step:
+     1. Introduce v   : sequential scan → new SMEntry[] (sorted by introduce())
+     2. Fused sweep    : P worker threads, each maps a shard of the sorted
+                         input; each worker runs buffered radix sort on its
+                         output shard; single-threaded P-way merge+dedup.
+   ====================================================================== */
+
+#include <pthread.h>
+
+typedef struct { u64 key; u128 val; } SMEntry;  /* 24 bytes, same as before */
+
+/* ── Buffered 8-bit LSD radix sort ─────────────────────────────────── */
+/* buf_size=32 → 256*32*24 = 192 KB working set → fits in L1           */
+#define SM_RBUF_SIZE  32
+#define SM_RBUCKETS  256
+
+typedef struct {
+    SMEntry slots[SM_RBUCKETS][SM_RBUF_SIZE];
+    size_t  cnt[SM_RBUCKETS];
+    size_t  prefix[SM_RBUCKETS];   /* next write offset in dst for bucket b */
+} RadixBuf;
+
+/* One scatter pass with buffered writes.  src→dst, extracting byte 'shift>>3'. */
+static void rbuf_pass(const SMEntry *src, size_t n, SMEntry *dst,
+                      int shift, RadixBuf *rb) {
+    /* Count phase */
+    size_t cnt[SM_RBUCKETS] = {0};
+    for (size_t i = 0; i < n; i++) cnt[(src[i].key >> shift) & 0xff]++;
+
+    /* Prefix sums → write positions */
+    size_t p = 0;
+    for (int b = 0; b < SM_RBUCKETS; b++) {
+        rb->prefix[b] = p;
+        p += cnt[b];
+        rb->cnt[b] = 0;
+    }
+
+    /* Scatter through per-bucket buffer (L1-resident) */
+    for (size_t i = 0; i < n; i++) {
+        int b = (src[i].key >> shift) & 0xff;
+        rb->slots[b][rb->cnt[b]++] = src[i];
+        if (rb->cnt[b] == SM_RBUF_SIZE) {
+            memcpy(dst + rb->prefix[b], rb->slots[b],
+                   SM_RBUF_SIZE * sizeof(SMEntry));
+            rb->prefix[b] += SM_RBUF_SIZE;
+            rb->cnt[b] = 0;
+        }
+    }
+    /* Flush partial buffers */
+    for (int b = 0; b < SM_RBUCKETS; b++) {
+        if (rb->cnt[b]) {
+            memcpy(dst + rb->prefix[b], rb->slots[b],
+                   rb->cnt[b] * sizeof(SMEntry));
+        }
+    }
+}
+
+/* Full 8-pass sort: result ends up in 'a' (8 passes = even, no final copy). */
+static void sm_radix_sort(SMEntry *a, SMEntry *tmp, size_t n) {
+    if (n < 2) return;
+    RadixBuf *rb = (RadixBuf*)malloc(sizeof(RadixBuf));
+    for (int pass = 0; pass < 8; pass++) {
+        SMEntry *src = (pass & 1) ? tmp : a;
+        SMEntry *dst = (pass & 1) ? a   : tmp;
+        rbuf_pass(src, n, dst, pass * 8, rb);
+    }
+    free(rb);
+    /* After 8 passes (even), result is in 'a'. */
+}
+
+/* ── P-way merge with dedup (min-heap) ───────────────────────────────── */
+typedef struct { const SMEntry *buf; size_t pos, len; } SMStream;
+typedef struct { u64 key; int s; } SMHEntry;
+
+static void sm_heap_sift(SMHEntry *h, int n, int i) {
+    for (;;) {
+        int m = i, l = 2*i+1, r = 2*i+2;
+        if (l < n && h[l].key < h[m].key) m = l;
+        if (r < n && h[r].key < h[m].key) m = r;
+        if (m == i) break;
+        SMHEntry t = h[i]; h[i] = h[m]; h[m] = t; i = m;
+    }
+}
+
+static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
+    SMHEntry *h = (SMHEntry*)malloc(P * sizeof(SMHEntry));
+    int hs = 0;
+    for (int i = 0; i < P; i++)
+        if (S[i].len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
+    for (int i = hs/2-1; i >= 0; i--) sm_heap_sift(h, hs, i);
+
+    size_t op = 0;
+    while (hs > 0) {
+        int s = h[0].s;
+        SMEntry cur = S[s].buf[S[s].pos++];
+        if (S[s].pos < S[s].len) {
+            h[0].key = S[s].buf[S[s].pos].key;
+            sm_heap_sift(h, hs, 0);
+        } else { h[0] = h[--hs]; if (hs > 0) sm_heap_sift(h, hs, 0); }
+
+        /* Dedup: accumulate all matching keys */
+        while (hs > 0 && h[0].key == cur.key) {
+            int s2 = h[0].s;
+            cur.val += S[s2].buf[S[s2].pos].val;
+            S[s2].pos++;
+            if (S[s2].pos < S[s2].len) {
+                h[0].key = S[s2].buf[S[s2].pos].key;
+                sm_heap_sift(h, hs, 0);
+            } else { h[0] = h[--hs]; if (hs > 0) sm_heap_sift(h, hs, 0); }
+        }
+        out[op++] = cur;
+    }
+    free(h);
+    return op;
+}
+
+
+/* ── SM table: sorted flat array with capacity ───────────────────────── */
+typedef struct {
+    SMEntry *data;
+    size_t   cnt;
+    size_t   cap;
+} SMTab;
+
+static SMTab *smtab_alloc(size_t initial_cap) {
+    SMTab *t = (SMTab*)calloc(1, sizeof(SMTab));
+    t->cap  = initial_cap < 1 ? 1024 : initial_cap;
+    t->data = (SMEntry*)malloc(t->cap * sizeof(SMEntry));
+    return t;
+}
+static void smtab_free(SMTab *t) { free(t->data); free(t); }
+
+static void smtab_ensure(SMTab *t, size_t needed) {
+    if (needed <= t->cap) return;
+    while (t->cap < needed) t->cap *= 2;
+    t->data = (SMEntry*)realloc(t->data, t->cap * sizeof(SMEntry));
+}
+
+/* ── SM introduce step ───────────────────────────────────────────────── */
+/* Sequential scan: introduce(key, fs) is key-monotone? No — canonical
+   renaming can reorder keys.  We sort the output after introducing.     */
+static void sm_introduce(const SMTab *src, SMTab *dst, int fs, SMEntry *tmp) {
+    smtab_ensure(dst, src->cnt);
+    for (size_t i = 0; i < src->cnt; i++) {
+        dst->data[i].key = introduce(src->data[i].key, fs);
+        dst->data[i].val = src->data[i].val;
+    }
+    dst->cnt = src->cnt;
+    /* Re-sort: introduce() may change ordering */
+    sm_radix_sort(dst->data, tmp, dst->cnt);
+}
+
+/* ── SM fused sweep ──────────────────────────────────────────────────── */
+#ifndef SM_NTHREADS
+#define SM_NTHREADS 6
+#endif
+
+/* Per-worker buffer size.  Caps peak memory at SM_NTHREADS × SM_BUF_ENTRIES × 24 B.
+ * With 6 threads and 8M entries: 6 × 8M × 24B = 1.15 GB peak regardless of nb.
+ * When a worker's buffer fills it is sorted and saved as a "run"; multiple
+ * runs per worker are merged into one sorted array before the final P-way merge. */
+#ifndef SM_BUF_ENTRIES
+#define SM_BUF_ENTRIES (8 * 1024 * 1024)   /* 8M entries = 192 MB per worker */
+#endif
+
+/* A sorted run produced by one worker.  After the map phase each worker
+   may have zero or more completed runs plus a partial final buffer.       */
+typedef struct {
+    SMEntry *data;
+    size_t   len;
+} SMRun;
+
+typedef struct {
+    SMEntry  *buf;         /* working buffer, SM_BUF_ENTRIES entries       */
+    SMEntry  *tmp;         /* scratch for radix sort, same size as buf     */
+    size_t    buf_len;     /* entries currently in buf                     */
+    SMRun    *runs;        /* completed sorted runs                        */
+    int       n_runs;
+    int       runs_cap;
+} SMWorkerState;
+
+static void sm_flush_run(SMWorkerState *ws) {
+    /* Sort the buffer */
+    sm_radix_sort(ws->buf, ws->tmp, ws->buf_len);
+
+    /* Deduplicate in-place: adjacent equal keys → sum counts.
+     * This is O(buf_len) and can compress nb=4 runs 10-76x before
+     * they are stored, dramatically reducing intra-worker merge cost. */
+    size_t out = 0;
+    for (size_t i = 0; i < ws->buf_len; ) {
+        size_t j = i + 1;
+        u128 acc = ws->buf[i].val;
+        while (j < ws->buf_len && ws->buf[j].key == ws->buf[i].key) {
+            acc += ws->buf[j].val;
+            j++;
+        }
+        ws->buf[out].key = ws->buf[i].key;
+        ws->buf[out].val = acc;
+        out++;
+        i = j;
+    }
+
+    /* Stash the compressed run */
+    if (ws->n_runs == ws->runs_cap) {
+        ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 4;
+        ws->runs = (SMRun*)realloc(ws->runs, ws->runs_cap * sizeof(SMRun));
+    }
+    SMEntry *run_data = (SMEntry*)malloc(out * sizeof(SMEntry));
+    memcpy(run_data, ws->buf, out * sizeof(SMEntry));
+    ws->runs[ws->n_runs++] = (SMRun){ run_data, out };
+    ws->buf_len = 0;
+}
+
+/* Merge all runs + remaining buf into one sorted array.
+   Returns newly malloc'd array; caller frees it.                          */
+static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
+    /* Flush the final partial buffer as one last run */
+    if (ws->buf_len > 0) sm_flush_run(ws);
+
+    if (ws->n_runs == 0) { *out_len = 0; return NULL; }
+    if (ws->n_runs == 1) {
+        *out_len = ws->runs[0].len;
+        SMEntry *d = ws->runs[0].data;
+        ws->runs[0].data = NULL;
+        return d;
+    }
+
+    /* Multi-run merge: total size = sum of all run lengths */
+    size_t total = 0;
+    for (int i = 0; i < ws->n_runs; i++) total += ws->runs[i].len;
+    SMEntry *out = (SMEntry*)malloc(total * sizeof(SMEntry));
+
+    /* Re-use sm_merge with a temporary SMStream array */
+    SMStream *S = (SMStream*)malloc(ws->n_runs * sizeof(SMStream));
+    for (int i = 0; i < ws->n_runs; i++)
+        S[i] = (SMStream){ ws->runs[i].data, 0, ws->runs[i].len };
+    *out_len = sm_merge(S, ws->n_runs, out);
+    free(S);
+    for (int i = 0; i < ws->n_runs; i++) free(ws->runs[i].data);
+    return out;
+}
+
+/* Map worker using fixed-size buffer with run accumulation */
+typedef struct {
+    const SMEntry   *in;
+    size_t           lo, hi;
+    int              fs, v_idx;
+    const int       *widxs;
+    int              n_back;
+    const int       *elim_idxs_desc;
+    int              n_elim;
+    int              step, n;
+    u128            *total;
+    pthread_mutex_t *total_mu;
+    SMWorkerState   *ws;     /* per-worker state (buffer + runs) */
+    /* output (filled after run merge) */
+    SMEntry         *out;
+    size_t           out_len;
+} SMWorker;
+
+static void *sm_worker_runs(void *arg) {
+    SMWorker      *w  = (SMWorker*)arg;
+    SMWorkerState *ws = w->ws;
+    int n_subsets = 1 << w->n_back;
+    u128 local_total = 0;
+
+    for (size_t i = w->lo; i < w->hi; i++) {
+        u64  base = w->in[i].key;
+        u128 cnt  = w->in[i].val;
+        for (int S = 0; S < n_subsets; S++) {
+            u64 nk    = base;
+            int valid = 1, nc_inc = 0;
+            for (int j = 0; j < w->n_back && valid; j++) {
+                if (!(S & (1 << j))) continue;
+                u64 nk2 = apply_edge(nk, w->fs, w->v_idx, w->widxs[j], &nc_inc);
+                if (!nk2) { valid = 0; break; }
+                nk = nk2;
+            }
+            if (!valid) continue;
+            if (w->n_elim > 0) {
+                nk = apply_elim_seq(nk, w->fs, w->elim_idxs_desc, w->n_elim,
+                                    w->step, w->n, cnt, &local_total);
+                if (!nk) continue;
+            }
+            /* Write to fixed buffer; flush as a run when full */
+            ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
+            if (ws->buf_len == SM_BUF_ENTRIES) sm_flush_run(ws);
+        }
+    }
+
+    if (local_total) {
+        pthread_mutex_lock(w->total_mu);
+        *w->total += local_total;
+        pthread_mutex_unlock(w->total_mu);
+    }
+
+    /* Merge all runs for this worker into a single sorted array */
+    w->out = sm_merge_runs(ws, &w->out_len);
+    return NULL;
+}
+
+static void sm_fused_sweep(const SMTab *curr, SMTab *nxt,
+                            int fs, int v_idx,
+                            const int *widxs, int n_back,
+                            const int *elim_idxs_desc, int n_elim,
+                            int step, int n,
+                            u128 *total,
+                            size_t prev_so) {
+    (void)prev_so;   /* no longer needed for pre-allocation */
+    int P = SM_NTHREADS;
+    size_t ni = curr->cnt;
+    size_t chunk = (ni + P - 1) / P;
+
+    SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
+    SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
+    pthread_t     *T  = (pthread_t*)malloc(P * sizeof(pthread_t));
+    pthread_mutex_t mu;
+    pthread_mutex_init(&mu, NULL);
+
+    for (int i = 0; i < P; i++) {
+        size_t lo = (size_t)i * chunk;
+        size_t hi = lo + chunk < ni ? lo + chunk : ni;
+        /* Each worker gets its own fixed-size buffer + scratch */
+        WS[i].buf     = (SMEntry*)malloc(SM_BUF_ENTRIES * sizeof(SMEntry));
+        WS[i].tmp     = (SMEntry*)malloc(SM_BUF_ENTRIES * sizeof(SMEntry));
+        WS[i].buf_len = 0;
+        WS[i].runs    = NULL;
+        WS[i].n_runs  = 0;
+        WS[i].runs_cap= 0;
+        W[i] = (SMWorker){
+            .in=curr->data, .lo=lo, .hi=hi,
+            .fs=fs, .v_idx=v_idx,
+            .widxs=widxs, .n_back=n_back,
+            .elim_idxs_desc=elim_idxs_desc, .n_elim=n_elim,
+            .step=step, .n=n,
+            .total=total, .total_mu=&mu,
+            .ws=&WS[i]
+        };
+        pthread_create(&T[i], NULL, sm_worker_runs, &W[i]);
+    }
+    for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
+    pthread_mutex_destroy(&mu);
+
+    /* Free per-worker scratch buffers */
+    for (int i = 0; i < P; i++) {
+        free(WS[i].buf);
+        free(WS[i].tmp);
+        free(WS[i].runs);
+    }
+
+    /* Final P-way merge of per-worker sorted arrays into nxt */
+    size_t raw_total = 0;
+    for (int i = 0; i < P; i++) raw_total += W[i].out_len;
+    smtab_ensure(nxt, raw_total + 1);
+
+    SMStream *S = (SMStream*)malloc(P * sizeof(SMStream));
+    for (int i = 0; i < P; i++)
+        S[i] = (SMStream){ W[i].out, 0, W[i].out_len };
+    nxt->cnt = sm_merge(S, P, nxt->data);
+
+    for (int i = 0; i < P; i++) free(W[i].out);
+    free(S); free(W); free(WS); free(T);
+}
+
+/* ── Top-level SM entry point ────────────────────────────────────────── */
+void count_ham_paths_sm(
+    int         n,
+    const int  *order,
+    const int  *pos,
+    const int  *last_s,
+    const int  *adj_off,
+    const int  *adj_dat,
+    uint64_t   *res_lo,
+    uint64_t   *res_hi,
+    int         verbose
+) {
+    int  frontier[MAX_FS_FAST + 2];
+    int *fidx = (int*)malloc((size_t)(n + 1) * sizeof(int));
+    int  fs   = 0;
+    for (int i = 0; i <= n; i++) fidx[i] = -1;
+
+    SMTab *curr = smtab_alloc(1024);
+    SMTab *nxt  = smtab_alloc(1024);
+    SMEntry *intro_tmp = NULL;  /* scratch for introduce sort */
+    size_t   intro_cap = 0;
+
+    u128 total = (u128)0;
+
+    /* Initial state */
+    curr->data[0].key = KEY_MARKER;
+    curr->data[0].val = (u128)1;
+    curr->cnt = 1;
+
+    double t_start = now_ms(), t_prev = t_start;
+
+    if (verbose)
+        fprintf(stderr,
+            "step  vertex  fs  n_back  states_in  states_out"
+            "  step_ms  cumul_ms  [sm]\n");
+
+    for (int step = 0; step < n; step++) {
+        int v = order[step];
+
+        if (fs >= MAX_FS_FAST) {
+            *res_lo = *res_hi = UINT64_MAX; goto cleanup;
+        }
+
+        /* ---- A. Introduce v ------------------------------------------ */
+        if (intro_cap < curr->cnt) {
+            intro_cap = curr->cnt * 2;
+            intro_tmp = (SMEntry*)realloc(intro_tmp, intro_cap * sizeof(SMEntry));
+        }
+        sm_introduce(curr, nxt, fs, intro_tmp);
+        { SMTab *t = curr; curr = nxt; nxt = t; }
+        frontier[fs] = v;
+        fidx[v]      = fs;
+        fs++;
+
+        /* ---- B + C. Back-edges + eliminations ------------------------- */
+        int v_idx  = fs - 1;
+        size_t states_in = curr->cnt;
+        int n_back = 0;
+        int widxs[8];
+        for (int ai = adj_off[v]; ai < adj_off[v+1]; ai++) {
+            int w = adj_dat[ai];
+            if (fidx[w] >= 0 && pos[w] < pos[v] && n_back < 8)
+                widxs[n_back++] = fidx[w];
+        }
+
+        int elim_asc[MAX_FS_FAST+2], n_elim = 0;
+        for (int ei = 0; ei < fs; ei++)
+            if (last_s[frontier[ei]] <= step) elim_asc[n_elim++] = ei;
+        int elim_desc[MAX_FS_FAST+2];
+        for (int e = 0; e < n_elim; e++)
+            elim_desc[e] = elim_asc[n_elim-1-e];
+
+        sm_fused_sweep(curr, nxt, fs, v_idx,
+                       widxs, n_back,
+                       elim_desc, n_elim,
+                       step, n, &total, 0);
+        { SMTab *t = curr; curr = nxt; nxt = t; }
+
+        /* ---- Eliminate from frontier ---------------------------------- */
+        for (int e = n_elim-1; e >= 0; e--) {
+            int ei = elim_asc[e];
+            fidx[frontier[ei]] = -1;
+            for (int k = ei; k < fs-1; k++) {
+                frontier[k] = frontier[k+1];
+                fidx[frontier[k]] = k;
+            }
+            fs--;
+        }
+
+        if (verbose) {
+            double t_now = now_ms();
+            fprintf(stderr,
+                "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f\n",
+                step, v, fs, n_back,
+                states_in, curr->cnt,
+                t_now - t_prev, t_now - t_start);
+            t_prev = t_now;
+        }
+    }
+
+    *res_lo = (uint64_t) total;
+    *res_hi = (uint64_t)(total >> 64);
+
+cleanup:
+    smtab_free(curr);
+    smtab_free(nxt);
+    free(intro_tmp);
+    free(fidx);
+}
 """
 
 # ---------------------------------------------------------------------------
@@ -1236,7 +1721,7 @@ def _get_lib():
         result = subprocess.run(
             ["gcc", "-O3", "-march=native", "-shared", "-fPIC", "-std=c11"]
             + d_flags
-            + ["-o", so_path, c_path],
+            + ["-o", so_path, c_path, "-lpthread"],
             capture_output=True,
         )
         if result.returncode != 0:
@@ -1251,6 +1736,12 @@ def _get_lib():
             int verbose,
             const char *checkpoint_path, double checkpoint_secs,
             int step_limit);
+
+        void count_ham_paths_sm(
+            int n, const int *order, const int *pos, const int *last_s,
+            const int *adj_off, const int *adj_dat,
+            uint64_t *res_lo, uint64_t *res_hi,
+            int verbose);
     """)
     lib = ffi.dlopen(so_path)
     _LIB_CACHE[cache_key] = (lib, ffi)
@@ -1321,6 +1812,72 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
         raise RuntimeError(
             "Frontier size exceeded MAX_FS_FAST=15 (pathwidth > 15). "
             "The packed uint64 state encoding is limited to 15 frontier slots."
+        )
+    return (hi << 64) | lo
+
+
+def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
+                                verbose: bool = False,
+                                checkpoint_path: str = "",
+                                checkpoint_secs: float = 300.0,
+                                **kwargs) -> int:
+    """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
+
+    Alternative to count_hamiltonian_paths_c (EH+rsort backend).
+    Uses: sorted flat array → parallel map → buffered 8-bit radix sort
+    (per thread) → P-way merge-with-dedup.
+
+    All memory access patterns are sequential; designed to saturate
+    bandwidth rather than hit random DRAM latency.  Expected to be
+    substantially faster than EH on large state counts.
+
+    Parameters
+    ----------
+    n               : graph size
+    order           : vertex ordering (1-indexed), length n.
+    adj             : adjacency dict {v: iterable_of_neighbours} (1-indexed).
+    verbose         : if True, print per-step profiling to stderr.
+    checkpoint_path : accepted for API compatibility; checkpointing is not
+                      yet implemented in the SM backend (ignored with warning).
+    checkpoint_secs : accepted for API compatibility; ignored.
+    """
+    import sys
+    if checkpoint_path:
+        print("# Warning: sort-merge backend does not yet support checkpointing; "
+              "checkpoint_path ignored.", file=sys.stderr)
+    lib, ffi = _get_lib()
+
+    pos = [0] * (n + 1)
+    for i, v in enumerate(order): pos[v] = i
+
+    last_s = [0] * (n + 1)
+    for v in range(1, n + 1):
+        nbr_pos = [pos[w] for w in adj[v]]
+        last_s[v] = max(nbr_pos) if nbr_pos else pos[v]
+
+    adj_off_list = [0] * (n + 2)
+    for v in range(1, n + 1):
+        adj_off_list[v + 1] = adj_off_list[v] + len(adj[v])
+    adj_dat_list: list = []
+    for v in range(1, n + 1):
+        adj_dat_list.extend(sorted(adj[v]))
+
+    c_order   = ffi.new("int[]", list(order))
+    c_pos     = ffi.new("int[]", pos)
+    c_last_s  = ffi.new("int[]", last_s)
+    c_adj_off = ffi.new("int[]", adj_off_list)
+    c_adj_dat = ffi.new("int[]", adj_dat_list if adj_dat_list else [0])
+    c_res_lo  = ffi.new("uint64_t*")
+    c_res_hi  = ffi.new("uint64_t*")
+
+    lib.count_ham_paths_sm(
+        n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
+        c_res_lo, c_res_hi, int(verbose),
+    )
+    lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
+    if lo == hi == 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError(
+            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth > 15)."
         )
     return (hi << 64) | lo
 

@@ -57,7 +57,7 @@ from math import isqrt
 
 import networkx as nx
 
-from .ham_dp_c import count_hamiltonian_paths_c, _get_lib
+from .ham_dp_c import count_hamiltonian_paths_c, count_hamiltonian_paths_sm,  _get_lib
 from .ham_ordering import build_graph, best_bfs_order, frontier_stats, sa_refine_order, best_multistart_order, validate_multistart_orders
 
 
@@ -273,6 +273,8 @@ def parse_args():
                         "Higher values reduce memory usage at the cost of more "
                         "hash probes per insert.  85 is recommended on machines "
                         "where peak two-table memory exceeds available RAM.")
+    p.add_argument("--sort-merge", action="store_true",
+                   help="Use the sort/merge implementation.")
     return p.parse_args()
 
 
@@ -374,13 +376,20 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
     # --- C frontier DP ---
     verbose = args.verbose or args.profile
     t_dp = time.time()
-    count = count_hamiltonian_paths_c(
-        n_vertices, order, adj,
-        verbose=verbose,
-        checkpoint_path=ckpt_path,
-        checkpoint_secs=args.checkpoint_interval,
-        load_factor=args.load_factor,
-    )
+
+    if args.sort_merge:
+        count = count_hamiltonian_paths_sm(
+            n_vertices, order, adj,
+            verbose=verbose,
+            )
+    else:
+        count = count_hamiltonian_paths_c(
+            n_vertices, order, adj,
+            verbose=verbose,
+            checkpoint_path=ckpt_path,
+            checkpoint_secs=args.checkpoint_interval,
+            load_factor=args.load_factor,
+            )
     t_dp = time.time() - t_dp
 
     pw_str = f"pw={pw:2d}" if pw is not None else "pw= ?"
