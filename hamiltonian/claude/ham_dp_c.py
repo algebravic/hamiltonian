@@ -1397,11 +1397,12 @@ static void *sm_worker_runs(void *arg) {
                                     w->step, w->n, cnt, &local_total);
                 if (!nk) continue;
             }
-            /* Write to fixed buffer; flush as a run when full */
             ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
             if (ws->buf_len == SM_BUF_ENTRIES) sm_flush_run(ws);
         }
     }
+    /* Always flush the final partial buffer as a sorted+deduped run */
+    if (ws->buf_len > 0) sm_flush_run(ws);
 
     if (local_total) {
         pthread_mutex_lock(w->total_mu);
@@ -1409,7 +1410,6 @@ static void *sm_worker_runs(void *arg) {
         pthread_mutex_unlock(w->total_mu);
     }
 
-    /* Merge all runs for this worker into a single sorted array */
     w->out = sm_merge_runs(ws, &w->out_len);
     return NULL;
 }
