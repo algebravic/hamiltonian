@@ -1414,14 +1414,14 @@ static void *sm_worker_runs(void *arg) {
     return NULL;
 }
 
-static void sm_fused_sweep(const SMTab *curr, SMTab *nxt,
+static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             int fs, int v_idx,
                             const int *widxs, int n_back,
                             const int *elim_idxs_desc, int n_elim,
                             int step, int n,
                             u128 *total,
                             size_t prev_so) {
-    (void)prev_so;   /* no longer needed for pre-allocation */
+    (void)prev_so;
     int P = SM_NTHREADS;
     size_t ni = curr->cnt;
     size_t chunk = (ni + P - 1) / P;
@@ -1435,7 +1435,6 @@ static void sm_fused_sweep(const SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) {
         size_t lo = (size_t)i * chunk;
         size_t hi = lo + chunk < ni ? lo + chunk : ni;
-        /* Each worker gets its own fixed-size buffer + scratch */
         WS[i].buf     = (SMEntry*)malloc(SM_BUF_ENTRIES * sizeof(SMEntry));
         WS[i].tmp     = (SMEntry*)malloc(SM_BUF_ENTRIES * sizeof(SMEntry));
         WS[i].buf_len = 0;
@@ -1456,7 +1455,20 @@ static void sm_fused_sweep(const SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
 
-    /* Free per-worker scratch buffers */
+    /* Workers are done reading curr — free it immediately before allocating
+     * nxt.  At this point curr->data is the largest single allocation alive
+     * (8+ GB for large n).  Freeing it here reduces peak memory by that
+     * amount, which is the difference between fitting in RAM and OOM.
+     * The caller swaps curr/nxt after we return; the freed SMTab struct
+     * will then become the new nxt and be reallocated by smtab_ensure on
+     * the next step's introduce phase.                                     */
+    free(curr->data);
+    curr->data = NULL;
+    curr->cap  = 0;
+    curr->cnt  = 0;
+
+    /* Free per-worker scratch buffers (buf/tmp already freed inside
+     * sm_worker_runs → sm_flush_run; runs freed by sm_merge_runs).        */
     for (int i = 0; i < P; i++) {
         free(WS[i].buf);
         free(WS[i].tmp);
@@ -1568,11 +1580,22 @@ void count_ham_paths_sm(
 
         if (verbose) {
             double t_now = now_ms();
+            /* Estimate peak RAM this step will have used (in GB).
+               curr is freed inside sm_fused_sweep, so peak = W.out + nxt.
+               W.out_total ≈ states_out × 1.15 (cross-worker dups), nxt = states_out. */
+            double peak_gb = (double)curr->cnt * 24.0 / 1e9   /* curr before free */
+                           + (double)curr->cnt * 24.0 / 1e9;  /* nxt ≈ same order */
+            /* After the fix curr is freed before nxt alloc, so effective peak:  */
+            double eff_peak_gb = (states_in > 0)
+                ? (double)curr->cnt * 1.15 * 24.0 / 1e9   /* W.out estimate */
+                + (double)curr->cnt       * 24.0 / 1e9    /* nxt             */
+                : 0.0;
+            (void)peak_gb;
             fprintf(stderr,
-                "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f\n",
+                "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f  peak~%.1fGB\n",
                 step, v, fs, n_back,
                 states_in, curr->cnt,
-                t_now - t_prev, t_now - t_start);
+                t_now - t_prev, t_now - t_start, eff_peak_gb);
             t_prev = t_now;
         }
     }
@@ -1954,7 +1977,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):
