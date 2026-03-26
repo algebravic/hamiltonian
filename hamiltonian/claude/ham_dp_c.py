@@ -1247,6 +1247,7 @@ static void smtab_free(SMTab *t) { free(t->data); free(t); }
 
 static void smtab_ensure(SMTab *t, size_t needed) {
     if (needed <= t->cap) return;
+    if (t->cap == 0) t->cap = 1024;          /* avoid 0 * 2 = 0 infinite loop */
     while (t->cap < needed) t->cap *= 2;
     t->data = (SMEntry*)realloc(t->data, t->cap * sizeof(SMEntry));
 }
@@ -1977,7 +1978,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-        from ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):
