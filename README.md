@@ -19,7 +19,7 @@ of Hamiltonian paths in $G$.
 
 The graph package `Graphillion` using ZDD's (Zero suppressed binary
 decision diagrams) to represent the set of all Hamiltonian paths in a
-graph. It then can easily (linear in the size of the ZDD) calculated
+graph. It then can easily (linear in the size of the ZDD) calculate
 the number of such paths.
 
 Posa rotation
@@ -64,9 +64,9 @@ which is true if $f(v) \le t$, and false otherwise. We must have the
 following constraints: for $1 \le t < n$ $x[v,t] \Rightarrow
 x[v,t+1]$, and for all $t \in [n]$, $\sum_{v \in V(G)} x[v,t] =
 t$. The latter ensures that at time $t$ there are exactly $t$ vertices
-that are allocated. We also have boolean variables $u[v,t]$ which is
-true if and only if $f(v) > t$ and there is an edge $(v,w)$ so that
-$f(w) \le t$.
+that are allocated. We also have a boolean variable $u[v,t]$
+for each pair $(v,t)$ which is true if and only if $f(v) > t$
+and there is an edge $(v,w)$ so that $f(w) \le t$.
 
 Note the following for all $v \in V(G)$
 $`\sum_t u[v,t] = \max_{w, f(w) < f(v), (v,w) \in E(G)} f(v) - f(w)`$
