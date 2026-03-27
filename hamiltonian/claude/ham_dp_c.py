@@ -1102,6 +1102,393 @@ cleanup:
     }
 }
 
+#include <pthread.h>
+#include <sched.h>
+
+/* ======================================================================
+   PARALLEL EH (PEH) IMPLEMENTATION
+   -----------------------------------------------------------------------
+   Both curr and nxt are PEH (array of P private EHTs).  Step-end swap is
+   O(1).  No copy-back needed.
+
+   Main thread does the source scan (PEH_FOR, read-only) and expansion.
+   P inserter threads each own RSORT_SLOTS/P rsort slots and a private EHT.
+   The rsort buffer routes outputs to the correct thread's queue.
+   apply_elim_seq writes to *total from main thread only — no race.
+   ====================================================================== */
+
+#ifndef PEH_NTHREADS
+#define PEH_NTHREADS 6
+#endif
+
+#define PEH_SLOTS_PER_THREAD  (RSORT_SLOTS / PEH_NTHREADS)
+
+/* SPSC ring buffer, power-of-2 capacity. */
+#define PEH_QCAP 512
+
+typedef struct {
+    volatile int head;
+    volatile int tail;
+    volatile int slot[PEH_QCAP];
+    volatile int cnt [PEH_QCAP];
+} PEHQueue;
+
+typedef struct {
+    EHT      *t;
+    PEHQueue *q;
+    int       id;
+} PEHWorker;
+
+static void *peh_inserter(void *arg) {
+    PEHWorker *w = (PEHWorker *)arg;
+    PEHQueue  *q = w->q;
+    EHT       *t = w->t;
+    for (;;) {
+        int tail = q->tail;
+        while (tail == q->head) { sched_yield(); tail = q->tail; }
+        int s = q->slot[tail & (PEH_QCAP-1)];
+        int n = q->cnt [tail & (PEH_QCAP-1)];
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        q->tail = tail + 1;
+        if (s < 0) break;
+        WEntry *base = g_rsort_flat + (size_t)s * RSORT_SLOT_CAP;
+        for (int i = 0; i < n; i++)
+            eh_insert(t, base[i].key, base[i].val);
+    }
+    return NULL;
+}
+
+typedef struct {
+    EHT      *sub[PEH_NTHREADS];
+    PEHQueue  q  [PEH_NTHREADS];
+    PEHWorker w  [PEH_NTHREADS];
+    pthread_t thr[PEH_NTHREADS];
+    size_t    cnt;
+} PEH;
+
+static PEH *peh_alloc(void) {
+    PEH *p = (PEH *)calloc(1, sizeof(PEH));
+    for (int i = 0; i < PEH_NTHREADS; i++) p->sub[i] = eh_alloc();
+    return p;
+}
+static void peh_free(PEH *p) {
+    for (int i = 0; i < PEH_NTHREADS; i++) eh_free(p->sub[i]);
+    free(p);
+}
+static void peh_reset(PEH *p) {
+    for (int i = 0; i < PEH_NTHREADS; i++) eh_reset(p->sub[i]);
+    p->cnt = 0;
+}
+static void peh_sync_cnt(PEH *p) {
+    p->cnt = 0;
+    for (int i = 0; i < PEH_NTHREADS; i++) p->cnt += p->sub[i]->cnt;
+}
+
+static void peh_start(PEH *p) {
+    for (int i = 0; i < PEH_NTHREADS; i++) {
+        p->q[i].head = p->q[i].tail = 0;
+        p->w[i].t = p->sub[i]; p->w[i].q = &p->q[i]; p->w[i].id = i;
+        pthread_create(&p->thr[i], NULL, peh_inserter, &p->w[i]);
+    }
+}
+static void peh_join(PEH *p) {
+    for (int i = 0; i < PEH_NTHREADS; i++) {
+        PEHQueue *q = &p->q[i];
+        int head = q->head;
+        while ((head + 1 - q->tail) >= PEH_QCAP) sched_yield();
+        q->slot[head & (PEH_QCAP-1)] = -1;
+        q->cnt [head & (PEH_QCAP-1)] = 0;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        q->head = head + 1;
+    }
+    for (int i = 0; i < PEH_NTHREADS; i++) pthread_join(p->thr[i], NULL);
+    peh_sync_cnt(p);
+}
+
+static inline void peh_post(PEH *p, int slot, int n) {
+    int owner = slot / PEH_SLOTS_PER_THREAD;
+    if (owner >= PEH_NTHREADS) owner = PEH_NTHREADS - 1;
+    PEHQueue *q = &p->q[owner];
+    int head = q->head;
+    while ((head + 1 - q->tail) >= PEH_QCAP) sched_yield();
+    q->slot[head & (PEH_QCAP-1)] = slot;
+    q->cnt [head & (PEH_QCAP-1)] = n;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    q->head = head + 1;
+}
+
+static void peh_rsort_flush(RSortBuf *rb, PEH *p) {
+    for (int b = 0; b < RSORT_SLOTS; b++) {
+        int n = rb->cnt[b];
+        if (!n) continue;
+        peh_post(p, b, n);
+        rb->cnt[b] = 0;
+    }
+    rb->total = 0;
+#if defined(MADV_FREE)
+    madvise(g_rsort_flat, (size_t)RSORT_FLAT_N*sizeof(WEntry), MADV_FREE);
+#elif defined(MADV_DONTNEED)
+    madvise(g_rsort_flat, (size_t)RSORT_FLAT_N*sizeof(WEntry), MADV_DONTNEED);
+#endif
+}
+
+static inline void peh_rsort_add(RSortBuf *rb, PEH *p, u64 key, u128 val) {
+    int b = (int)(eh_hash(key) >> (64 - RSORT_BITS));
+    int n = rb->cnt[b];
+    if (n == RSORT_SLOT_CAP) { peh_rsort_flush(rb, p); n = 0; }
+    WEntry *base = g_rsort_flat + (size_t)b * RSORT_SLOT_CAP;
+    base[n].key = key; base[n].val = val;
+    rb->cnt[b] = n + 1; rb->total++;
+    if (rb->total >= RSORT_FLUSH_THRESH) peh_rsort_flush(rb, p);
+}
+
+/* Iterate all entries across all P sub-tables (read-only, main thread). */
+#define PEH_FOR(peh_, bkt_)                                                \
+    for (int _pi_ = 0; _pi_ < PEH_NTHREADS; _pi_++)                      \
+        for (EHSlab *_esl_ = (peh_)->sub[_pi_]->sl_head;                  \
+             _esl_; _esl_ = _esl_->next)                                  \
+            for (int _ebi_ = 0; _ebi_ < _esl_->used; _ebi_++) {          \
+                EHBkt *(bkt_) = &_esl_->bkts[_ebi_];
+#define PEH_END  }
+
+/* Introduce step: 1:1 transform, route via rsort to correct sub-table.  */
+static void peh_introduce(PEH *curr, PEH *nxt, int fs) {
+    peh_reset(nxt);
+    peh_start(nxt);
+    RSortBuf rb = {0}; rb.total = 0; memset(rb.cnt, 0, sizeof rb.cnt);
+    PEH_FOR(curr, bkt) {
+        for (int i = 0; i < bkt->cnt; i++)
+            peh_rsort_add(&rb, nxt, introduce(bkt->k[i], fs), bkt->v[i]);
+    } PEH_END
+    peh_rsort_flush(&rb, nxt);
+    peh_join(nxt);
+}
+
+/* Fused sweep: parallel insertion into nxt via P threads.
+   apply_elim_seq writes to *total from main thread only (no race).      */
+static void peh_fused_sweep(PEH *curr, PEH *nxt,
+                             int fs, int v_idx,
+                             const int *widxs, int n_back,
+                             const int *elim_desc, int n_elim,
+                             int step, int n, u128 *total)
+{
+    int n_subsets = 1 << n_back;
+    peh_reset(nxt);
+    peh_start(nxt);
+    RSortBuf rb = {0}; rb.total = 0; memset(rb.cnt, 0, sizeof rb.cnt);
+    PEH_FOR(curr, bkt) {
+        for (int i = 0; i < bkt->cnt; i++) {
+            u64 base_key = bkt->k[i]; u128 cnt = bkt->v[i];
+            for (int S = 0; S < n_subsets; S++) {
+                u64 nk = base_key; int valid = 1;
+                for (int j = 0; j < n_back && valid; j++) {
+                    if (!(S & (1 << j))) continue;
+                    int nc_inc = 0;
+                    u64 nk2 = apply_edge(nk, fs, v_idx, widxs[j], &nc_inc);
+                    if (!nk2) { valid = 0; break; }
+                    nk = nk2;
+                }
+                if (!valid) continue;
+                if (n_elim > 0) {
+                    nk = apply_elim_seq(nk, fs, elim_desc, n_elim,
+                                        step, n, cnt, total);
+                    if (!nk) continue;
+                }
+                peh_rsort_add(&rb, nxt, nk, cnt);
+            }
+        }
+    } PEH_END
+    peh_rsort_flush(&rb, nxt);
+    peh_join(nxt);
+}
+
+/* Non-fused path: rare small steps, use single-threaded temp EHTs.     */
+static void peh_single_step(PEH *curr, PEH *nxt,
+                             int fs, int v_idx,
+                             const int *widxs, int n_back,
+                             const int *elim_asc, int n_elim,
+                             int step, int n, u128 *total,
+                             int *frontier, int *fidx, int *fs_out)
+{
+    EHT *tc = eh_alloc(), *tn = eh_alloc();
+    PEH_FOR(curr, bkt) {
+        for (int i = 0; i < bkt->cnt; i++)
+            eh_insert(tc, bkt->k[i], bkt->v[i]);
+    } PEH_END
+    int elim_desc[MAX_FS_FAST+2];
+    for (int e = 0; e < n_elim; e++) elim_desc[e] = elim_asc[n_elim-1-e];
+    fused_sweep(tc, tn, fs, v_idx, widxs, n_back,
+                elim_desc, n_elim, step, n, total);
+    peh_reset(nxt);
+    EH_FOR(tn, bkt) {
+        for (int i = 0; i < bkt->cnt; i++)
+            eh_insert(nxt->sub[0], bkt->k[i], bkt->v[i]);
+    } EH_END
+    peh_sync_cnt(nxt);
+    eh_free(tc); eh_free(tn);
+    /* Update frontier */
+    int cur_fs = fs;
+    for (int e = n_elim-1; e >= 0; e--) {
+        int ei = elim_asc[e];
+        fidx[frontier[ei]] = -1;
+        for (int k = ei; k < cur_fs-1; k++) {
+            frontier[k] = frontier[k+1];
+            fidx[frontier[k]] = k;
+        }
+        cur_fs--;
+    }
+    *fs_out = cur_fs;
+}
+
+/* ── Top-level PEH entry point ──────────────────────────────────────── */
+void count_ham_paths_peh(
+    int         n,
+    const int  *order,
+    const int  *pos,
+    const int  *last_s,
+    const int  *adj_off,
+    const int  *adj_dat,
+    uint64_t   *res_lo,
+    uint64_t   *res_hi,
+    int         verbose,
+    const char *checkpoint_path,
+    double      checkpoint_secs,
+    int         step_limit
+) {
+    rsort_global_init();
+    int  frontier[MAX_FS_FAST + 2];
+    int *fidx = (int *)malloc((size_t)(n + 1) * sizeof(int));
+    int  fs   = 0;
+    for (int i = 0; i <= n; i++) fidx[i] = -1;
+
+    PEH *curr = peh_alloc(), *nxt = peh_alloc();
+    u128 total = (u128)0;
+    int  start_step = 0;
+
+    if (checkpoint_path && checkpoint_path[0]) {
+        int ckpt_step = -1, ckpt_fs = 0;
+        EHT *tmp = eh_alloc();
+        if (ckpt_load(checkpoint_path, n, order, &ckpt_step, &ckpt_fs,
+                      frontier, &total, tmp)) {
+            EH_FOR(tmp, bkt) {
+                for (int i = 0; i < bkt->cnt; i++)
+                    eh_insert(curr->sub[0], bkt->k[i], bkt->v[i]);
+            } EH_END
+            peh_sync_cnt(curr);
+            start_step = ckpt_step + 1; fs = ckpt_fs;
+            for (int i = 0; i < fs; i++) fidx[frontier[i]] = i;
+            if (verbose)
+                fprintf(stderr, "# Resumed from checkpoint at step %d (%zu states)\n",
+                        ckpt_step, curr->cnt);
+        }
+        eh_free(tmp);
+    }
+
+    if (start_step == 0) {
+        eh_insert(curr->sub[0], KEY_MARKER, (u128)1);
+        peh_sync_cnt(curr);
+    }
+
+    double t_start = now_ms(), t_prev = t_start, t_last_ckpt = t_start;
+    double t_ckpt_total = 0.0;
+
+    if (verbose)
+        fprintf(stderr,
+            "step  vertex  fs  n_back  states_in  states_out"
+            "  step_ms  cumul_ms  [peh/%d]\n", PEH_NTHREADS);
+
+    for (int step = start_step; step < n; step++) {
+        if (step_limit >= 0 && step >= step_limit) {
+            *res_hi = UINT64_MAX - 1; goto cleanup;
+        }
+        int v = order[step];
+        if (fs >= MAX_FS_FAST) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
+
+        /* A. Introduce */
+        peh_introduce(curr, nxt, fs);
+        { PEH *t = curr; curr = nxt; nxt = t; }
+        frontier[fs] = v; fidx[v] = fs; fs++;
+
+        /* B+C. Edges + eliminations */
+        int v_idx = fs - 1;
+        size_t states_in = curr->cnt;
+        int n_back = 0, widxs[8];
+        for (int ai = adj_off[v]; ai < adj_off[v+1]; ai++) {
+            int w = adj_dat[ai];
+            if (fidx[w] >= 0 && pos[w] < pos[v] && n_back < 8)
+                widxs[n_back++] = fidx[w];
+        }
+        int elim_asc[MAX_FS_FAST+2], n_elim = 0;
+        for (int ei = 0; ei < fs; ei++)
+            if (last_s[frontier[ei]] <= step) elim_asc[n_elim++] = ei;
+
+        int use_fused = (n_elim >= 1) &&
+                        (curr->cnt >= FUSED_MIN_STATES || n_back >= 2);
+
+        if (use_fused) {
+            int elim_desc[MAX_FS_FAST+2];
+            for (int e = 0; e < n_elim; e++)
+                elim_desc[e] = elim_asc[n_elim-1-e];
+            peh_fused_sweep(curr, nxt, fs, v_idx,
+                            widxs, n_back, elim_desc, n_elim,
+                            step, n, &total);
+            { PEH *t = curr; curr = nxt; nxt = t; }
+            for (int e = n_elim-1; e >= 0; e--) {
+                int ei = elim_asc[e];
+                fidx[frontier[ei]] = -1;
+                for (int k = ei; k < fs-1; k++) {
+                    frontier[k] = frontier[k+1]; fidx[frontier[k]] = k;
+                }
+                fs--;
+            }
+        } else {
+            peh_single_step(curr, nxt, fs, v_idx,
+                            widxs, n_back, elim_asc, n_elim,
+                            step, n, &total, frontier, fidx, &fs);
+            { PEH *t = curr; curr = nxt; nxt = t; }
+        }
+
+        /* Checkpoint */
+        if (checkpoint_path && checkpoint_path[0] && checkpoint_secs > 0) {
+            double tnow2 = now_ms();
+            if ((tnow2 - t_last_ckpt)/1000.0 >= checkpoint_secs) {
+                double tc0 = now_ms();
+                EHT *tmp_c = eh_alloc();
+                PEH_FOR(curr, bkt) {
+                    for (int i = 0; i < bkt->cnt; i++)
+                        eh_insert(tmp_c, bkt->k[i], bkt->v[i]);
+                } PEH_END
+                ckpt_save(checkpoint_path, n, order, step, fs,
+                          frontier, total, tmp_c);
+                eh_free(tmp_c);
+                t_ckpt_total += now_ms() - tc0;
+                t_last_ckpt = tnow2;
+            }
+        }
+
+        if (verbose) {
+            double tnow = now_ms();
+            fprintf(stderr,
+                "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f\n",
+                step, v, fs, n_back,
+                states_in, curr->cnt,
+                tnow - t_prev, tnow - t_start - t_ckpt_total);
+            t_prev = tnow;
+        }
+    }
+
+    *res_lo = (uint64_t) total;
+    *res_hi = (uint64_t)(total >> 64);
+
+cleanup:
+    peh_free(curr); peh_free(nxt); free(fidx);
+    if (*res_hi != UINT64_MAX && *res_hi != (UINT64_MAX - 1)) {
+        *res_lo = (uint64_t) total;
+        *res_hi = (uint64_t)(total >> 64);
+    }
+}
+
+
 /* ======================================================================
    SORT-MERGE DP IMPLEMENTATION
    -----------------------------------------------------------------------
@@ -1761,6 +2148,14 @@ def _get_lib():
             const char *checkpoint_path, double checkpoint_secs,
             int step_limit);
 
+        void count_ham_paths_peh(
+            int n, const int *order, const int *pos, const int *last_s,
+            const int *adj_off, const int *adj_dat,
+            uint64_t *res_lo, uint64_t *res_hi,
+            int verbose,
+            const char *checkpoint_path, double checkpoint_secs,
+            int step_limit);
+
         void count_ham_paths_sm(
             int n, const int *order, const int *pos, const int *last_s,
             const int *adj_off, const int *adj_dat,
@@ -1836,6 +2231,71 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
         raise RuntimeError(
             "Frontier size exceeded MAX_FS_FAST=15 (pathwidth > 15). "
             "The packed uint64 state encoding is limited to 15 frontier slots."
+        )
+    return (hi << 64) | lo
+
+
+def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
+                                 verbose: bool = False,
+                                 checkpoint_path: str = "",
+                                 checkpoint_secs: float = 300.0,
+                                 **kwargs) -> int:
+    """Count Hamiltonian paths via parallel EH (PEH) backend.
+
+    Like the EH backend but with P inserter threads (default 6), one per
+    hash-partition of the output state table.  The rsort buffer routes each
+    slot's batch to the owning thread's private EHT; no merge is needed at
+    the end since each EHT is already fully deduplicated.
+
+    Speedup over single-threaded EH comes from parallelising the bottleneck
+    insertion phase.  Memory usage is the same as EH (proportional to the
+    actual state count).
+
+    Parameters
+    ----------
+    n               : graph size
+    order           : vertex ordering (1-indexed), length n
+    adj             : adjacency dict {v: iterable_of_neighbours}
+    verbose         : print per-step profiling to stderr
+    checkpoint_path : path for checkpoint file ('' = disabled)
+    checkpoint_secs : checkpoint interval in seconds
+    """
+    lib, ffi = _get_lib()
+
+    pos = [0] * (n + 1)
+    for i, v in enumerate(order): pos[v] = i
+
+    last_s = [0] * (n + 1)
+    for v in range(1, n + 1):
+        nbr_pos = [pos[w] for w in adj[v]]
+        last_s[v] = max(nbr_pos) if nbr_pos else pos[v]
+
+    adj_off_list = [0] * (n + 2)
+    for v in range(1, n + 1):
+        adj_off_list[v + 1] = adj_off_list[v] + len(adj[v])
+    adj_dat_list: list = []
+    for v in range(1, n + 1):
+        adj_dat_list.extend(sorted(adj[v]))
+
+    c_order   = ffi.new("int[]", list(order))
+    c_pos     = ffi.new("int[]", pos)
+    c_last_s  = ffi.new("int[]", last_s)
+    c_adj_off = ffi.new("int[]", adj_off_list)
+    c_adj_dat = ffi.new("int[]", adj_dat_list if adj_dat_list else [0])
+    c_res_lo  = ffi.new("uint64_t*")
+    c_res_hi  = ffi.new("uint64_t*")
+    c_ckpt    = ffi.new("char[]", checkpoint_path.encode() if checkpoint_path else b"")
+
+    lib.count_ham_paths_peh(
+        n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
+        c_res_lo, c_res_hi, int(verbose),
+        c_ckpt, ffi.cast("double", checkpoint_secs),
+        ffi.cast("int", -1),
+    )
+    lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
+    if lo == hi == 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError(
+            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth > 15)."
         )
     return (hi << 64) | lo
 
