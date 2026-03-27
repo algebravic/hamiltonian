@@ -1181,12 +1181,19 @@ static void pscan_fused_sweep(EHT *curr, EHT *nxt,
                                const int *elim_desc, int n_elim,
                                int step, int n, u128 *total)
 {
-    /* Collect slabs into flat array for easy range partitioning. */
+    /* Collect ACTIVE slabs only (used > 0).  The EHT pool linked list
+       retains all slabs ever allocated; after eh_reset() + partial refill,
+       the tail of the list contains empty slabs (used=0, bkts=NULL).
+       Including these in the worker partition causes severe load imbalance:
+       workers assigned to the tail do no work while others carry the full
+       load, collapsing effective parallelism to 1-2 threads.              */
     int n_slabs = 0;
-    for (EHSlab *sl = curr->sl_head; sl; sl = sl->next) n_slabs++;
-    EHSlab **slabs = (EHSlab **)malloc(n_slabs * sizeof(EHSlab *));
+    for (EHSlab *sl = curr->sl_head; sl; sl = sl->next)
+        if (sl->used > 0) n_slabs++;
+    EHSlab **slabs = (EHSlab **)malloc((n_slabs ? n_slabs : 1) * sizeof(EHSlab *));
     { int idx = 0;
-      for (EHSlab *sl = curr->sl_head; sl; sl = sl->next) slabs[idx++] = sl; }
+      for (EHSlab *sl = curr->sl_head; sl; sl = sl->next)
+          if (sl->used > 0) slabs[idx++] = sl; }
 
     int P = PSCAN_NTHREADS;
     if (P > n_slabs && n_slabs > 0) P = n_slabs;
@@ -2478,7 +2485,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-        from ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):
