@@ -1667,8 +1667,10 @@ def _get_lib():
         with open(c_path, "w") as f:
             f.write(C_SOURCE)
         d_flags = [f"-D{k}={v}" for k, v in consts.items()]
+        import shutil
+        compiler = "gcc-15" if shutil.which("gcc-15") else "gcc"
         result = subprocess.run(
-            ["gcc", "-O3", "-march=native", "-shared", "-fPIC", "-std=c11"]
+            [compiler, "-O3", "-march=native", "-shared", "-fPIC", "-std=c11"]
             + d_flags
             + ["-o", so_path, c_path, "-lpthread"],
             capture_output=True,
