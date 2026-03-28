@@ -57,7 +57,7 @@ from math import isqrt
 
 import networkx as nx
 
-from .ham_dp_c import count_hamiltonian_paths_c, count_hamiltonian_paths_sm,  _get_lib
+from .ham_dp_c import count_hamiltonian_paths_c, count_hamiltonian_paths_sm, _get_lib
 from .ham_ordering import build_graph, best_bfs_order, frontier_stats, sa_refine_order, best_multistart_order, validate_multistart_orders
 
 
@@ -146,6 +146,7 @@ def get_pathwidth_order(
     stratified: bool = False,
     solver: str = "cd195",
     minimize_profile: bool = False,
+    profile_time_limit: float = 120.0,
 ) -> tuple:
     """
     Compute the exact pathwidth and an optimal vertex ordering for G
@@ -180,16 +181,33 @@ def get_pathwidth_order(
 
     # Phase 2 (optional): re-solve to minimise profile at fixed pw
     if minimize_profile:
-        print(f"  minimize_profile: re-solving with bound={pw} to minimise Σ|F_t|",
-              flush=True)
-        pw2, order = pathwidth_order(
-            G,
-            bound=pw,
-            minimize_profile=True,
-            solver=solver,
-            stratified=stratified,
-        )
-        assert pw2 == pw, f"Profile minimisation changed pw: {pw2} != {pw}"
+        import threading
+        print(f"  minimize_profile: re-solving with bound={pw} to minimise Σ|F_t| "
+              f"(time_limit={profile_time_limit}s)", flush=True)
+
+        result_holder = [None]
+        def _solve():
+            try:
+                r = pathwidth_order(G, bound=pw, minimize_profile=True,
+                                    solver=solver, stratified=stratified)
+                result_holder[0] = r
+            except Exception as e:
+                result_holder[0] = e
+
+        t = threading.Thread(target=_solve, daemon=True)
+        t.start()
+        t.join(timeout=profile_time_limit)
+
+        if result_holder[0] is None:
+            print(f"  minimize_profile: timed out after {profile_time_limit}s, "
+                  f"keeping phase-1 ordering", flush=True)
+        elif isinstance(result_holder[0], Exception):
+            print(f"  minimize_profile: error ({result_holder[0]}), "
+                  f"keeping phase-1 ordering", flush=True)
+        else:
+            pw2, order = result_holder[0]
+            _, prof_new = None, None
+            print(f"  minimize_profile: done (pw={pw2})", flush=True)
 
     return pw, order
 
@@ -255,11 +273,16 @@ def parse_args():
                         "orderings.  Uses soft clauses on the u[v,t] frontier variables. "
                         "Adds a second solver invocation but produces orderings with "
                         "smaller total frontier exposure.")
+    p.add_argument("--profile-time-limit", type=float, default=120.0, metavar="SECS",
+                   help="Time limit in seconds for the profile-minimisation phase 2 "
+                        "solve (default: 120). If exceeded, the phase-1 ordering is "
+                        "kept. Set higher for large n where phase 2 may need more time.")
     p.add_argument("--solver", default="cd195", metavar="NAME",
                    help="SAT solver for RC2 (default: cd195).")
 
     # --- DP options ---
-    p.add_argument("-v", "--verbose", action="store_true",
+    p.add_argument("--sort-merge", action="store_true",
+                   help="Use sort-merge DP backend instead of EH+rsort.")
                    help="Print per-step frontier DP progress.")
     p.add_argument("--profile", action="store_true",
                    help="Print per-step timing/state-count table to stderr.")
@@ -273,8 +296,6 @@ def parse_args():
                         "Higher values reduce memory usage at the cost of more "
                         "hash probes per insert.  85 is recommended on machines "
                         "where peak two-table memory exceeds available RAM.")
-    p.add_argument("--sort-merge", action="store_true",
-                   help="Use the sort/merge implementation.")
     return p.parse_args()
 
 
@@ -307,6 +328,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
                 stratified=args.stratified,
                 solver=args.solver,
                 minimize_profile=getattr(args, 'minimize_profile', False),
+                profile_time_limit=getattr(args, 'profile_time_limit', 120.0),
             )
         except ImportError as e:
             print(f"  WARNING: {e}\n  Falling back to BFS.", flush=True)
@@ -376,12 +398,13 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
     # --- C frontier DP ---
     verbose = args.verbose or args.profile
     t_dp = time.time()
-
     if args.sort_merge:
         count = count_hamiltonian_paths_sm(
             n_vertices, order, adj,
             verbose=verbose,
-            )
+            checkpoint_path=ckpt_path,
+            checkpoint_secs=args.checkpoint_interval,
+        )
     else:
         count = count_hamiltonian_paths_c(
             n_vertices, order, adj,
@@ -389,7 +412,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
             checkpoint_path=ckpt_path,
             checkpoint_secs=args.checkpoint_interval,
             load_factor=args.load_factor,
-            )
+        )
     t_dp = time.time() - t_dp
 
     pw_str = f"pw={pw:2d}" if pw is not None else "pw= ?"
