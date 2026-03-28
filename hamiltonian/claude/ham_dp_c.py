@@ -1211,6 +1211,8 @@ static void sm_heap_sift(SMHEntry *h, int n, int i) {
     }
 }
 
+/* ── Single-threaded P-way merge with dedup (used by sm_merge_runs and
+   as the per-range kernel inside sm_parallel_merge) ──────────────────── */
 static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
     SMHEntry *h = (SMHEntry*)malloc(P * sizeof(SMHEntry));
     int hs = 0;
@@ -1236,6 +1238,169 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
     }
     free(h);
     return op;
+}
+
+/* ── Parallel P-way merge via key-range splitting ───────────────────────
+   Splits the P sorted input streams into K key ranges, assigns one merge
+   thread per range.  Each thread merges its P sub-streams directly into a
+   disjoint slice of the output array — no synchronisation needed during
+   the merge itself.
+
+   Algorithm:
+     1. Sample S keys from each stream → pick K-1 splitter keys.
+     2. Binary-search each stream for each splitter → lo/hi per (stream,range).
+     3. Count outputs per range (upper bound = sum of sub-stream lengths).
+     4. Allocate output array and compute write offsets.
+     5. Launch K threads; each does sm_merge on its P sub-streams, writing
+        into its slice.  Actual written count returned via MergeJob.out_cnt.
+     6. Compact: prefix-sum the actual counts to produce the final array.
+
+   Splitter selection: use the median of evenly-spaced samples across all
+   streams, so the split is approximately balanced even for skewed key
+   distributions.                                                          */
+
+typedef struct {
+    SMStream *subs;      /* P sub-streams for this range                   */
+    int       P;
+    SMEntry  *out;       /* write pointer into the output array            */
+    size_t    out_cap;   /* allocated capacity (upper bound)               */
+    size_t    out_cnt;   /* actual entries written (set by thread)         */
+} SMParMergeJob;
+
+static void *sm_par_merge_thread(void *arg) {
+    SMParMergeJob *j = (SMParMergeJob *)arg;
+    j->out_cnt = sm_merge(j->subs, j->P, j->out);
+    return NULL;
+}
+
+/* Binary search: index of first entry with key >= target in sorted array. */
+static size_t sm_lower_bound(const SMEntry *a, size_t n, u64 target) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) >> 1;
+        if (a[mid].key < target) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+/* Parallel merge: merges P sorted streams into a freshly-malloc'd array.
+   Returns the array; sets *out_len to the number of entries written.
+   Falls back to single-threaded sm_merge when K=1 or total input is small. */
+#define SM_PAR_MERGE_THRESH 1000000   /* use parallel merge above 1M entries */
+#define SM_SAMPLES_PER_STREAM 64      /* samples per stream for splitter selection */
+
+static SMEntry *sm_parallel_merge(SMStream *S, int P, int K, size_t *out_len) {
+    /* Compute total input size */
+    size_t total = 0;
+    for (int i = 0; i < P; i++) total += S[i].len;
+
+    /* Fall back to single-threaded for small inputs */
+    if (K <= 1 || total < SM_PAR_MERGE_THRESH) {
+        SMEntry *out = (SMEntry *)malloc((total + 1) * sizeof(SMEntry));
+        *out_len = sm_merge(S, P, out);
+        return out;
+    }
+
+    /* ── Step 1: collect sample keys ──────────────────────────────── */
+    int n_samples = P * SM_SAMPLES_PER_STREAM;
+    u64 *samples  = (u64 *)malloc(n_samples * sizeof(u64));
+    int  ns = 0;
+    for (int i = 0; i < P; i++) {
+        size_t len = S[i].len;
+        if (len == 0) continue;
+        int s = SM_SAMPLES_PER_STREAM;
+        for (int k = 0; k < s; k++) {
+            size_t idx = (size_t)k * (len - 1) / (s - 1 > 0 ? s - 1 : 1);
+            samples[ns++] = S[i].buf[idx].key;
+        }
+    }
+    /* Sort samples (insertion sort — tiny array) */
+    for (int i = 1; i < ns; i++) {
+        u64 v = samples[i]; int j = i - 1;
+        while (j >= 0 && samples[j] > v) { samples[j+1] = samples[j]; j--; }
+        samples[j+1] = v;
+    }
+
+    /* Pick K-1 splitter keys evenly from the sorted samples */
+    u64 *splitters = (u64 *)malloc((K - 1) * sizeof(u64));
+    for (int j = 0; j < K - 1; j++) {
+        int idx = (int)((size_t)(j + 1) * ns / K);
+        if (idx >= ns) idx = ns - 1;
+        splitters[j] = samples[idx];
+    }
+    free(samples);
+
+    /* Ensure splitters are strictly increasing (deduplicate) */
+    for (int j = 1; j < K - 1; j++)
+        if (splitters[j] <= splitters[j-1]) splitters[j] = splitters[j-1] + 1;
+
+    /* ── Step 2: binary-search each stream for each splitter ─────── */
+    /* boundaries[i][j] = start index in stream i for range j        */
+    size_t *boundaries = (size_t *)malloc((size_t)P * (K + 1) * sizeof(size_t));
+#define BND(i,j) boundaries[(size_t)(i)*(K+1)+(j)]
+    for (int i = 0; i < P; i++) {
+        BND(i, 0) = 0;
+        for (int j = 0; j < K - 1; j++)
+            BND(i, j+1) = sm_lower_bound(S[i].buf, S[i].len, splitters[j]);
+        BND(i, K) = S[i].len;
+    }
+    free(splitters);
+
+    /* ── Step 3: upper-bound output size per range ───────────────── */
+    size_t *range_cap = (size_t *)calloc(K, sizeof(size_t));
+    for (int j = 0; j < K; j++)
+        for (int i = 0; i < P; i++)
+            range_cap[j] += BND(i, j+1) - BND(i, j);
+
+    /* ── Step 4: allocate output and compute write offsets ────────── */
+    size_t *offsets = (size_t *)malloc((K + 1) * sizeof(size_t));
+    offsets[0] = 0;
+    for (int j = 0; j < K; j++) offsets[j+1] = offsets[j] + range_cap[j];
+    size_t out_cap = offsets[K];
+    SMEntry *out = (SMEntry *)malloc((out_cap + 1) * sizeof(SMEntry));
+    free(range_cap);
+
+    /* ── Step 5: launch K merge threads ─────────────────────────── */
+    SMParMergeJob *jobs    = (SMParMergeJob *)malloc(K * sizeof(SMParMergeJob));
+    SMStream      *all_sub = (SMStream *)malloc((size_t)K * P * sizeof(SMStream));
+    pthread_t     *threads = (pthread_t *)malloc(K * sizeof(pthread_t));
+
+    for (int j = 0; j < K; j++) {
+        SMStream *sub = &all_sub[(size_t)j * P];
+        for (int i = 0; i < P; i++) {
+            size_t lo = BND(i, j), hi = BND(i, j+1);
+            sub[i] = (SMStream){ S[i].buf + lo, 0, hi - lo };
+        }
+        jobs[j] = (SMParMergeJob){
+            .subs    = sub,
+            .P       = P,
+            .out     = out + offsets[j],
+            .out_cap = offsets[j+1] - offsets[j],
+            .out_cnt = 0,
+        };
+        pthread_create(&threads[j], NULL, sm_par_merge_thread, &jobs[j]);
+    }
+    for (int j = 0; j < K; j++) pthread_join(threads[j], NULL);
+#undef BND
+    free(boundaries);
+
+    /* ── Step 6: compact (threads may have deduplicated) ─────────── */
+    /* Each thread wrote jobs[j].out_cnt entries into out+offsets[j].
+       Shift later ranges left to fill any gaps from deduplication.   */
+    size_t write_pos = 0;
+    *out_len = 0;
+    for (int j = 0; j < K; j++) {
+        size_t cnt = jobs[j].out_cnt;
+        if (cnt == 0) continue;
+        SMEntry *src = out + offsets[j];
+        if (src != out + write_pos)
+            memmove(out + write_pos, src, cnt * sizeof(SMEntry));
+        write_pos += cnt;
+        *out_len  += cnt;
+    }
+
+    free(jobs); free(all_sub); free(threads); free(offsets);
+    return out;
 }
 
 /* ── SM table ───────────────────────────────────────────────────────── */
@@ -1437,15 +1602,22 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(curr->data); curr->data = NULL; curr->cap = 0; curr->cnt = 0;
     }
 
-    /* P-way merge of per-worker sorted streams into nxt. */
+    /* P-way parallel merge of per-worker sorted streams into nxt. */
     size_t raw_total = 0;
     for (int i = 0; i < P; i++) raw_total += W[i].out_len;
-    smtab_ensure(nxt, raw_total + 1);
 
     SMStream *S = (SMStream*)malloc(P * sizeof(SMStream));
     for (int i = 0; i < P; i++)
         S[i] = (SMStream){ W[i].out, 0, W[i].out_len };
-    nxt->cnt = sm_merge(S, P, nxt->data);
+
+    size_t merged_len = 0;
+    SMEntry *merged = sm_parallel_merge(S, P, P, &merged_len);
+
+    /* Move merged result into nxt (reuse nxt->data if large enough) */
+    smtab_ensure(nxt, merged_len + 1);
+    memcpy(nxt->data, merged, merged_len * sizeof(SMEntry));
+    nxt->cnt = merged_len;
+    free(merged);
 
     for (int i = 0; i < P; i++) {
         free(W[i].out);
