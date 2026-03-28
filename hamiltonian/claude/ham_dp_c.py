@@ -1641,8 +1641,8 @@ void count_ham_paths_sm(
     double t_start = now_ms(), t_prev = t_start;
     if (verbose)
         fprintf(stderr,
-            "step  vertex  fs  n_back  states_in  states_out"
-            "  step_ms  cumul_ms  [sm]\n");
+            "step  vertex  fs  n_back  e_bag  states_in  states_out"
+            "  step_ms  cumul_ms  bag  [sm]\n");
 
     for (int step = 0; step < n; step++) {
         int v = order[step];
@@ -1688,11 +1688,35 @@ void count_ham_paths_sm(
         }
 
         if (verbose) {
+            /* Count intra-frontier edges (both endpoints in frontier) */
+            int e_bag = 0;
+            for (int fi = 0; fi < fs; fi++) {
+                int u = frontier[fi];
+                for (int ai = adj_off[u]; ai < adj_off[u+1]; ai++) {
+                    int w = adj_dat[ai];
+                    if (fidx[w] >= 0 && fidx[w] > fi)  /* count each edge once */
+                        e_bag++;
+                }
+            }
+            /* Print frontier vertex list as {v1,v2,...} */
+            char bag_buf[256];
+            int  bpos = 0;
+            bag_buf[bpos++] = '{';
+            for (int fi = 0; fi < fs && bpos < 230; fi++) {
+                if (fi > 0) bag_buf[bpos++] = ',';
+                bpos += snprintf(bag_buf + bpos, sizeof(bag_buf) - bpos - 2,
+                                 "%d", frontier[fi]);
+            }
+            bag_buf[bpos++] = '}';
+            bag_buf[bpos]   = '\0';
+
             double t_now = now_ms();
             fprintf(stderr,
-                "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f  [sm]\n",
-                step, v, fs, n_back, states_in, curr->cnt,
-                t_now - t_prev, t_now - t_start);
+                "%4d  %6d  %2d  %6d  %5d  %9zu  %10zu  %8.1f  %8.1f  %-*s  [sm]\n",
+                step, v, fs, n_back, e_bag,
+                states_in, curr->cnt,
+                t_now - t_prev, t_now - t_start,
+                (int)(2 + fs * 4), bag_buf);   /* pad to max frontier width */
             t_prev = t_now;
         }
     }
