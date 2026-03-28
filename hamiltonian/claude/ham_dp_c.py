@@ -1725,7 +1725,7 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
     # Each worker needs buf + tmp = 2 × cap × SM_ENTRY bytes
     cap_bytes = max(0, available) // (n_threads * 2 * SM_ENTRY)
     # Round down to nearest 1M-entry boundary, clamp to [8M, 256M]
-    cap_m = max(8, min(256, cap_bytes // (1024 * 1024 * SM_ENTRY)))
+    cap_m = max(8, min(256, cap_bytes // (1024 * 1024)))
     sm_worker_cap = cap_m * 1024 * 1024
 
     return {
@@ -2072,7 +2072,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-       from .ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):
