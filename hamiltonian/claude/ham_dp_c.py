@@ -1151,7 +1151,7 @@ void count_ham_paths_peh(
 
 typedef struct { u64 key; u128 val; } SMEntry;  /* 24 bytes, same as before */
 
-/* ── Buffered 8-bit LSD radix sort ─────────────────────────────────── */
+/* ── Buffered 8-bit LSD radix sort ─────────────────────────────────────── */
 /* buf_size=32 → 256*32*24 = 192 KB working set → fits in L1           */
 #define SM_RBUF_SIZE  32
 #define SM_RBUCKETS  256
@@ -1210,7 +1210,7 @@ static void sm_radix_sort(SMEntry *a, SMEntry *tmp, size_t n) {
     /* After 8 passes (even), result is in 'a'. */
 }
 
-/* ── P-way merge with dedup (min-heap) ───────────────────────────────── */
+/* ── P-way merge with dedup (min-heap) ─────────────────────────────────── */
 typedef struct { const SMEntry *buf; size_t pos, len; } SMStream;
 typedef struct { u64 key; int s; } SMHEntry;
 
@@ -1256,8 +1256,75 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
     return op;
 }
 
+/* ── Map worker: expand shard → sort output ────────────────────────────── */
+typedef struct {
+    /* inputs */
+    const SMEntry *in;
+    size_t         lo, hi;
+    int            fs, v_idx;
+    const int     *widxs;
+    int            n_back;
+    const int     *elim_idxs_desc;
+    int            n_elim;
+    int            step, n;
+    /* shared total accumulator (atomic-ish: protected by mutex) */
+    u128          *total;
+    pthread_mutex_t *total_mu;
+    /* output */
+    SMEntry       *out;    /* pre-allocated worst-case */
+    SMEntry       *tmp;    /* radix scratch, same size */
+    size_t         out_len;
+} SMWorker;
 
-/* ── SM table: sorted flat array with capacity ───────────────────────── */
+static void *sm_worker(void *arg) {
+    SMWorker *w = (SMWorker*)arg;
+    int n_subsets = 1 << w->n_back;
+    size_t op = 0;
+    u128 local_total = 0;
+
+    for (size_t i = w->lo; i < w->hi; i++) {
+        u64  base = w->in[i].key;
+        u128 cnt  = w->in[i].val;
+
+        for (int S = 0; S < n_subsets; S++) {
+            u64 nk    = base;
+            int valid = 1;
+            int nc_inc = 0;
+
+            for (int j = 0; j < w->n_back && valid; j++) {
+                if (!(S & (1 << j))) continue;
+                u64 nk2 = apply_edge(nk, w->fs, w->v_idx, w->widxs[j], &nc_inc);
+                if (!nk2) { valid = 0; break; }
+                nk = nk2;
+            }
+            if (!valid) continue;
+
+            if (w->n_elim > 0) {
+                nk = apply_elim_seq(nk, w->fs, w->elim_idxs_desc, w->n_elim,
+                                    w->step, w->n, cnt, &local_total);
+                if (!nk) continue;
+            }
+
+            w->out[op].key = nk;
+            w->out[op].val = cnt;
+            op++;
+        }
+    }
+    w->out_len = op;
+
+    /* Accumulate thread-local total into shared total */
+    if (local_total) {
+        pthread_mutex_lock(w->total_mu);
+        *w->total += local_total;
+        pthread_mutex_unlock(w->total_mu);
+    }
+
+    /* Sort this shard */
+    sm_radix_sort(w->out, w->tmp, op);
+    return NULL;
+}
+
+/* ── SM table: sorted flat array with capacity ─────────────────────────── */
 typedef struct {
     SMEntry *data;
     size_t   cnt;
@@ -1274,14 +1341,12 @@ static void smtab_free(SMTab *t) { free(t->data); free(t); }
 
 static void smtab_ensure(SMTab *t, size_t needed) {
     if (needed <= t->cap) return;
-    if (t->cap == 0) t->cap = 1024;          /* avoid 0 * 2 = 0 infinite loop */
+    if (t->cap == 0) t->cap = 1024;
     while (t->cap < needed) t->cap *= 2;
     t->data = (SMEntry*)realloc(t->data, t->cap * sizeof(SMEntry));
 }
 
-/* ── SM introduce step ───────────────────────────────────────────────── */
-/* Sequential scan: introduce(key, fs) is key-monotone? No — canonical
-   renaming can reorder keys.  We sort the output after introducing.     */
+/* ── SM introduce step ─────────────────────────────────────────────────── */
 static void sm_introduce(const SMTab *src, SMTab *dst, int fs, SMEntry *tmp) {
     smtab_ensure(dst, src->cnt);
     for (size_t i = 0; i < src->cnt; i++) {
@@ -1289,186 +1354,39 @@ static void sm_introduce(const SMTab *src, SMTab *dst, int fs, SMEntry *tmp) {
         dst->data[i].val = src->data[i].val;
     }
     dst->cnt = src->cnt;
-    /* Re-sort: introduce() may change ordering */
     sm_radix_sort(dst->data, tmp, dst->cnt);
 }
 
-/* ── SM fused sweep ──────────────────────────────────────────────────── */
+/* ── SM fused sweep ──────────────────────────────────────────────────────── */
 #ifndef SM_NTHREADS
 #define SM_NTHREADS 6
 #endif
 
-/* Per-worker buffer size.  Caps peak memory at SM_NTHREADS × SM_BUF_ENTRIES × 24 B.
- * With 6 threads and 8M entries: 6 × 8M × 24B = 1.15 GB peak regardless of nb.
- * When a worker's buffer fills it is sorted and saved as a "run"; multiple
- * runs per worker are merged into one sorted array before the final P-way merge. */
-#ifndef SM_BUF_ENTRIES
-#define SM_BUF_ENTRIES (8 * 1024 * 1024)   /* 8M entries = 192 MB per worker */
-#endif
-
-/* A sorted run produced by one worker.  After the map phase each worker
-   may have zero or more completed runs plus a partial final buffer.       */
-typedef struct {
-    SMEntry *data;
-    size_t   len;
-} SMRun;
-
-typedef struct {
-    SMEntry  *buf;         /* working buffer, SM_BUF_ENTRIES entries       */
-    SMEntry  *tmp;         /* scratch for radix sort, same size as buf     */
-    size_t    buf_len;     /* entries currently in buf                     */
-    SMRun    *runs;        /* completed sorted runs                        */
-    int       n_runs;
-    int       runs_cap;
-} SMWorkerState;
-
-static void sm_flush_run(SMWorkerState *ws) {
-    /* Sort the buffer */
-    sm_radix_sort(ws->buf, ws->tmp, ws->buf_len);
-
-    /* Deduplicate in-place: adjacent equal keys → sum counts.
-     * This is O(buf_len) and can compress nb=4 runs 10-76x before
-     * they are stored, dramatically reducing intra-worker merge cost. */
-    size_t out = 0;
-    for (size_t i = 0; i < ws->buf_len; ) {
-        size_t j = i + 1;
-        u128 acc = ws->buf[i].val;
-        while (j < ws->buf_len && ws->buf[j].key == ws->buf[i].key) {
-            acc += ws->buf[j].val;
-            j++;
-        }
-        ws->buf[out].key = ws->buf[i].key;
-        ws->buf[out].val = acc;
-        out++;
-        i = j;
-    }
-
-    /* Stash the compressed run */
-    if (ws->n_runs == ws->runs_cap) {
-        ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 4;
-        ws->runs = (SMRun*)realloc(ws->runs, ws->runs_cap * sizeof(SMRun));
-    }
-    SMEntry *run_data = (SMEntry*)malloc(out * sizeof(SMEntry));
-    memcpy(run_data, ws->buf, out * sizeof(SMEntry));
-    ws->runs[ws->n_runs++] = (SMRun){ run_data, out };
-    ws->buf_len = 0;
-}
-
-/* Merge all runs + remaining buf into one sorted array.
-   Returns newly malloc'd array; caller frees it.                          */
-static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
-    /* Flush the final partial buffer as one last run */
-    if (ws->buf_len > 0) sm_flush_run(ws);
-
-    if (ws->n_runs == 0) { *out_len = 0; return NULL; }
-    if (ws->n_runs == 1) {
-        *out_len = ws->runs[0].len;
-        SMEntry *d = ws->runs[0].data;
-        ws->runs[0].data = NULL;
-        return d;
-    }
-
-    /* Multi-run merge: total size = sum of all run lengths */
-    size_t total = 0;
-    for (int i = 0; i < ws->n_runs; i++) total += ws->runs[i].len;
-    SMEntry *out = (SMEntry*)malloc(total * sizeof(SMEntry));
-
-    /* Re-use sm_merge with a temporary SMStream array */
-    SMStream *S = (SMStream*)malloc(ws->n_runs * sizeof(SMStream));
-    for (int i = 0; i < ws->n_runs; i++)
-        S[i] = (SMStream){ ws->runs[i].data, 0, ws->runs[i].len };
-    *out_len = sm_merge(S, ws->n_runs, out);
-    free(S);
-    for (int i = 0; i < ws->n_runs; i++) free(ws->runs[i].data);
-    return out;
-}
-
-/* Map worker using fixed-size buffer with run accumulation */
-typedef struct {
-    const SMEntry   *in;
-    size_t           lo, hi;
-    int              fs, v_idx;
-    const int       *widxs;
-    int              n_back;
-    const int       *elim_idxs_desc;
-    int              n_elim;
-    int              step, n;
-    u128            *total;
-    pthread_mutex_t *total_mu;
-    SMWorkerState   *ws;     /* per-worker state (buffer + runs) */
-    /* output (filled after run merge) */
-    SMEntry         *out;
-    size_t           out_len;
-} SMWorker;
-
-static void *sm_worker_runs(void *arg) {
-    SMWorker      *w  = (SMWorker*)arg;
-    SMWorkerState *ws = w->ws;
-    int n_subsets = 1 << w->n_back;
-    u128 local_total = 0;
-
-    for (size_t i = w->lo; i < w->hi; i++) {
-        u64  base = w->in[i].key;
-        u128 cnt  = w->in[i].val;
-        for (int S = 0; S < n_subsets; S++) {
-            u64 nk    = base;
-            int valid = 1, nc_inc = 0;
-            for (int j = 0; j < w->n_back && valid; j++) {
-                if (!(S & (1 << j))) continue;
-                u64 nk2 = apply_edge(nk, w->fs, w->v_idx, w->widxs[j], &nc_inc);
-                if (!nk2) { valid = 0; break; }
-                nk = nk2;
-            }
-            if (!valid) continue;
-            if (w->n_elim > 0) {
-                nk = apply_elim_seq(nk, w->fs, w->elim_idxs_desc, w->n_elim,
-                                    w->step, w->n, cnt, &local_total);
-                if (!nk) continue;
-            }
-            ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
-            if (ws->buf_len == SM_BUF_ENTRIES) sm_flush_run(ws);
-        }
-    }
-    /* Always flush the final partial buffer as a sorted+deduped run */
-    if (ws->buf_len > 0) sm_flush_run(ws);
-
-    if (local_total) {
-        pthread_mutex_lock(w->total_mu);
-        *w->total += local_total;
-        pthread_mutex_unlock(w->total_mu);
-    }
-
-    w->out = sm_merge_runs(ws, &w->out_len);
-    return NULL;
-}
-
-static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
+static void sm_fused_sweep(const SMTab *curr, SMTab *nxt,
                             int fs, int v_idx,
                             const int *widxs, int n_back,
                             const int *elim_idxs_desc, int n_elim,
                             int step, int n,
-                            u128 *total,
-                            size_t prev_so) {
-    (void)prev_so;
+                            u128 *total) {
     int P = SM_NTHREADS;
+    int n_subsets = 1 << n_back;
     size_t ni = curr->cnt;
     size_t chunk = (ni + P - 1) / P;
+    /* Worst-case output per worker: chunk * 2^n_back */
+    size_t bpt = chunk * (size_t)n_subsets + 256;
 
-    SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
-    SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
-    pthread_t     *T  = (pthread_t*)malloc(P * sizeof(pthread_t));
+    SMWorker     *W  = (SMWorker*)     malloc(P * sizeof(SMWorker));
+    pthread_t    *T  = (pthread_t*)    malloc(P * sizeof(pthread_t));
+    SMEntry     **OB = (SMEntry**)     malloc(P * sizeof(SMEntry*));
+    SMEntry     **TB = (SMEntry**)     malloc(P * sizeof(SMEntry*));
     pthread_mutex_t mu;
     pthread_mutex_init(&mu, NULL);
 
     for (int i = 0; i < P; i++) {
         size_t lo = (size_t)i * chunk;
         size_t hi = lo + chunk < ni ? lo + chunk : ni;
-        WS[i].buf     = (SMEntry*)malloc(SM_BUF_ENTRIES * sizeof(SMEntry));
-        WS[i].tmp     = (SMEntry*)malloc(SM_BUF_ENTRIES * sizeof(SMEntry));
-        WS[i].buf_len = 0;
-        WS[i].runs    = NULL;
-        WS[i].n_runs  = 0;
-        WS[i].runs_cap= 0;
+        OB[i] = (SMEntry*)malloc(bpt * sizeof(SMEntry));
+        TB[i] = (SMEntry*)malloc(bpt * sizeof(SMEntry));
         W[i] = (SMWorker){
             .in=curr->data, .lo=lo, .hi=hi,
             .fs=fs, .v_idx=v_idx,
@@ -1476,48 +1394,36 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             .elim_idxs_desc=elim_idxs_desc, .n_elim=n_elim,
             .step=step, .n=n,
             .total=total, .total_mu=&mu,
-            .ws=&WS[i]
+            .out=OB[i], .tmp=TB[i]
         };
-        pthread_create(&T[i], NULL, sm_worker_runs, &W[i]);
+        pthread_create(&T[i], NULL, sm_worker, &W[i]);
     }
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
 
-    /* Workers are done reading curr — free it immediately before allocating
-     * nxt, but only when curr is large enough that the memory matters.
-     * For small/medium n where curr < ~4 GB, keeping the allocation avoids
-     * the cost of freeing + re-faulting pages every step (which caused a
-     * 25% slowdown for n=57).  For large n (n≥59) where peak approaches
-     * machine RAM, freeing curr before smtab_ensure(nxt) is the difference
-     * between fitting and OOM.                                               */
-#define SM_FREE_THRESH ((size_t)150 * 1024 * 1024)   /* 150M entries ~ 3.6 GB */
-    if (curr->cap > SM_FREE_THRESH) {
-        free(curr->data);
-        curr->data = NULL;
-        curr->cap  = 0;
-        curr->cnt  = 0;
+    /* Free curr before allocating nxt when curr is large (>150M entries).
+       Prevents OOM on systems where curr + nxt would exceed available RAM.
+       For small n (n≤57), curr->cap never reaches this threshold so the
+       allocation is reused every step (fast path, identical to original). */
+    if (((SMTab*)curr)->cap > (size_t)150 * 1024 * 1024) {
+        free(((SMTab*)curr)->data);
+        ((SMTab*)curr)->data = NULL;
+        ((SMTab*)curr)->cap  = 0;
+        ((SMTab*)curr)->cnt  = 0;
     }
 
-    /* Free per-worker scratch buffers (buf/tmp already freed inside
-     * sm_worker_runs → sm_flush_run; runs freed by sm_merge_runs).        */
-    for (int i = 0; i < P; i++) {
-        free(WS[i].buf);
-        free(WS[i].tmp);
-        free(WS[i].runs);
-    }
-
-    /* Final P-way merge of per-worker sorted arrays into nxt */
+    /* Merge P sorted shards into nxt */
     size_t raw_total = 0;
     for (int i = 0; i < P; i++) raw_total += W[i].out_len;
     smtab_ensure(nxt, raw_total + 1);
 
     SMStream *S = (SMStream*)malloc(P * sizeof(SMStream));
     for (int i = 0; i < P; i++)
-        S[i] = (SMStream){ W[i].out, 0, W[i].out_len };
+        S[i] = (SMStream){ OB[i], 0, W[i].out_len };
     nxt->cnt = sm_merge(S, P, nxt->data);
 
-    for (int i = 0; i < P; i++) free(W[i].out);
-    free(S); free(W); free(WS); free(T);
+    for (int i = 0; i < P; i++) { free(OB[i]); free(TB[i]); }
+    free(OB); free(TB); free(W); free(T); free(S);
 }
 
 /* ── Top-level SM entry point ────────────────────────────────────────── */
@@ -1539,12 +1445,11 @@ void count_ham_paths_sm(
 
     SMTab *curr = smtab_alloc(1024);
     SMTab *nxt  = smtab_alloc(1024);
-    SMEntry *intro_tmp = NULL;  /* scratch for introduce sort */
+    SMEntry *intro_tmp = NULL;
     size_t   intro_cap = 0;
 
     u128 total = (u128)0;
 
-    /* Initial state */
     curr->data[0].key = KEY_MARKER;
     curr->data[0].val = (u128)1;
     curr->cnt = 1;
@@ -1595,7 +1500,7 @@ void count_ham_paths_sm(
         sm_fused_sweep(curr, nxt, fs, v_idx,
                        widxs, n_back,
                        elim_desc, n_elim,
-                       step, n, &total, 0);
+                       step, n, &total);
         { SMTab *t = curr; curr = nxt; nxt = t; }
 
         /* ---- Eliminate from frontier ---------------------------------- */
@@ -1611,22 +1516,11 @@ void count_ham_paths_sm(
 
         if (verbose) {
             double t_now = now_ms();
-            /* Estimate peak RAM this step will have used (in GB).
-               curr is freed inside sm_fused_sweep, so peak = W.out + nxt.
-               W.out_total ≈ states_out × 1.15 (cross-worker dups), nxt = states_out. */
-            double peak_gb = (double)curr->cnt * 24.0 / 1e9   /* curr before free */
-                           + (double)curr->cnt * 24.0 / 1e9;  /* nxt ≈ same order */
-            /* After the fix curr is freed before nxt alloc, so effective peak:  */
-            double eff_peak_gb = (states_in > 0)
-                ? (double)curr->cnt * 1.15 * 24.0 / 1e9   /* W.out estimate */
-                + (double)curr->cnt       * 24.0 / 1e9    /* nxt             */
-                : 0.0;
-            (void)peak_gb;
             fprintf(stderr,
-                "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f  peak~%.1fGB\n",
+                "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f  [sm]\n",
                 step, v, fs, n_back,
                 states_in, curr->cnt,
-                t_now - t_prev, t_now - t_start, eff_peak_gb);
+                t_now - t_prev, t_now - t_start);
             t_prev = t_now;
         }
     }
@@ -1640,6 +1534,7 @@ cleanup:
     free(intro_tmp);
     free(fidx);
 }
+
 """
 
 # ---------------------------------------------------------------------------
