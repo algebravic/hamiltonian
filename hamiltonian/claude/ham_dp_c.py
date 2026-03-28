@@ -1288,7 +1288,7 @@ static size_t sm_lower_bound(const SMEntry *a, size_t n, u64 target) {
    Falls back to single-threaded sm_merge when K=1 or input is small.
    Writing directly into the caller's buffer avoids the extra 16GB malloc
    that would otherwise coexist with W[i].out and nxt->data at step 39. */
-#define SM_PAR_MERGE_THRESH 1000000
+#define SM_PAR_MERGE_THRESH 50000000  /* use parallel merge above 50M entries */
 #define SM_SAMPLES_PER_STREAM 64
 
 static size_t sm_parallel_merge(SMStream *S, int P, int K,
