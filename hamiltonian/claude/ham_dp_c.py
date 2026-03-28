@@ -1484,16 +1484,19 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     pthread_mutex_destroy(&mu);
 
     /* Workers are done reading curr — free it immediately before allocating
-     * nxt.  At this point curr->data is the largest single allocation alive
-     * (8+ GB for large n).  Freeing it here reduces peak memory by that
-     * amount, which is the difference between fitting in RAM and OOM.
-     * The caller swaps curr/nxt after we return; the freed SMTab struct
-     * will then become the new nxt and be reallocated by smtab_ensure on
-     * the next step's introduce phase.                                     */
-    free(curr->data);
-    curr->data = NULL;
-    curr->cap  = 0;
-    curr->cnt  = 0;
+     * nxt, but only when curr is large enough that the memory matters.
+     * For small/medium n where curr < ~4 GB, keeping the allocation avoids
+     * the cost of freeing + re-faulting pages every step (which caused a
+     * 25% slowdown for n=57).  For large n (n≥59) where peak approaches
+     * machine RAM, freeing curr before smtab_ensure(nxt) is the difference
+     * between fitting and OOM.                                               */
+#define SM_FREE_THRESH ((size_t)150 * 1024 * 1024)   /* 150M entries ~ 3.6 GB */
+    if (curr->cap > SM_FREE_THRESH) {
+        free(curr->data);
+        curr->data = NULL;
+        curr->cap  = 0;
+        curr->cnt  = 0;
+    }
 
     /* Free per-worker scratch buffers (buf/tmp already freed inside
      * sm_worker_runs → sm_flush_run; runs freed by sm_merge_runs).        */
