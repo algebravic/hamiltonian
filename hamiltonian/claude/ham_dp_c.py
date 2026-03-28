@@ -1362,7 +1362,7 @@ static void sm_introduce(const SMTab *src, SMTab *dst, int fs, SMEntry *tmp) {
 #define SM_NTHREADS 6
 #endif
 
-static void sm_fused_sweep(const SMTab *curr, SMTab *nxt,
+static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             int fs, int v_idx,
                             const int *widxs, int n_back,
                             const int *elim_idxs_desc, int n_elim,
@@ -1405,11 +1405,11 @@ static void sm_fused_sweep(const SMTab *curr, SMTab *nxt,
        Prevents OOM on systems where curr + nxt would exceed available RAM.
        For small n (n≤57), curr->cap never reaches this threshold so the
        allocation is reused every step (fast path, identical to original). */
-    if (((SMTab*)curr)->cap > (size_t)150 * 1024 * 1024) {
-        free(((SMTab*)curr)->data);
-        ((SMTab*)curr)->data = NULL;
-        ((SMTab*)curr)->cap  = 0;
-        ((SMTab*)curr)->cnt  = 0;
+    if (curr->cap > (size_t)150 * 1024 * 1024) {
+        free(curr->data);
+        curr->data = NULL;
+        curr->cap  = 0;
+        curr->cnt  = 0;
     }
 
     /* Merge P sorted shards into nxt */
