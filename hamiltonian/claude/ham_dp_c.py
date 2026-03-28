@@ -1128,12 +1128,15 @@ cleanup:
 typedef struct {
     EHSlab     **slabs;
     int          slab_lo, slab_hi;
-    int          fs, v_idx;
+    int          fs_pre;  /* frontier size BEFORE introducing new vertex    */
+    int          fs;      /* frontier size AFTER introduce (= fs_pre + 1)   */
+    int          v_idx;
     const int   *widxs;
     int          n_back;
     const int   *elim_desc;
     int          n_elim;
     int          step, n;
+    int          do_intro; /* if 1, apply introduce(key, fs_pre) first      */
     EHT         *out;
     u128         total_acc;
 } PScanWorker;
@@ -1150,6 +1153,8 @@ static void *pscan_worker(void *arg) {
             for (int i = 0; i < bkt->cnt; i++) {
                 u64  base_key = bkt->k[i];
                 u128 cnt      = bkt->v[i];
+                /* Optional introduce step folded into the worker.          */
+                if (w->do_intro) base_key = introduce(base_key, w->fs_pre);
                 for (int S = 0; S < n_subsets; S++) {
                     u64 nk = base_key; int valid = 1;
                     for (int j = 0; j < w->n_back && valid; j++) {
@@ -1175,12 +1180,15 @@ static void *pscan_worker(void *arg) {
     return NULL;
 }
 
-static void pscan_fused_sweep(EHT *curr, EHT *nxt,
+/* pscan_fused_sweep: parallel fused sweep WITHOUT folding introduce.
+   Called when curr already holds post-introduce states.                 */
+static void pscan_fused_sweep(EHT **curr_p, EHT *nxt,
                                int fs, int v_idx,
                                const int *widxs, int n_back,
                                const int *elim_desc, int n_elim,
                                int step, int n, u128 *total)
 {
+    EHT *curr = *curr_p;
     /* Collect ACTIVE slabs only (used > 0).  The EHT pool linked list
        retains all slabs ever allocated; after eh_reset() + partial refill,
        the tail of the list contains empty slabs (used=0, bkts=NULL).
@@ -1207,10 +1215,10 @@ static void pscan_fused_sweep(EHT *curr, EHT *nxt,
         int hi = lo + base + (i < extra ? 1 : 0);
         W[i] = (PScanWorker){
             .slabs=slabs, .slab_lo=lo, .slab_hi=hi,
-            .fs=fs, .v_idx=v_idx,
+            .fs_pre=fs, .fs=fs, .v_idx=v_idx,
             .widxs=widxs, .n_back=n_back,
             .elim_desc=elim_desc, .n_elim=n_elim,
-            .step=step, .n=n,
+            .step=step, .n=n, .do_intro=0,
             .out=eh_alloc()
         };
         lo = hi;
@@ -1221,7 +1229,79 @@ static void pscan_fused_sweep(EHT *curr, EHT *nxt,
     /* Accumulate per-worker totals. */
     for (int i = 0; i < P; i++) *total += W[i].total_acc;
 
+    /* Free curr immediately after workers finish reading it.
+       This frees 10-22 GB before the merge phase grows nxt.
+       Replace with a fresh empty EHT so the caller can swap as usual.  */
+    eh_free(curr);
+    *curr_p = eh_alloc();
+
     /* Merge P local EHTs into nxt via rsort; free each immediately after. */
+    eh_reset(nxt);
+    RSortBuf rb = {0};
+    rsort_init(&rb, nxt, 0);
+    for (int i = 0; i < P; i++) {
+        EH_FOR(W[i].out, bkt) {
+            for (int j = 0; j < bkt->cnt; j++)
+                rsort_add(&rb, bkt->k[j], bkt->v[j]);
+        } EH_END
+        eh_free(W[i].out);
+        W[i].out = NULL;
+    }
+    rsort_flush(&rb);
+
+    free(slabs); free(W); free(T);
+}
+
+/* pscan_intro_fused_sweep: combine introduce + fused_sweep in one pass.
+   Workers read pre-introduce curr, apply introduce(key, fs_pre) first,
+   then apply_edge × 2^n_back, then eliminations.
+   After join curr is freed — eliminating the peak-memory doubling that
+   the separate introduce step causes when si ≥ ~300M states.           */
+static void pscan_intro_fused_sweep(EHT **curr_p, EHT *nxt,
+                                     int fs_pre, int fs,
+                                     int v_idx,
+                                     const int *widxs, int n_back,
+                                     const int *elim_desc, int n_elim,
+                                     int step, int n, u128 *total)
+{
+    EHT *curr = *curr_p;
+    int n_slabs = 0;
+    for (EHSlab *sl = curr->sl_head; sl; sl = sl->next)
+        if (sl->used > 0) n_slabs++;
+    EHSlab **slabs = (EHSlab **)malloc((n_slabs ? n_slabs : 1) * sizeof(EHSlab *));
+    { int idx = 0;
+      for (EHSlab *sl = curr->sl_head; sl; sl = sl->next)
+          if (sl->used > 0) slabs[idx++] = sl; }
+
+    int P = PSCAN_NTHREADS;
+    if (P > n_slabs && n_slabs > 0) P = n_slabs;
+    if (P < 1) P = 1;
+
+    PScanWorker *W = (PScanWorker *)calloc(P, sizeof(PScanWorker));
+    pthread_t   *T = (pthread_t   *)malloc(P * sizeof(pthread_t));
+
+    int base = n_slabs / P, extra = n_slabs % P, lo = 0;
+    for (int i = 0; i < P; i++) {
+        int hi = lo + base + (i < extra ? 1 : 0);
+        W[i] = (PScanWorker){
+            .slabs=slabs, .slab_lo=lo, .slab_hi=hi,
+            .fs_pre=fs_pre, .fs=fs, .v_idx=v_idx,
+            .widxs=widxs, .n_back=n_back,
+            .elim_desc=elim_desc, .n_elim=n_elim,
+            .step=step, .n=n, .do_intro=1,
+            .out=eh_alloc()
+        };
+        lo = hi;
+        pthread_create(&T[i], NULL, pscan_worker, &W[i]);
+    }
+    for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
+
+    for (int i = 0; i < P; i++) *total += W[i].total_acc;
+
+    /* Free curr BEFORE merge — the key memory saving.                   */
+    eh_free(curr);
+    *curr_p = eh_alloc();
+
     eh_reset(nxt);
     RSortBuf rb = {0};
     rsort_init(&rb, nxt, 0);
@@ -1299,35 +1379,26 @@ void count_ham_paths_peh(
         }
 
         /* ---- A. Introduce v ------------------------------------------ */
-        {
-            int use_rsort_a = (curr->cnt >= RSORT_THRESH);
-            RSortBuf rb_a = {0};
-            eh_reset(nxt);
-            if (use_rsort_a) rsort_init(&rb_a, nxt, 0);
-            EH_FOR(curr, bkt) {
-                for (int i = 0; i < bkt->cnt; i++) {
-                    u64 nk = introduce(bkt->k[i], fs);
-                    if (use_rsort_a) rsort_add(&rb_a, nk, bkt->v[i]);
-                    else             eh_insert(nxt, nk, bkt->v[i]);
-                }
-            } EH_END
-            if (use_rsort_a) rsort_flush(&rb_a);
-        }
-        { EHT *tmp = curr; curr = nxt; nxt = tmp; }
+        /* For large fused steps we fold introduce into the parallel sweep
+           (pscan_intro_fused_sweep) to avoid the peak-memory doubling of
+           holding two full-sized EHTs simultaneously.  For small steps and
+           non-fused steps we do the classic single-threaded introduce.    */
+
+        /* Precompute widxs and elim arrays now (they don't depend on whether
+           we do a separate introduce or a combined one).                   */
+        int fs_pre   = fs;   /* frontier size before adding v              */
+        int fs_post  = fs + 1;
+        int v_idx_post = fs;   /* position of v in post-introduce frontier  */
+
+        /* Update frontier tentatively (needed to compute widxs/elim).     */
         frontier[fs] = v; fidx[v] = fs; fs++;
 
-        /* ---- B + C. Edge decisions and elimination ------------------- */
-        int    v_idx     = fs - 1;
-        size_t states_in = curr->cnt;
-        int    n_back    = 0;
-        int    widxs[8];
-
+        int n_back_p = 0, widxs_p[8];
         for (int ai = adj_off[v]; ai < adj_off[v + 1]; ai++) {
-            int w = adj_dat[ai];
-            if (fidx[w] >= 0 && pos[w] < pos[v] && n_back < 8)
-                widxs[n_back++] = fidx[w];
+            int ww = adj_dat[ai];
+            if (fidx[ww] >= 0 && pos[ww] < pos[v] && n_back_p < 8)
+                widxs_p[n_back_p++] = fidx[ww];
         }
-
         int elim_idxs_asc[MAX_FS_FAST + 2], n_elim = 0;
         for (int ei = 0; ei < fs; ei++)
             if (last_s[frontier[ei]] <= step)
@@ -1337,25 +1408,64 @@ void count_ham_paths_peh(
             elim_idxs_desc[e] = elim_idxs_asc[n_elim - 1 - e];
 
         int use_fused = (n_elim >= 1) &&
-                        (curr->cnt >= FUSED_MIN_STATES || n_back >= 2);
+                        (curr->cnt >= FUSED_MIN_STATES || n_back_p >= 2);
 
-        if (use_fused) {
-            /* ---- KEY CHANGE: parallel for large steps, serial for small. */
-            if (curr->cnt >= (size_t)RSORT_THRESH) {
-                pscan_fused_sweep(curr, nxt, fs, v_idx,
-                                  widxs, n_back,
-                                  elim_idxs_desc, n_elim,
-                                  step, n, &total);
-            } else {
-                fused_sweep(curr, nxt, fs, v_idx,
-                            widxs, n_back,
-                            elim_idxs_desc, n_elim,
-                            step, n, &total);
-            }
+        /* Use combined intro+fused for large steps to avoid peak-memory OOM. */
+        int use_pscan_combined = use_fused &&
+                                 (curr->cnt >= (size_t)RSORT_THRESH);
+
+        /* Capture input state count before any processing (for verbose). */
+        size_t states_in = curr->cnt;
+
+        if (use_pscan_combined) {
+            /* Skip separate introduce — workers do it internally.
+               Both functions take &curr and replace it with a fresh empty
+               EHT after freeing it; nxt receives the result.             */
+            pscan_intro_fused_sweep(&curr, nxt,
+                                    fs_pre, fs_post, v_idx_post,
+                                    widxs_p, n_back_p,
+                                    elim_idxs_desc, n_elim,
+                                    step, n, &total);
+            /* curr now points to a fresh empty EHT (old curr was freed).
+               nxt holds the new states.  Swap so curr = new states.     */
             { EHT *tmp = curr; curr = nxt; nxt = tmp; }
 
         } else {
-            /* B: sequential per-back-edge sweeps (identical to EH). */
+            /* Classic single-threaded introduce for small/non-fused steps. */
+            {
+                int use_rsort_a = (curr->cnt >= RSORT_THRESH);
+                RSortBuf rb_a = {0};
+                eh_reset(nxt);
+                if (use_rsort_a) rsort_init(&rb_a, nxt, 0);
+                EH_FOR(curr, bkt) {
+                    for (int i = 0; i < bkt->cnt; i++) {
+                        u64 nk = introduce(bkt->k[i], fs_pre);
+                        if (use_rsort_a) rsort_add(&rb_a, nk, bkt->v[i]);
+                        else             eh_insert(nxt, nk, bkt->v[i]);
+                    }
+                } EH_END
+                if (use_rsort_a) rsort_flush(&rb_a);
+            }
+            { EHT *tmp = curr; curr = nxt; nxt = tmp; }
+        }
+
+        /* ---- B + C. Edge decisions and elimination (classic path only) -- */
+        /* When use_pscan_combined, B+C were already handled inside
+           pscan_intro_fused_sweep.  We only reach the code below for the
+           small/non-fused path where the classic single-threaded logic runs. */
+        int    v_idx     = v_idx_post;
+        int    n_back    = n_back_p;
+        const int *widxs = widxs_p;
+
+        if (use_fused && !use_pscan_combined) {
+            /* Small fused step: serial fused_sweep.  */
+            fused_sweep(curr, nxt, fs, v_idx,
+                        widxs_p, n_back_p,
+                        elim_idxs_desc, n_elim,
+                        step, n, &total);
+            { EHT *tmp = curr; curr = nxt; nxt = tmp; }
+        } else if (!use_pscan_combined) {
+            /* Non-fused or small: sequential per-edge sweeps then elimination. */
             for (int j = 0; j < n_back; j++) {
                 int w_idx = widxs[j];
                 int use_rsort_b = (curr->cnt >= RSORT_THRESH);
@@ -1465,7 +1575,11 @@ void count_ham_paths_peh(
             }
         }
 
-        /* Update frontier for the fused path (non-fused does it above). */
+        /* Update frontier for the fused path (non-fused does it above).
+           For pscan_combined, the DATA eliminations are done inside the
+           workers (apply_elim_seq filters states), but the FRONTIER
+           bookkeeping (updating frontier[] and fidx[]) must still happen
+           here, because it affects subsequent steps.                     */
         if (use_fused) {
             for (int e = 0; e < n_elim; e++) {
                 int u_idx = elim_idxs_desc[e];
