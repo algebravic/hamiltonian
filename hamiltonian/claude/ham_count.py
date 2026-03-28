@@ -283,6 +283,7 @@ def parse_args():
     # --- DP options ---
     p.add_argument("--sort-merge", action="store_true",
                    help="Use sort-merge DP backend instead of EH+rsort.")
+    p.add_argument("-v", "--verbose", action="store true",
                    help="Print per-step frontier DP progress.")
     p.add_argument("--profile", action="store_true",
                    help="Print per-step timing/state-count table to stderr.")
