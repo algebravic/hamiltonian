@@ -1538,6 +1538,13 @@ static void *sm_worker_runs(void *arg) {
     /* flush final partial buffer as a run */
     if (ws->buf_len > 0) sm_flush_run(ws);
 
+    /* Free scratch buffers now — they're no longer needed and holding
+       them through sm_merge_runs would add 2 × SM_WORKER_CAP × 24B per
+       worker (16.8 GB total for P=6) to the peak memory footprint.
+       free(NULL) is safe so sm_fused_sweep can still call free(WS[i].buf). */
+    free(ws->buf); ws->buf = NULL;
+    free(ws->tmp); ws->tmp = NULL;
+
     if (local_total) {
         pthread_mutex_lock(w->total_mu);
         *w->total += local_total;
