@@ -1110,34 +1110,52 @@ cleanup:
    -----------------------------------------------------------------------
    Parallelises the expensive source-scan computation (apply_edge × 2^n_back
    per state).  Each of P worker threads processes a disjoint slab range of
-   curr, inserts valid outputs into its own private EHT (no shared mutable
-   state, no locks, no fences during computation), then the main thread
-   merges P local EHTs into nxt via the rsort buffer.
+   curr and writes its outputs to a private FLAT BUFFER (sequential appends,
+   cache-friendly).  After all workers finish, each worker sorts its buffer
+   (qsort, O(N log N), fits in L3), deduplicates consecutive equal keys, and
+   the main thread P-way-merges the sorted arrays into the final EHT via the
+   existing rsort buffer path.
+
+   This avoids the random-write EHT insertion that caused cache thrashing in
+   the previous implementation.  Peak memory = curr + P × worker_buf + nxt,
+   where each worker_buf ≈ so/P entries × 24 B, so total = curr + so + nxt —
+   identical to single-threaded EH.
 
    count_ham_paths_peh is structurally identical to count_ham_paths_c with
-   a single change: fused_sweep → pscan_fused_sweep for large steps.
-   The non-fused path, frontier management, checkpointing, and final-step
-   logic are byte-for-byte the same as the EH backend to avoid any risk of
-   introducing correctness bugs.
+   two changes:
+     1. pscan_intro_fused_sweep folds introduce+fused into one parallel pass
+        (avoids holding two full-sized EHTs simultaneously for large n).
+     2. pscan_fused_sweep parallelises the source scan for large fused steps.
+   All other logic (frontier bookkeeping, non-fused path, checkpoint) is
+   byte-for-byte identical to count_ham_paths_c.
    ====================================================================== */
 
 #ifndef PSCAN_NTHREADS
 #define PSCAN_NTHREADS 6
 #endif
 
+/* Comparator for qsort of WEntry by key. */
+static int wentry_cmp(const void *a, const void *b) {
+    u64 ka = ((const WEntry *)a)->key;
+    u64 kb = ((const WEntry *)b)->key;
+    return (ka > kb) - (ka < kb);
+}
+
 typedef struct {
     EHSlab     **slabs;
     int          slab_lo, slab_hi;
-    int          fs_pre;  /* frontier size BEFORE introducing new vertex    */
-    int          fs;      /* frontier size AFTER introduce (= fs_pre + 1)   */
+    int          fs_pre;     /* frontier size before introduce              */
+    int          fs;         /* frontier size after introduce               */
     int          v_idx;
     const int   *widxs;
     int          n_back;
     const int   *elim_desc;
     int          n_elim;
     int          step, n;
-    int          do_intro; /* if 1, apply introduce(key, fs_pre) first      */
-    EHT         *out;
+    int          do_intro;   /* fold introduce() into the worker            */
+    /* Outputs (written by worker, read by main after join)                 */
+    WEntry      *out;        /* flat sorted+deduped array of output states  */
+    size_t       out_len;    /* number of unique (key,val) pairs            */
     u128         total_acc;
 } PScanWorker;
 
@@ -1145,6 +1163,13 @@ static void *pscan_worker(void *arg) {
     PScanWorker *w = (PScanWorker *)arg;
     int n_subsets = 1 << w->n_back;
     w->total_acc  = (u128)0;
+    w->out        = NULL;
+    w->out_len    = 0;
+
+    /* Flat buffer for outputs — sequential appends, no random writes.      */
+    size_t buf_cap = 65536;
+    WEntry *buf = (WEntry *)malloc(buf_cap * sizeof(WEntry));
+    size_t  buf_len = 0;
 
     for (int si = w->slab_lo; si < w->slab_hi; si++) {
         EHSlab *sl = w->slabs[si];
@@ -1153,7 +1178,6 @@ static void *pscan_worker(void *arg) {
             for (int i = 0; i < bkt->cnt; i++) {
                 u64  base_key = bkt->k[i];
                 u128 cnt      = bkt->v[i];
-                /* Optional introduce step folded into the worker.          */
                 if (w->do_intro) base_key = introduce(base_key, w->fs_pre);
                 for (int S = 0; S < n_subsets; S++) {
                     u64 nk = base_key; int valid = 1;
@@ -1172,115 +1196,96 @@ static void *pscan_worker(void *arg) {
                                             cnt, &w->total_acc);
                         if (!nk) continue;
                     }
-                    eh_insert(w->out, nk, cnt);
+                    /* Sequential append — perfectly cache-friendly.        */
+                    if (buf_len == buf_cap) {
+                        buf_cap *= 2;
+                        buf = (WEntry *)realloc(buf, buf_cap * sizeof(WEntry));
+                    }
+                    buf[buf_len].key = nk;
+                    buf[buf_len].val = cnt;
+                    buf_len++;
                 }
             }
         }
     }
+
+    /* Sort by key (qsort, O(N log N), ~N entries fit in L3 for small N).  */
+    if (buf_len > 1)
+        qsort(buf, buf_len, sizeof(WEntry), wentry_cmp);
+
+    /* Dedup: accumulate values for consecutive equal keys.                 */
+    if (buf_len > 0) {
+        size_t n_uniq = 0;
+        for (size_t i = 0; i < buf_len; i++) {
+            if (n_uniq > 0 && buf[n_uniq-1].key == buf[i].key)
+                buf[n_uniq-1].val += buf[i].val;
+            else
+                buf[n_uniq++] = buf[i];
+        }
+        buf_len = n_uniq;
+    }
+
+    w->out     = buf;
+    w->out_len = buf_len;
     return NULL;
 }
 
-/* pscan_fused_sweep: parallel fused sweep WITHOUT folding introduce.
-   Called when curr already holds post-introduce states.                 */
-static void pscan_fused_sweep(EHT **curr_p, EHT *nxt,
-                               int fs, int v_idx,
-                               const int *widxs, int n_back,
-                               const int *elim_desc, int n_elim,
-                               int step, int n, u128 *total)
-{
-    EHT *curr = *curr_p;
-    /* Collect ACTIVE slabs only (used > 0).  The EHT pool linked list
-       retains all slabs ever allocated; after eh_reset() + partial refill,
-       the tail of the list contains empty slabs (used=0, bkts=NULL).
-       Including these in the worker partition causes severe load imbalance:
-       workers assigned to the tail do no work while others carry the full
-       load, collapsing effective parallelism to 1-2 threads.              */
-    int n_slabs = 0;
-    for (EHSlab *sl = curr->sl_head; sl; sl = sl->next)
-        if (sl->used > 0) n_slabs++;
-    EHSlab **slabs = (EHSlab **)malloc((n_slabs ? n_slabs : 1) * sizeof(EHSlab *));
-    { int idx = 0;
-      for (EHSlab *sl = curr->sl_head; sl; sl = sl->next)
-          if (sl->used > 0) slabs[idx++] = sl; }
+/* P-way merge of P sorted WEntry arrays into a single sorted+deduped stream,
+   then insert into nxt via rsort (for cross-worker duplicate handling).
+   Uses a simple linear-scan min-finder — fast for P ≤ 8.                  */
+static void pscan_merge_into_nxt(PScanWorker *W, int P, EHT *nxt) {
+    size_t pos[PSCAN_NTHREADS] = {0};
 
-    int P = PSCAN_NTHREADS;
-    if (P > n_slabs && n_slabs > 0) P = n_slabs;
-    if (P < 1) P = 1;
-
-    PScanWorker *W = (PScanWorker *)calloc(P, sizeof(PScanWorker));
-    pthread_t   *T = (pthread_t   *)malloc(P * sizeof(pthread_t));
-
-    int base = n_slabs / P, extra = n_slabs % P, lo = 0;
-    for (int i = 0; i < P; i++) {
-        int hi = lo + base + (i < extra ? 1 : 0);
-        W[i] = (PScanWorker){
-            .slabs=slabs, .slab_lo=lo, .slab_hi=hi,
-            .fs_pre=fs, .fs=fs, .v_idx=v_idx,
-            .widxs=widxs, .n_back=n_back,
-            .elim_desc=elim_desc, .n_elim=n_elim,
-            .step=step, .n=n, .do_intro=0,
-            .out=eh_alloc()
-        };
-        lo = hi;
-        pthread_create(&T[i], NULL, pscan_worker, &W[i]);
-    }
-    for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
-
-    /* Accumulate per-worker totals. */
-    for (int i = 0; i < P; i++) *total += W[i].total_acc;
-
-    /* Free curr immediately after workers finish reading it.
-       This frees 10-22 GB before the merge phase grows nxt.
-       Replace with a fresh empty EHT so the caller can swap as usual.  */
-    eh_free(curr);
-    *curr_p = eh_alloc();
-
-    /* Merge P local EHTs into nxt via rsort; free each immediately after. */
     eh_reset(nxt);
     RSortBuf rb = {0};
     rsort_init(&rb, nxt, 0);
-    for (int i = 0; i < P; i++) {
-        EH_FOR(W[i].out, bkt) {
-            for (int j = 0; j < bkt->cnt; j++)
-                rsort_add(&rb, bkt->k[j], bkt->v[j]);
-        } EH_END
-        eh_free(W[i].out);
-        W[i].out = NULL;
+
+    for (;;) {
+        /* Find the worker with the smallest current key. */
+        u64 min_key = UINT64_MAX;
+        int min_i   = -1;
+        for (int i = 0; i < P; i++) {
+            if (pos[i] < W[i].out_len && W[i].out[pos[i]].key < min_key) {
+                min_key = W[i].out[pos[i]].key;
+                min_i   = i;
+            }
+        }
+        if (min_i < 0) break;
+
+        /* Accumulate all workers' entries with this key.                   */
+        u128 acc = 0;
+        for (int i = 0; i < P; i++) {
+            while (pos[i] < W[i].out_len && W[i].out[pos[i]].key == min_key) {
+                acc += W[i].out[pos[i]].val;
+                pos[i]++;
+            }
+        }
+        rsort_add(&rb, min_key, acc);
     }
     rsort_flush(&rb);
-
-    free(slabs); free(W); free(T);
 }
 
-/* pscan_intro_fused_sweep: combine introduce + fused_sweep in one pass.
-   Workers read pre-introduce curr, apply introduce(key, fs_pre) first,
-   then apply_edge × 2^n_back, then eliminations.
-   After join curr is freed — eliminating the peak-memory doubling that
-   the separate introduce step causes when si ≥ ~300M states.           */
-static void pscan_intro_fused_sweep(EHT **curr_p, EHT *nxt,
-                                     int fs_pre, int fs,
-                                     int v_idx,
-                                     const int *widxs, int n_back,
-                                     const int *elim_desc, int n_elim,
-                                     int step, int n, u128 *total)
+/* ── Internal helper: collect active slabs and launch P workers. ─────── */
+static void pscan_launch(EHT *curr, PScanWorker *W, pthread_t *T, int *P_out,
+                          EHSlab ***slabs_out, int *n_slabs_out,
+                          int fs_pre, int fs, int v_idx,
+                          const int *widxs, int n_back,
+                          const int *elim_desc, int n_elim,
+                          int step, int n, int do_intro)
 {
-    EHT *curr = *curr_p;
-    int n_slabs = 0;
-    for (EHSlab *sl = curr->sl_head; sl; sl = sl->next)
-        if (sl->used > 0) n_slabs++;
-    EHSlab **slabs = (EHSlab **)malloc((n_slabs ? n_slabs : 1) * sizeof(EHSlab *));
-    { int idx = 0;
-      for (EHSlab *sl = curr->sl_head; sl; sl = sl->next)
-          if (sl->used > 0) slabs[idx++] = sl; }
+    /* Collect only ACTIVE slabs (used>0) to avoid load imbalance from
+       empty slabs retained in the pool after eh_reset().                  */
+    int ns = 0;
+    for (EHSlab *sl = curr->sl_head; sl; sl = sl->next) if (sl->used > 0) ns++;
+    EHSlab **slabs = (EHSlab **)malloc((ns ? ns : 1) * sizeof(EHSlab *));
+    { int idx=0; for (EHSlab *sl=curr->sl_head; sl; sl=sl->next)
+          if (sl->used>0) slabs[idx++]=sl; }
 
     int P = PSCAN_NTHREADS;
-    if (P > n_slabs && n_slabs > 0) P = n_slabs;
+    if (P > ns && ns > 0) P = ns;
     if (P < 1) P = 1;
 
-    PScanWorker *W = (PScanWorker *)calloc(P, sizeof(PScanWorker));
-    pthread_t   *T = (pthread_t   *)malloc(P * sizeof(pthread_t));
-
-    int base = n_slabs / P, extra = n_slabs % P, lo = 0;
+    int base = ns/P, extra = ns%P, lo = 0;
     for (int i = 0; i < P; i++) {
         int hi = lo + base + (i < extra ? 1 : 0);
         W[i] = (PScanWorker){
@@ -1288,39 +1293,72 @@ static void pscan_intro_fused_sweep(EHT **curr_p, EHT *nxt,
             .fs_pre=fs_pre, .fs=fs, .v_idx=v_idx,
             .widxs=widxs, .n_back=n_back,
             .elim_desc=elim_desc, .n_elim=n_elim,
-            .step=step, .n=n, .do_intro=1,
-            .out=eh_alloc()
+            .step=step, .n=n, .do_intro=do_intro
         };
         lo = hi;
         pthread_create(&T[i], NULL, pscan_worker, &W[i]);
     }
-    for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
+    *P_out       = P;
+    *slabs_out   = slabs;
+    *n_slabs_out = ns;
+}
 
+static void pscan_join_and_free(PScanWorker *W, pthread_t *T, int P,
+                                 EHSlab **slabs, u128 *total,
+                                 EHT **curr_p, EHT *nxt)
+{
+    for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     for (int i = 0; i < P; i++) *total += W[i].total_acc;
 
-    /* Free curr BEFORE merge — the key memory saving.                   */
-    eh_free(curr);
+    /* Free curr before merging — avoids holding curr + nxt simultaneously. */
+    eh_free(*curr_p);
     *curr_p = eh_alloc();
 
-    eh_reset(nxt);
-    RSortBuf rb = {0};
-    rsort_init(&rb, nxt, 0);
-    for (int i = 0; i < P; i++) {
-        EH_FOR(W[i].out, bkt) {
-            for (int j = 0; j < bkt->cnt; j++)
-                rsort_add(&rb, bkt->k[j], bkt->v[j]);
-        } EH_END
-        eh_free(W[i].out);
-        W[i].out = NULL;
-    }
-    rsort_flush(&rb);
+    /* P-way merge sorted worker arrays into nxt.                           */
+    pscan_merge_into_nxt(W, P, nxt);
 
-    free(slabs); free(W); free(T);
+    for (int i = 0; i < P; i++) { free(W[i].out); W[i].out = NULL; }
+    free(slabs);
+}
+
+/* Parallel fused sweep (separate from introduce).                          */
+static void pscan_fused_sweep(EHT **curr_p, EHT *nxt,
+                               int fs, int v_idx,
+                               const int *widxs, int n_back,
+                               const int *elim_desc, int n_elim,
+                               int step, int n, u128 *total)
+{
+    PScanWorker W[PSCAN_NTHREADS]; pthread_t T[PSCAN_NTHREADS];
+    int P; EHSlab **slabs; int ns;
+    pscan_launch(*curr_p, W, T, &P, &slabs, &ns,
+                 fs, fs, v_idx, widxs, n_back,
+                 elim_desc, n_elim, step, n, 0);
+    pscan_join_and_free(W, T, P, slabs, total, curr_p, nxt);
+}
+
+/* Combined introduce + fused sweep in one parallel pass.
+   Avoids building a post-introduce EHT before the fused step, which would
+   double peak memory for large n (two 20+ GB EHTs simultaneously).         */
+static void pscan_intro_fused_sweep(EHT **curr_p, EHT *nxt,
+                                     int fs_pre, int fs, int v_idx,
+                                     const int *widxs, int n_back,
+                                     const int *elim_desc, int n_elim,
+                                     int step, int n, u128 *total)
+{
+    PScanWorker W[PSCAN_NTHREADS]; pthread_t T[PSCAN_NTHREADS];
+    int P; EHSlab **slabs; int ns;
+    pscan_launch(*curr_p, W, T, &P, &slabs, &ns,
+                 fs_pre, fs, v_idx, widxs, n_back,
+                 elim_desc, n_elim, step, n, 1);
+    pscan_join_and_free(W, T, P, slabs, total, curr_p, nxt);
 }
 
 /* ── Top-level PScan entry point ────────────────────────────────────────
    Structurally identical to count_ham_paths_c.  Only change:
-   fused_sweep → pscan_fused_sweep when curr->cnt >= RSORT_THRESH.      */
+   large fused steps use pscan_intro_fused_sweep (combined introduce+fused,
+   frees curr before growing nxt) or pscan_fused_sweep (post-introduce only).
+   All frontier management, non-fused path, checkpoint, and final-step logic
+   are byte-for-byte the same as count_ham_paths_c.                        */
 void count_ham_paths_peh(
     int         n,
     const int  *order,
@@ -1378,60 +1416,45 @@ void count_ham_paths_peh(
             goto cleanup;
         }
 
-        /* ---- A. Introduce v ------------------------------------------ */
-        /* For large fused steps we fold introduce into the parallel sweep
-           (pscan_intro_fused_sweep) to avoid the peak-memory doubling of
-           holding two full-sized EHTs simultaneously.  For small steps and
-           non-fused steps we do the classic single-threaded introduce.    */
-
-        /* Precompute widxs and elim arrays now (they don't depend on whether
-           we do a separate introduce or a combined one).                   */
-        int fs_pre   = fs;   /* frontier size before adding v              */
-        int fs_post  = fs + 1;
-        int v_idx_post = fs;   /* position of v in post-introduce frontier  */
-
-        /* Update frontier tentatively (needed to compute widxs/elim).     */
+        /* Precompute widxs, elim arrays, and flags before any processing.  */
+        int fs_pre    = fs;
+        int fs_post   = fs + 1;
+        int v_idx_post = fs;
         frontier[fs] = v; fidx[v] = fs; fs++;
 
         int n_back_p = 0, widxs_p[8];
-        for (int ai = adj_off[v]; ai < adj_off[v + 1]; ai++) {
+        for (int ai = adj_off[v]; ai < adj_off[v+1]; ai++) {
             int ww = adj_dat[ai];
             if (fidx[ww] >= 0 && pos[ww] < pos[v] && n_back_p < 8)
                 widxs_p[n_back_p++] = fidx[ww];
         }
-        int elim_idxs_asc[MAX_FS_FAST + 2], n_elim = 0;
+        int elim_idxs_asc[MAX_FS_FAST+2], n_elim = 0;
         for (int ei = 0; ei < fs; ei++)
-            if (last_s[frontier[ei]] <= step)
-                elim_idxs_asc[n_elim++] = ei;
-        int elim_idxs_desc[MAX_FS_FAST + 2];
+            if (last_s[frontier[ei]] <= step) elim_idxs_asc[n_elim++] = ei;
+        int elim_idxs_desc[MAX_FS_FAST+2];
         for (int e = 0; e < n_elim; e++)
-            elim_idxs_desc[e] = elim_idxs_asc[n_elim - 1 - e];
+            elim_idxs_desc[e] = elim_idxs_asc[n_elim-1-e];
 
         int use_fused = (n_elim >= 1) &&
                         (curr->cnt >= FUSED_MIN_STATES || n_back_p >= 2);
+        int use_pscan = use_fused && (curr->cnt >= (size_t)RSORT_THRESH);
 
-        /* Use combined intro+fused for large steps to avoid peak-memory OOM. */
-        int use_pscan_combined = use_fused &&
-                                 (curr->cnt >= (size_t)RSORT_THRESH);
+        size_t states_in = curr->cnt;   /* capture before any modification */
 
-        /* Capture input state count before any processing (for verbose). */
-        size_t states_in = curr->cnt;
-
-        if (use_pscan_combined) {
-            /* Skip separate introduce — workers do it internally.
-               Both functions take &curr and replace it with a fresh empty
-               EHT after freeing it; nxt receives the result.             */
+        /* ---- A. Introduce v --------------------------------------------- */
+        if (use_pscan) {
+            /* Combined introduce + fused in one parallel pass.
+               pscan_intro_fused_sweep frees curr before growing nxt,
+               avoiding the peak-memory doubling of a separate introduce.   */
             pscan_intro_fused_sweep(&curr, nxt,
                                     fs_pre, fs_post, v_idx_post,
                                     widxs_p, n_back_p,
                                     elim_idxs_desc, n_elim,
                                     step, n, &total);
-            /* curr now points to a fresh empty EHT (old curr was freed).
-               nxt holds the new states.  Swap so curr = new states.     */
             { EHT *tmp = curr; curr = nxt; nxt = tmp; }
 
         } else {
-            /* Classic single-threaded introduce for small/non-fused steps. */
+            /* Classic single-threaded introduce for small steps.           */
             {
                 int use_rsort_a = (curr->cnt >= RSORT_THRESH);
                 RSortBuf rb_a = {0};
@@ -1447,154 +1470,119 @@ void count_ham_paths_peh(
                 if (use_rsort_a) rsort_flush(&rb_a);
             }
             { EHT *tmp = curr; curr = nxt; nxt = tmp; }
-        }
 
-        /* ---- B + C. Edge decisions and elimination (classic path only) -- */
-        /* When use_pscan_combined, B+C were already handled inside
-           pscan_intro_fused_sweep.  We only reach the code below for the
-           small/non-fused path where the classic single-threaded logic runs. */
-        int    v_idx     = v_idx_post;
-        int    n_back    = n_back_p;
-        const int *widxs = widxs_p;
-
-        if (use_fused && !use_pscan_combined) {
-            /* Small fused step: serial fused_sweep.  */
-            fused_sweep(curr, nxt, fs, v_idx,
-                        widxs_p, n_back_p,
-                        elim_idxs_desc, n_elim,
-                        step, n, &total);
-            { EHT *tmp = curr; curr = nxt; nxt = tmp; }
-        } else if (!use_pscan_combined) {
-            /* Non-fused or small: sequential per-edge sweeps then elimination. */
-            for (int j = 0; j < n_back; j++) {
-                int w_idx = widxs[j];
-                int use_rsort_b = (curr->cnt >= RSORT_THRESH);
-                RSortBuf rb_b = {0};
-                eh_reset(nxt);
-                if (use_rsort_b) rsort_init(&rb_b, nxt, 0);
-                EH_FOR(curr, bkt) {
-                    for (int i = 0; i < bkt->cnt; i++) {
-                        u64    key = bkt->k[i];
-                        u128   cnt = bkt->v[i];
-                        int8_t sv  = slot_get(key, v_idx);
-                        int8_t sw  = slot_get(key, w_idx);
-#define BINSERT2(k_) do { if(use_rsort_b) rsort_add(&rb_b,(k_),cnt); \
-                          else eh_insert(nxt,(k_),cnt); } while(0)
-                        BINSERT2(key);
-                        if (sv == -1 || sw == -1) { (void)0; } else {
-                        u64 nk = key;
-                        if (sv == 0 && sw == 0) {
-                            int8_t L = label_max(key, fs) + 1;
-                            nk = slot_set(nk, v_idx, L);
-                            nk = slot_set(nk, w_idx, L);
-                            BINSERT2(canon(nk, fs));
-                        } else if (sv == 0) {
-                            nk = slot_set(nk, w_idx, -1);
-                            nk = slot_set(nk, v_idx, sw);
-                            BINSERT2(canon(nk, fs));
-                        } else if (sw == 0) {
-                            nk = slot_set(nk, v_idx, -1);
-                            nk = slot_set(nk, w_idx, sv);
-                            BINSERT2(canon(nk, fs));
-                        } else if (sv != sw) {
-                            int sv_c = label_count(key, fs, sv);
-                            int sw_c = label_count(key, fs, sw);
-                            nk = slot_set(nk, v_idx, -1);
-                            nk = slot_set(nk, w_idx, -1);
-                            nk = label_rename(nk, fs, sw, sv);
-                            if (sv_c == 1 && sw_c == 1) {
-                                if (nc_get(nk) >= 1) goto bskip2;
-                                int ok = 1;
-                                for (int k2 = 0; k2 < fs; k2++)
-                                    if (slot_get(nk, k2) != -1) { ok = 0; break; }
-                                if (!ok) goto bskip2;
-                                BINSERT2(canon(nc_set_1(nk), fs));
-                            } else {
-                                BINSERT2(canon(nk, fs));
-                            }
-                        }
-                        }
-                        bskip2:;
-#undef BINSERT2
-                    }
-                } EH_END
-                if (use_rsort_b) rsort_flush(&rb_b);
+            /* ---- B + C. Edge decisions and elimination ------------------- */
+            int v_idx = v_idx_post;
+            if (use_fused) {
+                fused_sweep(curr, nxt, fs, v_idx,
+                            widxs_p, n_back_p,
+                            elim_idxs_desc, n_elim,
+                            step, n, &total);
                 { EHT *tmp = curr; curr = nxt; nxt = tmp; }
-            }
-
-            /* C: eliminate vertices one at a time (identical to EH). */
-            for (int e = 0; e < n_elim; e++) {
-                int u_idx = elim_idxs_asc[e];
-                int use_rsort_c = (curr->cnt >= RSORT_THRESH);
-                RSortBuf rb_c = {0};
-                eh_reset(nxt);
-                if (use_rsort_c) rsort_init(&rb_c, nxt, 0);
-#define CINSERT2(k_,v_) do { if(use_rsort_c) rsort_add(&rb_c,(k_),(v_)); \
-                             else eh_insert(nxt,(k_),(v_)); } while(0)
-                EH_FOR(curr, bkt) {
-                    for (int i = 0; i < bkt->cnt; i++) {
-                        u64    key = bkt->k[i];
-                        u128   cnt = bkt->v[i];
-                        int8_t su  = slot_get(key, u_idx);
-                        int    nc  = nc_get(key);
-                        if (su == 0) continue;
-                        u64 rk = eliminate_slot(key, u_idx, fs);
-                        if (su == -1) {
-                            CINSERT2(canon(rk, fs - 1), cnt);
-                        } else {
-                            int partner = 0;
-                            for (int k2 = 0; k2 < fs - 1; k2++)
-                                if (slot_get(rk, k2) == su) { partner = 1; break; }
-                            if (partner) {
-                                CINSERT2(canon(rk, fs - 1), cnt);
-                            } else {
-                                if (nc + 1 > 1) continue;
-                                int ok = 1;
-                                for (int k2 = 0; k2 < fs - 1; k2++)
-                                    if (slot_get(rk, k2) != -1) { ok = 0; break; }
-                                if (!ok) continue;
-                                if (step == n - 1) total += cnt;
+            } else {
+                /* Sequential per-back-edge sweeps (identical to EH).      */
+                for (int j = 0; j < n_back_p; j++) {
+                    int w_idx = widxs_p[j];
+                    int use_rsort_b = (curr->cnt >= RSORT_THRESH);
+                    RSortBuf rb_b = {0};
+                    eh_reset(nxt);
+                    if (use_rsort_b) rsort_init(&rb_b, nxt, 0);
+                    EH_FOR(curr, bkt) {
+                        for (int i = 0; i < bkt->cnt; i++) {
+                            u64  key = bkt->k[i]; u128 cnt = bkt->v[i];
+                            int8_t sv = slot_get(key,v_idx), sw = slot_get(key,w_idx);
+#define BPEH(k_) do { if(use_rsort_b) rsort_add(&rb_b,(k_),cnt); \
+                      else eh_insert(nxt,(k_),cnt); } while(0)
+                            BPEH(key);
+                            if (sv != -1 && sw != -1) {
+                              u64 nk = key;
+                              if (sv==0&&sw==0){int8_t L=label_max(key,fs)+1;
+                                nk=slot_set(nk,v_idx,L);nk=slot_set(nk,w_idx,L);
+                                BPEH(canon(nk,fs));
+                              } else if(sv==0){nk=slot_set(nk,w_idx,-1);
+                                nk=slot_set(nk,v_idx,sw);BPEH(canon(nk,fs));
+                              } else if(sw==0){nk=slot_set(nk,v_idx,-1);
+                                nk=slot_set(nk,w_idx,sv);BPEH(canon(nk,fs));
+                              } else if(sv!=sw){
+                                int sv_c=label_count(key,fs,sv),sw_c=label_count(key,fs,sw);
+                                nk=slot_set(nk,v_idx,-1);nk=slot_set(nk,w_idx,-1);
+                                nk=label_rename(nk,fs,sw,sv);
+                                if(sv_c==1&&sw_c==1){if(nc_get(nk)>=1) goto bpeh_skip;
+                                  int ok=1;for(int k2=0;k2<fs;k2++)
+                                    if(slot_get(nk,k2)!=-1){ok=0;break;}
+                                  if(!ok) goto bpeh_skip;
+                                  BPEH(canon(nc_set_1(nk),fs));
+                                } else { BPEH(canon(nk,fs)); }
+                              }
                             }
+                            bpeh_skip:;
+#undef BPEH
                         }
-                    }
-                } EH_END
-#undef CINSERT2
-                if (use_rsort_c) rsort_flush(&rb_c);
-                { EHT *tmp = curr; curr = nxt; nxt = tmp; }
-                fs--;
-                int u = frontier[u_idx];
-                for (int k = u_idx; k < fs; k++) {
-                    frontier[k] = frontier[k + 1];
-                    fidx[frontier[k]] = k;
+                    } EH_END
+                    if (use_rsort_b) rsort_flush(&rb_b);
+                    { EHT *tmp = curr; curr = nxt; nxt = tmp; }
                 }
-                fidx[u] = -1;
-                /* Adjust subsequent elim indices for the compacted frontier. */
-                for (int e2 = e + 1; e2 < n_elim; e2++)
-                    if (elim_idxs_asc[e2] > u_idx)
-                        elim_idxs_asc[e2]--;
+                /* Sequential elimination (identical to EH).               */
+                for (int e = 0; e < n_elim; e++) {
+                    int u_idx = elim_idxs_asc[e];
+                    int use_rsort_c = (curr->cnt >= RSORT_THRESH);
+                    RSortBuf rb_c = {0};
+                    eh_reset(nxt);
+                    if (use_rsort_c) rsort_init(&rb_c, nxt, 0);
+#define CPEH(k_,v_) do { if(use_rsort_c) rsort_add(&rb_c,(k_),(v_)); \
+                         else eh_insert(nxt,(k_),(v_)); } while(0)
+                    EH_FOR(curr, bkt) {
+                        for (int i = 0; i < bkt->cnt; i++) {
+                            u64 key=bkt->k[i]; u128 cnt=bkt->v[i];
+                            int8_t su=slot_get(key,u_idx); int nc=nc_get(key);
+                            if (su==0) continue;
+                            u64 rk=eliminate_slot(key,u_idx,fs);
+                            if (su==-1){ CPEH(canon(rk,fs-1),cnt); }
+                            else {
+                              int partner=0;
+                              for(int k2=0;k2<fs-1;k2++)
+                                if(slot_get(rk,k2)==su){partner=1;break;}
+                              if(partner){ CPEH(canon(rk,fs-1),cnt); }
+                              else {
+                                if(nc+1>1) continue;
+                                int ok=1;for(int k2=0;k2<fs-1;k2++)
+                                  if(slot_get(rk,k2)!=-1){ok=0;break;}
+                                if(!ok) continue;
+                                if(step==n-1) total+=cnt;
+                              }
+                            }
+                        }
+                    } EH_END
+#undef CPEH
+                    if (use_rsort_c) rsort_flush(&rb_c);
+                    { EHT *tmp = curr; curr = nxt; nxt = tmp; }
+                    fs--;
+                    int u = frontier[u_idx];
+                    for (int k = u_idx; k < fs; k++) {
+                        frontier[k] = frontier[k+1];
+                        fidx[frontier[k]] = k;
+                    }
+                    fidx[u] = -1;
+                    for (int e2 = e+1; e2 < n_elim; e2++)
+                        if (elim_idxs_asc[e2] > u_idx) elim_idxs_asc[e2]--;
+                }
             }
         }
 
-        /* Update frontier for the fused path (non-fused does it above).
-           For pscan_combined, the DATA eliminations are done inside the
-           workers (apply_elim_seq filters states), but the FRONTIER
-           bookkeeping (updating frontier[] and fidx[]) must still happen
-           here, because it affects subsequent steps.                     */
+        /* Update frontier for fused path (non-fused does it in C loop above). */
         if (use_fused) {
             for (int e = 0; e < n_elim; e++) {
                 int u_idx = elim_idxs_desc[e];
                 int u     = frontier[u_idx];
-                for (int k = u_idx; k < fs - 1; k++) {
-                    frontier[k] = frontier[k + 1];
-                    fidx[frontier[k]] = k;
+                for (int k = u_idx; k < fs-1; k++) {
+                    frontier[k] = frontier[k+1]; fidx[frontier[k]] = k;
                 }
-                fidx[u] = -1;
-                fs--;
+                fidx[u] = -1; fs--;
             }
         }
 
-        /* Final-step lookup: count Hamiltonian path completions. */
-        if (step == n - 1) {
+        /* Final-step lookup. */
+        if (step == n-1) {
             u64   target = KEY_MARKER | KEY_NC_BIT;
             u128 *vp     = eh_lookup(curr, target);
             if (vp) total += *vp;
@@ -1604,7 +1592,7 @@ void count_ham_paths_peh(
             double t_now = now_ms();
             fprintf(stderr,
                 "%4d  %6d  %2d  %6d  %9zu  %10zu  %8.1f  %8.1f\n",
-                step, v, fs, n_back,
+                step, v, fs, n_back_p,
                 states_in, curr->cnt,
                 t_now - t_prev, t_now - t_start - t_ckpt_total);
             t_prev = t_now;
@@ -1612,7 +1600,7 @@ void count_ham_paths_peh(
 
         if (checkpoint_path && checkpoint_path[0] && checkpoint_secs > 0) {
             double t_now2 = now_ms();
-            if ((t_now2 - t_last_ckpt) / 1000.0 >= checkpoint_secs) {
+            if ((t_now2 - t_last_ckpt)/1000.0 >= checkpoint_secs) {
                 if (ckpt_save(checkpoint_path, n, order, step, fs,
                               frontier, total, curr)) {
                     double t_ckpt_end = now_ms();
@@ -1643,7 +1631,7 @@ void count_ham_paths_peh(
 
 cleanup:
     eh_free(curr); eh_free(nxt); free(fidx);
-    if (*res_hi != UINT64_MAX && *res_hi != (UINT64_MAX - 1)) {
+    if (*res_hi != UINT64_MAX && *res_hi != (UINT64_MAX-1)) {
         *res_lo = (uint64_t) total;
         *res_hi = (uint64_t)(total >> 64);
     }
