@@ -1457,10 +1457,11 @@ typedef struct {
     int      ext_runs;
     SMRun   *runs;           /* RAM mode */
     int      n_runs, runs_cap;
-    int      run_fd;         /* ext mode: fd from shm_open or open(tmpfile) */
-    char    *run_shm_name;   /* ext mode: shm name to unlink (or NULL)      */
-    size_t   run_fd_off;     /* ext mode: current write offset in bytes      */
-    size_t  *run_lens;       /* ext mode: length of each run in entries      */
+    int      run_fd;         /* ext mode: fd from shm_open or tmpfile     */
+    void    *run_map;        /* ext mode: mmap base (macOS) or NULL       */
+    size_t   run_capacity;   /* ext mode: total bytes allocated           */
+    size_t   run_fd_off;     /* ext mode: current write offset in bytes   */
+    size_t  *run_lens;       /* ext mode: length of each run in entries   */
 } SMWorkerState;
 
 /* ── ext_runs backing store helpers ─────────────────────────────────── */
@@ -1468,48 +1469,69 @@ typedef struct {
 #include <sys/mman.h>
 #include <unistd.h>
 #ifdef __APPLE__
-#  define SM_USE_SHM 1    /* use shm_open on macOS — bypasses APFS journal */
+#  define SM_USE_SHM 1    /* use shm_open+mmap on macOS — bypasses APFS   */
 #else
-#  define SM_USE_SHM 0    /* Linux tmpfs is already RAM-backed              */
+#  define SM_USE_SHM 0    /* Linux tmpfs is already RAM-backed via tmpfile */
 #endif
 
-static int sm_ext_open(char **shm_name_out) {
+/* Open backing store for a worker's run data.
+   capacity_bytes: maximum bytes that will be written (must be exact).
+   On macOS: shm_open + single ftruncate + mmap → RAM bandwidth.
+   On Linux: tmpfile → tmpfs (also RAM-backed).
+   Returns fd and sets *map_out to the mapped base address (or NULL).   */
+static int sm_ext_open(size_t capacity_bytes, void **map_out) {
+    *map_out = NULL;
 #if SM_USE_SHM
-    /* Create an anonymous POSIX shared memory object.
-       Unlink the name immediately so it's auto-cleaned if the process
-       crashes; the fd remains valid for the process lifetime.          */
-    static _Atomic int shm_seq = 0;
+    static volatile int shm_seq = 0;
     char name[64];
-    snprintf(name, sizeof(name), "/ham_dp_%d_%d",
-             (int)getpid(), __atomic_fetch_add(&shm_seq, 1, __ATOMIC_RELAXED));
+    int seq = __sync_fetch_and_add(&shm_seq, 1);
+    snprintf(name, sizeof(name), "/ham_dp_%d_%d", (int)getpid(), seq);
     int fd = shm_open(name, O_CREAT | O_RDWR, 0600);
-    if (fd < 0) { *shm_name_out = NULL; return -1; }
-    /* Unlink immediately — fd stays valid, name disappears from namespace */
-    shm_unlink(name);
-    *shm_name_out = NULL;   /* nothing to unlink at close time */
+    shm_unlink(name);   /* remove name; fd stays valid until close() */
+    if (fd < 0) return -1;
+    if (capacity_bytes == 0) capacity_bytes = 1;
+    if (ftruncate(fd, (off_t)capacity_bytes) < 0) { close(fd); return -1; }
+    void *m = mmap(NULL, capacity_bytes, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { close(fd); return -1; }
+    *map_out = m;
     return fd;
 #else
-    /* Linux: use a regular temp file on tmpfs (/tmp is usually tmpfs)  */
-    *shm_name_out = NULL;
     FILE *f = tmpfile();
     return f ? fileno(f) : -1;
 #endif
 }
 
-/* Write 'n' SMEntries to fd at current offset; extend file if needed.  */
-static void sm_ext_write(int fd, size_t *off, const SMEntry *data, size_t n) {
+/* Write n entries at byte offset *off; advance *off.
+   map != NULL → direct memcpy into the mmap region (macOS path).
+   map == NULL → pwrite to fd (Linux path).                             */
+static void sm_ext_write(int fd, void *map, size_t *off,
+                          const SMEntry *data, size_t n) {
     size_t bytes = n * sizeof(SMEntry);
-    /* ftruncate to ensure the file is large enough for random writes   */
-    if (ftruncate(fd, (off_t)(*off + bytes)) < 0) return;
-    ssize_t written = pwrite(fd, data, bytes, (off_t)*off);
-    (void)written;
+    if (map) {
+        memcpy((char *)map + *off, data, bytes);
+    } else {
+        ssize_t w = pwrite(fd, data, bytes, (off_t)*off);
+        (void)w;
+    }
     *off += bytes;
 }
 
-/* Read 'n' SMEntries from fd at byte offset 'off'.                     */
-static void sm_ext_read(int fd, size_t off, SMEntry *data, size_t n) {
-    ssize_t r = pread(fd, data, n * sizeof(SMEntry), (off_t)off);
-    (void)r;
+/* Read n entries from byte offset off.                                 */
+static void sm_ext_read(int fd, const void *map, size_t off,
+                         SMEntry *data, size_t n) {
+    if (map) {
+        memcpy(data, (const char *)map + off, n * sizeof(SMEntry));
+    } else {
+        ssize_t r = pread(fd, data, n * sizeof(SMEntry), (off_t)off);
+        (void)r;
+    }
+}
+
+/* Close and unmap a backing store.                                     */
+static void sm_ext_close(int fd, void *map, size_t capacity_bytes) {
+    if (map && map != MAP_FAILED)
+        munmap(map, capacity_bytes);
+    if (fd >= 0) close(fd);
 }
 
 typedef struct {
@@ -1544,8 +1566,7 @@ static void sm_flush_run(SMWorkerState *ws) {
     ws->buf_len = 0;
 
     if (ws->ext_runs) {
-        /* Ext mode: write to shm/tmpfile via pwrite, record length.     */
-        sm_ext_write(ws->run_fd, &ws->run_fd_off, ws->buf, o);
+        sm_ext_write(ws->run_fd, ws->run_map, &ws->run_fd_off, ws->buf, o);
         if (ws->n_runs == ws->runs_cap) {
             ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 16;
             ws->run_lens = (size_t*)realloc(ws->run_lens,
@@ -1577,7 +1598,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
         if (ws->n_runs == 1) {
             size_t len = ws->run_lens[0];
             SMEntry *d = (SMEntry*)malloc(len * sizeof(SMEntry));
-            sm_ext_read(ws->run_fd, 0, d, len);
+            sm_ext_read(ws->run_fd, ws->run_map, 0, d, len);
             *out_len = len;
             return d;
         }
@@ -1591,7 +1612,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
         for (int i = 0; i < ws->n_runs; i++) {
             size_t len = ws->run_lens[i];
             rdata[i] = (SMEntry*)malloc(len * sizeof(SMEntry));
-            sm_ext_read(ws->run_fd, off, rdata[i], len);
+            sm_ext_read(ws->run_fd, ws->run_map, off, rdata[i], len);
             off += len * sizeof(SMEntry);
             S[i] = (SMStream){ rdata[i], 0, len };
         }
@@ -1703,6 +1724,11 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     size_t chunk = (ni + P - 1) / P;
     int ext_runs = sm_should_use_ext(ni, n_back, ram_bytes);
 
+    /* Worst-case capacity per worker: chunk * 2^n_back entries (no dedup).
+       Used to allocate the shm region upfront with a single ftruncate.  */
+    size_t bpt_per_worker = chunk * ((size_t)1 << n_back);
+    size_t ext_cap_bytes  = bpt_per_worker * sizeof(SMEntry);
+
     SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
     SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
     pthread_t     *T  = (pthread_t*)malloc(P * sizeof(pthread_t));
@@ -1720,11 +1746,14 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         WS[i].runs_cap   = 0;
         WS[i].runs       = NULL;
         WS[i].run_fd     = -1;
-        WS[i].run_shm_name = NULL;
+        WS[i].run_map    = NULL;
+        WS[i].run_capacity = 0;
         WS[i].run_fd_off = 0;
         WS[i].run_lens   = NULL;
-        if (ext_runs)
-            WS[i].run_fd = sm_ext_open(&WS[i].run_shm_name);
+        if (ext_runs) {
+            WS[i].run_capacity = ext_cap_bytes;
+            WS[i].run_fd = sm_ext_open(ext_cap_bytes, &WS[i].run_map);
+        }
         W[i] = (SMWorker){
             .in=curr->data, .lo=lo, .hi=hi,
             .fs=fs, .v_idx=v_idx,
@@ -1761,7 +1790,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(WS[i].tmp);
         free(WS[i].runs);
         free(WS[i].run_lens);
-        if (WS[i].run_fd >= 0) close(WS[i].run_fd);
+        sm_ext_close(WS[i].run_fd, WS[i].run_map, WS[i].run_capacity);
     }
     free(S); free(W); free(WS); free(T);
 }
