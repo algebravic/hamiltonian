@@ -1446,13 +1446,71 @@ typedef struct {
     size_t   buf_len;
     /* completed sorted+deduped runs — two storage modes:
        ext_runs=0: in-memory SMRun array (small n, fits in RAM)
-       ext_runs=1: written to a temp file; run_lens[] records each length */
-    int      ext_runs;       /* 0=RAM mode, 1=file mode                  */
-    SMRun   *runs;           /* RAM mode: array of run descriptors        */
+       ext_runs=1: written to backing store; run_lens[] records lengths
+
+       Backing store strategy (selected at compile time):
+         macOS  — shm_open() gives an anonymous POSIX shared memory fd
+                  backed by the VM system at full RAM bandwidth, bypassing
+                  APFS journal overhead that makes tmpfile() 38× slower.
+         Linux  — tmpfile() lands on tmpfs (RAM-backed) so it's fast;
+                  shm_open is available but offers no advantage.         */
+    int      ext_runs;
+    SMRun   *runs;           /* RAM mode */
     int      n_runs, runs_cap;
-    FILE    *run_file;       /* file mode: temp file holding all run data */
-    size_t  *run_lens;       /* file mode: length of each run in entries  */
+    int      run_fd;         /* ext mode: fd from shm_open or open(tmpfile) */
+    char    *run_shm_name;   /* ext mode: shm name to unlink (or NULL)      */
+    size_t   run_fd_off;     /* ext mode: current write offset in bytes      */
+    size_t  *run_lens;       /* ext mode: length of each run in entries      */
 } SMWorkerState;
+
+/* ── ext_runs backing store helpers ─────────────────────────────────── */
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#  define SM_USE_SHM 1    /* use shm_open on macOS — bypasses APFS journal */
+#else
+#  define SM_USE_SHM 0    /* Linux tmpfs is already RAM-backed              */
+#endif
+
+static int sm_ext_open(char **shm_name_out) {
+#if SM_USE_SHM
+    /* Create an anonymous POSIX shared memory object.
+       Unlink the name immediately so it's auto-cleaned if the process
+       crashes; the fd remains valid for the process lifetime.          */
+    static _Atomic int shm_seq = 0;
+    char name[64];
+    snprintf(name, sizeof(name), "/ham_dp_%d_%d",
+             (int)getpid(), __atomic_fetch_add(&shm_seq, 1, __ATOMIC_RELAXED));
+    int fd = shm_open(name, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) { *shm_name_out = NULL; return -1; }
+    /* Unlink immediately — fd stays valid, name disappears from namespace */
+    shm_unlink(name);
+    *shm_name_out = NULL;   /* nothing to unlink at close time */
+    return fd;
+#else
+    /* Linux: use a regular temp file on tmpfs (/tmp is usually tmpfs)  */
+    *shm_name_out = NULL;
+    FILE *f = tmpfile();
+    return f ? fileno(f) : -1;
+#endif
+}
+
+/* Write 'n' SMEntries to fd at current offset; extend file if needed.  */
+static void sm_ext_write(int fd, size_t *off, const SMEntry *data, size_t n) {
+    size_t bytes = n * sizeof(SMEntry);
+    /* ftruncate to ensure the file is large enough for random writes   */
+    if (ftruncate(fd, (off_t)(*off + bytes)) < 0) return;
+    ssize_t written = pwrite(fd, data, bytes, (off_t)*off);
+    (void)written;
+    *off += bytes;
+}
+
+/* Read 'n' SMEntries from fd at byte offset 'off'.                     */
+static void sm_ext_read(int fd, size_t off, SMEntry *data, size_t n) {
+    ssize_t r = pread(fd, data, n * sizeof(SMEntry), (off_t)off);
+    (void)r;
+}
 
 typedef struct {
     const SMEntry   *in;
@@ -1486,8 +1544,8 @@ static void sm_flush_run(SMWorkerState *ws) {
     ws->buf_len = 0;
 
     if (ws->ext_runs) {
-        /* File mode: write sorted run to temp file, record length.       */
-        fwrite(ws->buf, sizeof(SMEntry), o, ws->run_file);
+        /* Ext mode: write to shm/tmpfile via pwrite, record length.     */
+        sm_ext_write(ws->run_fd, &ws->run_fd_off, ws->buf, o);
         if (ws->n_runs == ws->runs_cap) {
             ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 16;
             ws->run_lens = (size_t*)realloc(ws->run_lens,
@@ -1512,30 +1570,29 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
     if (ws->buf_len > 0) sm_flush_run(ws);
 
     if (ws->ext_runs) {
-        /* File mode: read runs back one at a time into the heap merge.
-           We load all runs simultaneously (each as a malloc'd buffer) so
-           the heap can access any position — but the key point is that
-           we're called sequentially from the main thread, so only ONE
-           worker's runs are in RAM at a time.                            */
+        /* Ext mode: read runs back from shm/tmpfile one at a time.
+           Called sequentially from main thread — only one worker's data
+           in RAM at a time.                                              */
         if (ws->n_runs == 0) { *out_len = 0; return NULL; }
-        rewind(ws->run_file);
         if (ws->n_runs == 1) {
             size_t len = ws->run_lens[0];
             SMEntry *d = (SMEntry*)malloc(len * sizeof(SMEntry));
-            fread(d, sizeof(SMEntry), len, ws->run_file);
+            sm_ext_read(ws->run_fd, 0, d, len);
             *out_len = len;
             return d;
         }
-        /* Load all runs from file */
+        /* Load all runs, merge, free one by one */
         size_t total = 0;
         for (int i = 0; i < ws->n_runs; i++) total += ws->run_lens[i];
-        SMEntry  *out = (SMEntry*)malloc(total * sizeof(SMEntry));
+        SMEntry  *out   = (SMEntry*)malloc(total * sizeof(SMEntry));
         SMEntry **rdata = (SMEntry**)malloc(ws->n_runs * sizeof(SMEntry*));
-        SMStream  *S   = (SMStream*)malloc(ws->n_runs * sizeof(SMStream));
+        SMStream  *S    = (SMStream*)malloc(ws->n_runs * sizeof(SMStream));
+        size_t off = 0;
         for (int i = 0; i < ws->n_runs; i++) {
             size_t len = ws->run_lens[i];
             rdata[i] = (SMEntry*)malloc(len * sizeof(SMEntry));
-            fread(rdata[i], sizeof(SMEntry), len, ws->run_file);
+            sm_ext_read(ws->run_fd, off, rdata[i], len);
+            off += len * sizeof(SMEntry);
             S[i] = (SMStream){ rdata[i], 0, len };
         }
         *out_len = sm_merge(S, ws->n_runs, out);
@@ -1657,15 +1714,17 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         size_t hi = lo + chunk < ni ? lo + chunk : ni;
         WS[i].buf      = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
         WS[i].tmp      = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
-        WS[i].buf_len  = 0;
-        WS[i].ext_runs = ext_runs;
-        WS[i].n_runs   = 0;
-        WS[i].runs_cap = 0;
-        WS[i].runs     = NULL;
-        WS[i].run_file = NULL;
-        WS[i].run_lens = NULL;
+        WS[i].buf_len    = 0;
+        WS[i].ext_runs   = ext_runs;
+        WS[i].n_runs     = 0;
+        WS[i].runs_cap   = 0;
+        WS[i].runs       = NULL;
+        WS[i].run_fd     = -1;
+        WS[i].run_shm_name = NULL;
+        WS[i].run_fd_off = 0;
+        WS[i].run_lens   = NULL;
         if (ext_runs)
-            WS[i].run_file = tmpfile();   /* anonymous temp file, auto-deleted */
+            WS[i].run_fd = sm_ext_open(&WS[i].run_shm_name);
         W[i] = (SMWorker){
             .in=curr->data, .lo=lo, .hi=hi,
             .fs=fs, .v_idx=v_idx,
@@ -1702,7 +1761,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(WS[i].tmp);
         free(WS[i].runs);
         free(WS[i].run_lens);
-        if (WS[i].run_file) fclose(WS[i].run_file);
+        if (WS[i].run_fd >= 0) close(WS[i].run_fd);
     }
     free(S); free(W); free(WS); free(T);
 }
@@ -2056,12 +2115,14 @@ def _get_lib():
         with open(c_path, "w") as f:
             f.write(C_SOURCE)
         d_flags = [f"-D{k}={v}" for k, v in consts.items()]
-        import shutil
+        import shutil, platform
         compiler = "gcc-15" if shutil.which("gcc-15") else "gcc"
+        # Linux needs -lrt for shm_open; macOS has it in libc
+        rt_flag = [] if platform.system() == "Darwin" else ["-lrt"]
         result = subprocess.run(
             [compiler, "-O3", "-march=native", "-shared", "-fPIC", "-std=c11"]
             + d_flags
-            + ["-o", so_path, c_path, "-lpthread"],
+            + ["-o", so_path, c_path, "-lpthread"] + rt_flag,
             capture_output=True,
         )
         if result.returncode != 0:
