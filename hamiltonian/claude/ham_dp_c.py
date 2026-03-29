@@ -1547,8 +1547,7 @@ typedef struct {
 
 typedef struct {
     const SMEntry   *in;
-    size_t           ni;        /* total input entries                       */
-    SMWorkQueue     *wq;        /* shared work-stealing queue                */
+    size_t           lo, hi;
     int              fs, v_idx;
     const int       *widxs;
     int              n_back;
@@ -1558,10 +1557,8 @@ typedef struct {
     u128            *total;
     pthread_mutex_t *total_mu;
     SMWorkerState   *ws;
-    /* output after merge (set by main thread via sm_merge_runs) */
     SMEntry         *out;
     size_t           out_len;
-    /* instrumentation (filled by worker + main thread) */
     double           t_compute_ms;
     double           t_flush_ms;
     double           t_merge_ms;
@@ -1669,49 +1666,38 @@ static size_t sm_wq_claim(SMWorkQueue *wq) {
 static void *sm_worker_runs(void *arg) {
     SMWorker      *w  = (SMWorker*)arg;
     SMWorkerState *ws = w->ws;
-    SMWorkQueue   *wq = w->wq;
     int n_subsets = 1 << w->n_back;
     u128 local_total = 0;
     size_t raw_out = 0;
 
     double t0 = now_ms(), t_flush_acc = 0.0;
-    size_t ni = w->ni;
 
-    /* Claim and process micro-chunks until the queue is exhausted. */
-    for (;;) {
-        size_t mc = sm_wq_claim(wq);
-        if (mc >= wq->total) break;
-        size_t lo = mc * wq->mchunk;
-        size_t hi = lo + wq->mchunk < ni ? lo + wq->mchunk : ni;
-
-        for (size_t i = lo; i < hi; i++) {
-            u64  base = w->in[i].key;
-            u128 cnt  = w->in[i].val;
-            for (int S = 0; S < n_subsets; S++) {
-                u64 nk = base; int valid = 1; int nc_inc = 0;
-                for (int j = 0; j < w->n_back && valid; j++) {
-                    if (!(S & (1 << j))) continue;
-                    u64 nk2 = apply_edge(nk, w->fs, w->v_idx, w->widxs[j], &nc_inc);
-                    if (!nk2) { valid = 0; break; }
-                    nk = nk2;
-                }
-                if (!valid) continue;
-                if (w->n_elim > 0) {
-                    nk = apply_elim_seq(nk, w->fs, w->elim_idxs_desc, w->n_elim,
-                                        w->step, w->n, cnt, &local_total);
-                    if (!nk) continue;
-                }
-                ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
-                raw_out++;
-                if (ws->buf_len == SM_WORKER_CAP) {
-                    double tf0 = now_ms();
-                    sm_flush_run(ws);
-                    t_flush_acc += now_ms() - tf0;
-                }
+    for (size_t i = w->lo; i < w->hi; i++) {
+        u64  base = w->in[i].key;
+        u128 cnt  = w->in[i].val;
+        for (int S = 0; S < n_subsets; S++) {
+            u64 nk = base; int valid = 1; int nc_inc = 0;
+            for (int j = 0; j < w->n_back && valid; j++) {
+                if (!(S & (1 << j))) continue;
+                u64 nk2 = apply_edge(nk, w->fs, w->v_idx, w->widxs[j], &nc_inc);
+                if (!nk2) { valid = 0; break; }
+                nk = nk2;
+            }
+            if (!valid) continue;
+            if (w->n_elim > 0) {
+                nk = apply_elim_seq(nk, w->fs, w->elim_idxs_desc, w->n_elim,
+                                    w->step, w->n, cnt, &local_total);
+                if (!nk) continue;
+            }
+            ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
+            raw_out++;
+            if (ws->buf_len == SM_WORKER_CAP) {
+                double tf0 = now_ms();
+                sm_flush_run(ws);
+                t_flush_acc += now_ms() - tf0;
             }
         }
     }
-
     if (ws->buf_len > 0) {
         double tf0 = now_ms();
         sm_flush_run(ws);
@@ -1764,25 +1750,12 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             int instrument) {
     int P = SM_NTHREADS;
     size_t ni    = curr->cnt;
+    size_t chunk = (ni + P - 1) / P;
     int ext_runs = sm_should_use_ext(ni, n_back, ram_bytes);
 
-    /* Work-stealing queue: divide input into M micro-chunks.
-       Micro-chunk size is chosen so each worker processes ~STEAL_FACTOR
-       chunks on average, giving good load balance without excessive
-       atomic contention.  Minimum micro-chunk size of 64 avoids
-       per-entry atomic overhead on tiny inputs.                        */
-    size_t M      = (size_t)P * SM_STEAL_FACTOR;
-    size_t mchunk = (ni + M - 1) / M;
-    if (mchunk < 64) mchunk = 64;
-    M = (ni + mchunk - 1) / mchunk;   /* recompute M after clamping    */
-
-    SMWorkQueue wq = { 0, M, mchunk };
-
-    /* Worst-case capacity per worker for ext_runs shm region.
-       With work-stealing, a worker could theoretically claim all M
-       micro-chunks.  Use total input × 2^n_back as the absolute max. */
-    size_t bpt_total   = ni * ((size_t)1 << n_back);
-    size_t ext_cap_bytes = bpt_total * sizeof(SMEntry);
+    /* Worst-case capacity per worker for ext_runs shm region. */
+    size_t bpt_per_worker = chunk * ((size_t)1 << n_back);
+    size_t ext_cap_bytes  = bpt_per_worker * sizeof(SMEntry);
 
     SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
     SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
@@ -1791,6 +1764,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     pthread_mutex_init(&mu, NULL);
 
     for (int i = 0; i < P; i++) {
+        size_t lo = (size_t)i * chunk;
+        size_t hi = lo + chunk < ni ? lo + chunk : ni;
         WS[i].buf      = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
         WS[i].tmp      = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
         WS[i].buf_len    = 0;
@@ -1808,7 +1783,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             WS[i].run_fd = sm_ext_open(ext_cap_bytes, &WS[i].run_map);
         }
         W[i] = (SMWorker){
-            .in=curr->data, .ni=ni, .wq=&wq,
+            .in=curr->data, .lo=lo, .hi=hi,
             .fs=fs, .v_idx=v_idx,
             .widxs=widxs, .n_back=n_back,
             .elim_idxs_desc=elim_idxs_desc, .n_elim=n_elim,
@@ -1858,14 +1833,14 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         }
         double dedup_ratio = raw_total > 0 ? (double)raw_total / nxt->cnt : 1.0;
         fprintf(stderr,
-            "  [inst] step=%d nb=%d ext=%d n_runs=%d M=%zu mchunk=%zu\n"
+            "  [inst] step=%d nb=%d ext=%d n_runs=%d\n"
             "  [inst]   compute: max=%.0fms mean=%.0fms  "
             "flush: max=%.0fms mean=%.0fms\n"
             "  [inst]   merge_runs(seq): total=%.0fms max=%.0fms  "
             "par_merge: %.0fms\n"
             "  [inst]   raw_out=%zuM  deduped=%zuM  dedup=%.1fx\n"
             "  [inst]   worker details (compute / flush / merge_runs / n_runs / out):\n",
-            step, n_back, ext_runs, WS[0].n_runs, M, mchunk,
+            step, n_back, ext_runs, WS[0].n_runs,
             t_compute_max, t_wall_compute/P,
             t_flush_max,   t_wall_flush/P,
             t_merge_runs_total, t_merge_max,
