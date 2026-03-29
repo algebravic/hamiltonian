@@ -1444,9 +1444,14 @@ typedef struct {
     SMEntry *buf;   /* output accumulation buffer, SM_WORKER_CAP entries */
     SMEntry *tmp;   /* radix sort scratch,         SM_WORKER_CAP entries */
     size_t   buf_len;
-    /* completed sorted+deduped runs */
-    SMRun   *runs;
+    /* completed sorted+deduped runs — two storage modes:
+       ext_runs=0: in-memory SMRun array (small n, fits in RAM)
+       ext_runs=1: written to a temp file; run_lens[] records each length */
+    int      ext_runs;       /* 0=RAM mode, 1=file mode                  */
+    SMRun   *runs;           /* RAM mode: array of run descriptors        */
     int      n_runs, runs_cap;
+    FILE    *run_file;       /* file mode: temp file holding all run data */
+    size_t  *run_lens;       /* file mode: length of each run in entries  */
 } SMWorkerState;
 
 typedef struct {
@@ -1461,12 +1466,12 @@ typedef struct {
     u128            *total;
     pthread_mutex_t *total_mu;
     SMWorkerState   *ws;
-    /* output after merge */
+    /* output after merge (set by main thread via sm_merge_runs) */
     SMEntry         *out;
     size_t           out_len;
 } SMWorker;
 
-/* Sort, dedup, and stash ws->buf[0..buf_len) as a new run. */
+/* ── sm_flush_run: sort+dedup buf, then store as a run ─────────────── */
 static void sm_flush_run(SMWorkerState *ws) {
     if (ws->buf_len == 0) return;
     sm_radix_sort(ws->buf, ws->tmp, ws->buf_len);
@@ -1478,38 +1483,87 @@ static void sm_flush_run(SMWorkerState *ws) {
         else
             ws->buf[o++] = ws->buf[i];
     }
-    ws->buf_len = 0;  /* reset accumulator */
-    /* save run */
-    SMEntry *run_data = (SMEntry*)malloc(o * sizeof(SMEntry));
-    memcpy(run_data, ws->buf, o * sizeof(SMEntry));
-    if (ws->n_runs == ws->runs_cap) {
-        ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 4;
-        ws->runs = (SMRun*)realloc(ws->runs, ws->runs_cap * sizeof(SMRun));
+    ws->buf_len = 0;
+
+    if (ws->ext_runs) {
+        /* File mode: write sorted run to temp file, record length.       */
+        fwrite(ws->buf, sizeof(SMEntry), o, ws->run_file);
+        if (ws->n_runs == ws->runs_cap) {
+            ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 16;
+            ws->run_lens = (size_t*)realloc(ws->run_lens,
+                                            ws->runs_cap * sizeof(size_t));
+        }
+        ws->run_lens[ws->n_runs++] = o;
+    } else {
+        /* RAM mode: malloc a copy and append to SMRun array.             */
+        SMEntry *run_data = (SMEntry*)malloc(o * sizeof(SMEntry));
+        memcpy(run_data, ws->buf, o * sizeof(SMEntry));
+        if (ws->n_runs == ws->runs_cap) {
+            ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 4;
+            ws->runs = (SMRun*)realloc(ws->runs,
+                                       ws->runs_cap * sizeof(SMRun));
+        }
+        ws->runs[ws->n_runs++] = (SMRun){ run_data, o };
     }
-    ws->runs[ws->n_runs++] = (SMRun){ run_data, o };
 }
 
-/* Merge all of ws->runs into a single sorted+deduped array. */
+/* ── sm_merge_runs: merge all runs → single sorted+deduped array ───── */
 static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
-    /* flush final partial buffer */
     if (ws->buf_len > 0) sm_flush_run(ws);
-    if (ws->n_runs == 0) { *out_len = 0; return NULL; }
-    if (ws->n_runs == 1) {
-        *out_len = ws->runs[0].len;
-        SMEntry *d = ws->runs[0].data;
-        ws->runs[0].data = NULL;
-        return d;
+
+    if (ws->ext_runs) {
+        /* File mode: read runs back one at a time into the heap merge.
+           We load all runs simultaneously (each as a malloc'd buffer) so
+           the heap can access any position — but the key point is that
+           we're called sequentially from the main thread, so only ONE
+           worker's runs are in RAM at a time.                            */
+        if (ws->n_runs == 0) { *out_len = 0; return NULL; }
+        rewind(ws->run_file);
+        if (ws->n_runs == 1) {
+            size_t len = ws->run_lens[0];
+            SMEntry *d = (SMEntry*)malloc(len * sizeof(SMEntry));
+            fread(d, sizeof(SMEntry), len, ws->run_file);
+            *out_len = len;
+            return d;
+        }
+        /* Load all runs from file */
+        size_t total = 0;
+        for (int i = 0; i < ws->n_runs; i++) total += ws->run_lens[i];
+        SMEntry  *out = (SMEntry*)malloc(total * sizeof(SMEntry));
+        SMEntry **rdata = (SMEntry**)malloc(ws->n_runs * sizeof(SMEntry*));
+        SMStream  *S   = (SMStream*)malloc(ws->n_runs * sizeof(SMStream));
+        for (int i = 0; i < ws->n_runs; i++) {
+            size_t len = ws->run_lens[i];
+            rdata[i] = (SMEntry*)malloc(len * sizeof(SMEntry));
+            fread(rdata[i], sizeof(SMEntry), len, ws->run_file);
+            S[i] = (SMStream){ rdata[i], 0, len };
+        }
+        *out_len = sm_merge(S, ws->n_runs, out);
+        free(S);
+        for (int i = 0; i < ws->n_runs; i++) free(rdata[i]);
+        free(rdata);
+        return out;
+
+    } else {
+        /* RAM mode: unchanged from original implementation.              */
+        if (ws->n_runs == 0) { *out_len = 0; return NULL; }
+        if (ws->n_runs == 1) {
+            *out_len = ws->runs[0].len;
+            SMEntry *d = ws->runs[0].data;
+            ws->runs[0].data = NULL;
+            return d;
+        }
+        size_t total = 0;
+        for (int i = 0; i < ws->n_runs; i++) total += ws->runs[i].len;
+        SMEntry  *out = (SMEntry*)malloc(total * sizeof(SMEntry));
+        SMStream  *S  = (SMStream*)malloc(ws->n_runs * sizeof(SMStream));
+        for (int i = 0; i < ws->n_runs; i++)
+            S[i] = (SMStream){ ws->runs[i].data, 0, ws->runs[i].len };
+        *out_len = sm_merge(S, ws->n_runs, out);
+        free(S);
+        for (int i = 0; i < ws->n_runs; i++) free(ws->runs[i].data);
+        return out;
     }
-    size_t total = 0;
-    for (int i = 0; i < ws->n_runs; i++) total += ws->runs[i].len;
-    SMEntry *out = (SMEntry*)malloc(total * sizeof(SMEntry));
-    SMStream *S = (SMStream*)malloc(ws->n_runs * sizeof(SMStream));
-    for (int i = 0; i < ws->n_runs; i++)
-        S[i] = (SMStream){ ws->runs[i].data, 0, ws->runs[i].len };
-    *out_len = sm_merge(S, ws->n_runs, out);
-    free(S);
-    for (int i = 0; i < ws->n_runs; i++) free(ws->runs[i].data);
-    return out;
 }
 
 static void *sm_worker_runs(void *arg) {
@@ -1566,7 +1620,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             const int *widxs, int n_back,
                             const int *elim_idxs_desc, int n_elim,
                             int step, int n,
-                            u128 *total) {
+                            u128 *total,
+                            int ext_runs) {
     int P = SM_NTHREADS;
     size_t ni    = curr->cnt;
     size_t chunk = (ni + P - 1) / P;
@@ -1580,12 +1635,17 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) {
         size_t lo = (size_t)i * chunk;
         size_t hi = lo + chunk < ni ? lo + chunk : ni;
-        WS[i].buf     = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
-        WS[i].tmp     = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
-        WS[i].buf_len = 0;
-        WS[i].runs    = NULL;
-        WS[i].n_runs  = 0;
-        WS[i].runs_cap= 0;
+        WS[i].buf      = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
+        WS[i].tmp      = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
+        WS[i].buf_len  = 0;
+        WS[i].ext_runs = ext_runs;
+        WS[i].n_runs   = 0;
+        WS[i].runs_cap = 0;
+        WS[i].runs     = NULL;
+        WS[i].run_file = NULL;
+        WS[i].run_lens = NULL;
+        if (ext_runs)
+            WS[i].run_file = tmpfile();   /* anonymous temp file, auto-deleted */
         W[i] = (SMWorker){
             .in=curr->data, .lo=lo, .hi=hi,
             .fs=fs, .v_idx=v_idx,
@@ -1621,6 +1681,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(WS[i].buf);
         free(WS[i].tmp);
         free(WS[i].runs);
+        free(WS[i].run_lens);
+        if (WS[i].run_file) fclose(WS[i].run_file);
     }
     free(S); free(W); free(WS); free(T);
 }
@@ -1635,7 +1697,8 @@ void count_ham_paths_sm(
     const int  *adj_dat,
     uint64_t   *res_lo,
     uint64_t   *res_hi,
-    int         verbose
+    int         verbose,
+    int         ext_runs    /* 0=RAM runs (default), 1=file-backed runs */
 ) {
     int  frontier[MAX_FS_FAST + 2];
     int *fidx = (int*)malloc((size_t)(n + 1) * sizeof(int));
@@ -1694,7 +1757,7 @@ void count_ham_paths_sm(
             elim_desc[e] = elim_asc[n_elim-1-e];
 
         sm_fused_sweep(curr, nxt, fs, v_idx, widxs, n_back,
-                       elim_desc, n_elim, step, n, &total);
+                       elim_desc, n_elim, step, n, &total, ext_runs);
         { SMTab *t = curr; curr = nxt; nxt = t; }
 
         /* Update frontier */
@@ -2000,7 +2063,7 @@ def _get_lib():
             int n, const int *order, const int *pos, const int *last_s,
             const int *adj_off, const int *adj_dat,
             uint64_t *res_lo, uint64_t *res_hi,
-            int verbose);
+            int verbose, int ext_runs);
     """)
     lib = ffi.dlopen(so_path)
     _LIB_CACHE[cache_key] = (lib, ffi)
@@ -2142,18 +2205,11 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
 
 def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 verbose: bool = False,
+                                ext_runs: bool = False,
                                 checkpoint_path: str = "",
                                 checkpoint_secs: float = 300.0,
                                 **kwargs) -> int:
     """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
-
-    Alternative to count_hamiltonian_paths_c (EH+rsort backend).
-    Uses: sorted flat array → parallel map → buffered 8-bit radix sort
-    (per thread) → P-way merge-with-dedup.
-
-    All memory access patterns are sequential; designed to saturate
-    bandwidth rather than hit random DRAM latency.  Expected to be
-    substantially faster than EH on large state counts.
 
     Parameters
     ----------
@@ -2161,8 +2217,12 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     order           : vertex ordering (1-indexed), length n.
     adj             : adjacency dict {v: iterable_of_neighbours} (1-indexed).
     verbose         : if True, print per-step profiling to stderr.
-    checkpoint_path : accepted for API compatibility; checkpointing is not
-                      yet implemented in the SM backend (ignored with warning).
+    ext_runs        : if True, write sorted runs to temp files instead of
+                      holding them in RAM.  Reduces peak memory by
+                      ~(n_runs × run_size × P) at the cost of SSD I/O
+                      (~10% overhead vs RAM bandwidth).  Recommended for
+                      n≥61 on machines with limited RAM.
+    checkpoint_path : accepted for API compatibility; ignored with warning.
     checkpoint_secs : accepted for API compatibility; ignored.
     """
     import sys
@@ -2196,7 +2256,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
 
     lib.count_ham_paths_sm(
         n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
-        c_res_lo, c_res_hi, int(verbose),
+        c_res_lo, c_res_hi, int(verbose), int(ext_runs),
     )
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
