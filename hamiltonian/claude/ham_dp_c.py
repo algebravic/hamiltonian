@@ -1542,19 +1542,21 @@ static void *sm_worker_runs(void *arg) {
     /* flush final partial buffer as a run */
     if (ws->buf_len > 0) sm_flush_run(ws);
 
-    /* Free scratch buffers now — they're no longer needed and holding
-       them through sm_merge_runs would add 2 × SM_WORKER_CAP × 24B per
-       worker (16.8 GB total for P=6) to the peak memory footprint.
-       free(NULL) is safe so sm_fused_sweep can still call free(WS[i].buf). */
+    /* Free scratch buffers — no longer needed after last flush. */
     free(ws->buf); ws->buf = NULL;
     free(ws->tmp); ws->tmp = NULL;
+
+    /* NOTE: sm_merge_runs is NOT called here.  It is called sequentially
+       in the main thread after all workers join, so only one worker's run
+       data + output buffer is alive at a time.  For n=61 step 39 this
+       keeps the peak from ~55 GB (all 6 workers merging simultaneously)
+       down to ~20 GB (curr + one worker's runs + one worker's output).  */
 
     if (local_total) {
         pthread_mutex_lock(w->total_mu);
         *w->total += local_total;
         pthread_mutex_unlock(w->total_mu);
     }
-    w->out = sm_merge_runs(ws, &w->out_len);
     return NULL;
 }
 
@@ -1597,6 +1599,12 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     }
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
+
+    /* Merge each worker's runs sequentially so only one worker's run data
+       + output buffer is alive at a time.  For step 39 of n=61 this keeps
+       peak memory at ~20 GB instead of ~55 GB (all workers simultaneous). */
+    for (int i = 0; i < P; i++)
+        W[i].out = sm_merge_runs(&WS[i], &W[i].out_len);
 
     /* P-way parallel merge of per-worker sorted streams into nxt. */
     size_t raw_total = 0;
