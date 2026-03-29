@@ -1411,14 +1411,18 @@ static void smtab_ensure(SMTab *t, size_t needed) {
 }
 
 /* ── SM introduce ───────────────────────────────────────────────────── */
-static void sm_introduce(const SMTab *src, SMTab *dst, int fs, SMEntry *tmp) {
+/* After copying src→dst, src->data is no longer read and can serve as
+   the radix-sort scratch buffer, eliminating the separate intro_tmp
+   allocation (which was si × 24B = up to 13 GB for n=61 step 39).    */
+static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
     smtab_ensure(dst, src->cnt);
     for (size_t i = 0; i < src->cnt; i++) {
         dst->data[i].key = introduce(src->data[i].key, fs);
         dst->data[i].val = src->data[i].val;
     }
     dst->cnt = src->cnt;
-    sm_radix_sort(dst->data, tmp, dst->cnt);
+    /* src->data is fully read; cast away const to reuse as sort scratch. */
+    sm_radix_sort(dst->data, (SMEntry *)src->data, dst->cnt);
 }
 
 /* ── SM worker (capped buffer + run accumulation) ───────────────────── */
@@ -1594,11 +1598,6 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
 
-    /* Free curr early when large to avoid holding curr+nxt simultaneously. */
-    if (curr->cap > (size_t)150 * 1024 * 1024) {
-        free(curr->data); curr->data = NULL; curr->cap = 0; curr->cnt = 0;
-    }
-
     /* P-way parallel merge of per-worker sorted streams into nxt. */
     size_t raw_total = 0;
     for (int i = 0; i < P; i++) raw_total += W[i].out_len;
@@ -1637,8 +1636,6 @@ void count_ham_paths_sm(
 
     SMTab *curr = smtab_alloc(1024);
     SMTab *nxt  = smtab_alloc(1024);
-    SMEntry *intro_tmp = NULL;
-    size_t   intro_cap = 0;
     u128 total = (u128)0;
 
     curr->data[0].key = KEY_MARKER;
@@ -1655,14 +1652,22 @@ void count_ham_paths_sm(
         int v = order[step];
         if (fs >= MAX_FS_FAST) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
 
-        /* A. Introduce */
-        if (intro_cap < curr->cnt) {
-            intro_cap = curr->cnt * 2;
-            intro_tmp = (SMEntry*)realloc(intro_tmp, intro_cap * sizeof(SMEntry));
-        }
-        sm_introduce(curr, nxt, fs, intro_tmp);
+        /* A. Introduce: copy curr→nxt with key transformation, then
+           radix-sort nxt using curr->data as scratch (curr is done
+           being read).  After this, curr->data holds garbage but its
+           allocation is still live; we free it before launching workers
+           so it doesn't contribute to peak memory during the sweep.    */
+        smtab_ensure(nxt, curr->cnt);  /* grow nxt if needed before introduce */
+        sm_introduce(curr, nxt, fs);
+        /* Free curr->data now — it held the previous step's states and
+           was just used as sort scratch.  Workers don't need it.        */
+        free(curr->data); curr->data = NULL; curr->cap = 0; curr->cnt = 0;
         { SMTab *t = curr; curr = nxt; nxt = t; }
         frontier[fs] = v; fidx[v] = fs; fs++;
+
+        /* nxt (the old curr shell, now empty) will be populated by the
+           sweep.  Freeing its data here (already NULL after the swap)
+           is a no-op; smtab_ensure in sm_fused_sweep will allocate.    */
 
         /* B+C. Fused sweep */
         int v_idx = fs - 1;
@@ -1733,7 +1738,7 @@ void count_ham_paths_sm(
 
 cleanup:
     smtab_free(curr); smtab_free(nxt);
-    free(intro_tmp); free(fidx);
+    free(fidx);
 }
 
 """
@@ -1904,14 +1909,21 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
     SM_ENTRY     = 24          # bytes per SMEntry
     OS_HEADROOM  = 4 << 30     # 4 GB reserved for OS + misc
 
-    # Worst-case curr table size: 700M entries (n=61 step 39 output)
-    curr_max_bytes = 700_000_000 * SM_ENTRY
+    # During the sweep compute phase the peak memory footprint is:
+    #   curr (largest sweep input ≈ 553M entries for n=61 step 38) = 13.3 GB
+    #   P × buf  (SM_WORKER_CAP entries each)
+    #   P × tmp  (SM_WORKER_CAP entries each, freed before sm_merge_runs)
+    #   run data accumulating ≈ 2 × (cap/dedup) × P entries at peak
+    #     (two completed runs per worker before the third flush; dedup≈4×)
+    #
+    # Total ≈ curr + P × cap × 24 × (2 + 2 + 0.5)  = curr + P×cap×24×2.5
+    # Solve for cap given a target of (RAM - OS_HEADROOM - 2 GB slack):
+    curr_max_bytes = 553_000_000 * SM_ENTRY   # 13.3 GB
 
-    available = ram - OS_HEADROOM - curr_max_bytes
-    # Each worker needs buf + tmp = 2 × cap × SM_ENTRY bytes
-    cap_bytes = max(0, available) // (n_threads * 2 * SM_ENTRY)
-    # Round down to nearest 1M-entry boundary, clamp to [8M, 256M]
-    cap_m = max(8, min(256, cap_bytes // (1024 * 1024)))
+    target = ram - OS_HEADROOM - (2 << 30)    # 30 GB on 36 GB machine
+    cap_bytes = max(0, int((target - curr_max_bytes) / (n_threads * 2.5 * SM_ENTRY)))
+    # Round down to nearest 1M-entry boundary, clamp to [8M, 128M]
+    cap_m = max(8, min(128, cap_bytes // (1024 * 1024)))
     sm_worker_cap = cap_m * 1024 * 1024
 
     return {
