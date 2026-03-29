@@ -285,6 +285,10 @@ def parse_args():
                    help="Use sort-merge DP backend instead of EH+rsort. "
                         "Run storage (RAM vs file-backed) is chosen automatically "
                         "per step based on available physical RAM.")
+    p.add_argument("--instrument", action="store_true",
+                   help="(sort-merge only) Print per-step phase timing breakdown: "
+                        "compute / flush / merge_runs / parallel-merge times per "
+                        "worker, imbalance metrics, and dedup ratios.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Print per-step frontier DP progress.")
     p.add_argument("--profile", action="store_true",
@@ -405,6 +409,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
         count = count_hamiltonian_paths_sm(
             n_vertices, order, adj,
             verbose=verbose,
+            instrument=args.instrument,
             checkpoint_path=ckpt_path,
             checkpoint_secs=args.checkpoint_interval,
         )
