@@ -1615,16 +1615,36 @@ static void *sm_worker_runs(void *arg) {
 }
 
 /* ── SM fused sweep ─────────────────────────────────────────────────── */
+/* Predict whether run data will exceed available RAM.
+   Conservative dedup estimate of 2× (actual is typically 3-6×) ensures
+   we switch to ext earlier than strictly necessary — safe but not wasteful
+   since the threshold only triggers on genuinely large steps.            */
+static int sm_should_use_ext(size_t si, int nb, size_t ram_bytes) {
+    size_t P   = SM_NTHREADS;
+    size_t CAP = SM_WORKER_CAP;
+    size_t chunk   = (si + P - 1) / P;
+    size_t bpt     = chunk * ((size_t)1 << nb);
+    size_t n_runs  = bpt > CAP ? (bpt + CAP - 1) / CAP : 1;
+    size_t run_bytes  = n_runs * (CAP / 2) * P * sizeof(SMEntry);
+    size_t os_head    = (size_t)4 << 30;
+    size_t curr_bytes = si * sizeof(SMEntry);
+    size_t bufs_bytes = P * 2 * CAP * sizeof(SMEntry);
+    if (ram_bytes <= os_head + curr_bytes + bufs_bytes) return 1;
+    size_t avail = ram_bytes - os_head - curr_bytes - bufs_bytes;
+    return run_bytes > avail;
+}
+
 static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             int fs, int v_idx,
                             const int *widxs, int n_back,
                             const int *elim_idxs_desc, int n_elim,
                             int step, int n,
                             u128 *total,
-                            int ext_runs) {
+                            size_t ram_bytes) {
     int P = SM_NTHREADS;
     size_t ni    = curr->cnt;
     size_t chunk = (ni + P - 1) / P;
+    int ext_runs = sm_should_use_ext(ni, n_back, ram_bytes);
 
     SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
     SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
@@ -1698,7 +1718,7 @@ void count_ham_paths_sm(
     uint64_t   *res_lo,
     uint64_t   *res_hi,
     int         verbose,
-    int         ext_runs    /* 0=RAM runs (default), 1=file-backed runs */
+    uint64_t    ram_bytes   /* physical RAM; 0 = use conservative default */
 ) {
     int  frontier[MAX_FS_FAST + 2];
     int *fidx = (int*)malloc((size_t)(n + 1) * sizeof(int));
@@ -1756,8 +1776,11 @@ void count_ham_paths_sm(
         for (int e = 0; e < n_elim; e++)
             elim_desc[e] = elim_asc[n_elim-1-e];
 
+        /* resolve ram_bytes: use provided value or conservative 8 GB default */
+        size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
+
         sm_fused_sweep(curr, nxt, fs, v_idx, widxs, n_back,
-                       elim_desc, n_elim, step, n, &total, ext_runs);
+                       elim_desc, n_elim, step, n, &total, ram);
         { SMTab *t = curr; curr = nxt; nxt = t; }
 
         /* Update frontier */
@@ -1794,12 +1817,15 @@ void count_ham_paths_sm(
             bag_buf[bpos]   = '\0';
 
             double t_now = now_ms();
+            size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
+            const char *mode = sm_should_use_ext(states_in, n_back, ram)
+                               ? "[ext]" : "[sm]";
             fprintf(stderr,
-                "%4d  %6d  %2d  %6d  %5d  %9zu  %10zu  %8.1f  %8.1f  %-*s  [sm]\n",
+                "%4d  %6d  %2d  %6d  %5d  %9zu  %10zu  %8.1f  %8.1f  %-*s  %s\n",
                 step, v, fs, n_back, e_bag,
                 states_in, curr->cnt,
                 t_now - t_prev, t_now - t_start,
-                (int)(2 + fs * 4), bag_buf);   /* pad to max frontier width */
+                (int)(2 + fs * 4), bag_buf, mode);
             t_prev = t_now;
         }
     }
@@ -2063,7 +2089,7 @@ def _get_lib():
             int n, const int *order, const int *pos, const int *last_s,
             const int *adj_off, const int *adj_dat,
             uint64_t *res_lo, uint64_t *res_hi,
-            int verbose, int ext_runs);
+            int verbose, uint64_t ram_bytes);
     """)
     lib = ffi.dlopen(so_path)
     _LIB_CACHE[cache_key] = (lib, ffi)
@@ -2205,7 +2231,6 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
 
 def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 verbose: bool = False,
-                                ext_runs: bool = False,
                                 checkpoint_path: str = "",
                                 checkpoint_secs: float = 300.0,
                                 **kwargs) -> int:
@@ -2216,20 +2241,26 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     n               : graph size
     order           : vertex ordering (1-indexed), length n.
     adj             : adjacency dict {v: iterable_of_neighbours} (1-indexed).
-    verbose         : if True, print per-step profiling to stderr.
-    ext_runs        : if True, write sorted runs to temp files instead of
-                      holding them in RAM.  Reduces peak memory by
-                      ~(n_runs × run_size × P) at the cost of SSD I/O
-                      (~10% overhead vs RAM bandwidth).  Recommended for
-                      n≥61 on machines with limited RAM.
+    verbose         : if True, print per-step profiling to stderr.  Steps
+                      using file-backed runs (ext mode) are marked [ext].
     checkpoint_path : accepted for API compatibility; ignored with warning.
     checkpoint_secs : accepted for API compatibility; ignored.
+
+    Notes
+    -----
+    Run storage (RAM vs file-backed) is chosen automatically per step based
+    on available physical RAM.  File-backed runs are used only when the
+    predicted in-memory run data would exceed available RAM, avoiding OOM
+    for large n (≥61) while keeping pure-RAM performance for smaller steps.
     """
     import sys
     if checkpoint_path:
         print("# Warning: sort-merge backend does not yet support checkpointing; "
               "checkpoint_path ignored.", file=sys.stderr)
     lib, ffi = _get_lib()
+
+    # Pass physical RAM so the C code can make per-step ext_runs decisions.
+    ram, _ = _detect_ram_and_threads()
 
     pos = [0] * (n + 1)
     for i, v in enumerate(order): pos[v] = i
@@ -2256,7 +2287,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
 
     lib.count_ham_paths_sm(
         n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
-        c_res_lo, c_res_hi, int(verbose), int(ext_runs),
+        c_res_lo, c_res_hi, int(verbose), ram,
     )
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:

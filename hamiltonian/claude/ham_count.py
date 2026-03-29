@@ -282,12 +282,9 @@ def parse_args():
 
     # --- DP options ---
     p.add_argument("--sort-merge", action="store_true",
-                   help="Use sort-merge DP backend instead of EH+rsort.")
-    p.add_argument("--sort-merge-ext", action="store_true",
-                   help="Use sort-merge with file-backed runs (reduces peak RAM "
-                        "by writing intermediate sorted runs to temp files instead "
-                        "of holding them in RAM; ~10%% I/O overhead; recommended "
-                        "for n≥61 on memory-limited machines).")
+                   help="Use sort-merge DP backend instead of EH+rsort. "
+                        "Run storage (RAM vs file-backed) is chosen automatically "
+                        "per step based on available physical RAM.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Print per-step frontier DP progress.")
     p.add_argument("--profile", action="store_true",
@@ -404,11 +401,10 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
     # --- C frontier DP ---
     verbose = args.verbose or args.profile
     t_dp = time.time()
-    if args.sort_merge or args.sort_merge_ext:
+    if args.sort_merge:
         count = count_hamiltonian_paths_sm(
             n_vertices, order, adj,
             verbose=verbose,
-            ext_runs=args.sort_merge_ext,
             checkpoint_path=ckpt_path,
             checkpoint_secs=args.checkpoint_interval,
         )
