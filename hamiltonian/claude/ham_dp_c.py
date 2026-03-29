@@ -1549,6 +1549,11 @@ typedef struct {
     /* output after merge (set by main thread via sm_merge_runs) */
     SMEntry         *out;
     size_t           out_len;
+    /* instrumentation (filled by worker + main thread) */
+    double           t_compute_ms;   /* apply_edge + buf accumulation     */
+    double           t_flush_ms;     /* total time in sm_flush_run calls  */
+    double           t_merge_ms;     /* sm_merge_runs (set by main thread)*/
+    size_t           raw_out;        /* total entries before dedup        */
 } SMWorker;
 
 /* ── sm_flush_run: sort+dedup buf, then store as a run ─────────────── */
@@ -1649,6 +1654,9 @@ static void *sm_worker_runs(void *arg) {
     SMWorkerState *ws = w->ws;
     int n_subsets = 1 << w->n_back;
     u128 local_total = 0;
+    size_t raw_out = 0;
+
+    double t0 = now_ms(), t_flush_acc = 0.0;
 
     for (size_t i = w->lo; i < w->hi; i++) {
         u64  base = w->in[i].key;
@@ -1668,11 +1676,24 @@ static void *sm_worker_runs(void *arg) {
                 if (!nk) continue;
             }
             ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
-            if (ws->buf_len == SM_WORKER_CAP) sm_flush_run(ws);
+            raw_out++;
+            if (ws->buf_len == SM_WORKER_CAP) {
+                double tf0 = now_ms();
+                sm_flush_run(ws);
+                t_flush_acc += now_ms() - tf0;
+            }
         }
     }
-    /* flush final partial buffer as a run */
-    if (ws->buf_len > 0) sm_flush_run(ws);
+    if (ws->buf_len > 0) {
+        double tf0 = now_ms();
+        sm_flush_run(ws);
+        t_flush_acc += now_ms() - tf0;
+    }
+
+    double t1 = now_ms();
+    w->t_compute_ms = (t1 - t0) - t_flush_acc;
+    w->t_flush_ms   = t_flush_acc;
+    w->raw_out      = raw_out;
 
     /* Free scratch buffers — no longer needed after last flush. */
     free(ws->buf); ws->buf = NULL;
@@ -1718,7 +1739,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             const int *elim_idxs_desc, int n_elim,
                             int step, int n,
                             u128 *total,
-                            size_t ram_bytes) {
+                            size_t ram_bytes,
+                            int instrument) {
     int P = SM_NTHREADS;
     size_t ni    = curr->cnt;
     size_t chunk = (ni + P - 1) / P;
@@ -1768,11 +1790,14 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
 
-    /* Merge each worker's runs sequentially so only one worker's run data
-       + output buffer is alive at a time.  For step 39 of n=61 this keeps
-       peak memory at ~20 GB instead of ~55 GB (all workers simultaneous). */
-    for (int i = 0; i < P; i++)
+    /* Sequential sm_merge_runs: one worker at a time to bound peak memory. */
+    double t_merge_runs_total = 0.0;
+    for (int i = 0; i < P; i++) {
+        double tm0 = now_ms();
         W[i].out = sm_merge_runs(&WS[i], &W[i].out_len);
+        W[i].t_merge_ms = now_ms() - tm0;
+        t_merge_runs_total += W[i].t_merge_ms;
+    }
 
     /* P-way parallel merge of per-worker sorted streams into nxt. */
     size_t raw_total = 0;
@@ -1782,7 +1807,46 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     SMStream *S = (SMStream*)malloc(P * sizeof(SMStream));
     for (int i = 0; i < P; i++)
         S[i] = (SMStream){ W[i].out, 0, W[i].out_len };
+    double t_par0 = now_ms();
     nxt->cnt = sm_parallel_merge(S, P, P, nxt->data, nxt->cap);
+    double t_par_merge = now_ms() - t_par0;
+
+    if (instrument) {
+        /* Per-worker breakdown */
+        double t_compute_max = 0, t_flush_max = 0, t_merge_max = 0;
+        for (int i = 0; i < P; i++) {
+            if (W[i].t_compute_ms > t_compute_max) t_compute_max = W[i].t_compute_ms;
+            if (W[i].t_flush_ms   > t_flush_max)   t_flush_max   = W[i].t_flush_ms;
+            if (W[i].t_merge_ms   > t_merge_max)   t_merge_max   = W[i].t_merge_ms;
+        }
+        /* Imbalance: max worker time vs mean */
+        double t_wall_compute = 0, t_wall_flush = 0;
+        for (int i = 0; i < P; i++) {
+            t_wall_compute += W[i].t_compute_ms;
+            t_wall_flush   += W[i].t_flush_ms;
+        }
+        double dedup_ratio = raw_total > 0 ? (double)raw_total / nxt->cnt : 1.0;
+        fprintf(stderr,
+            "  [inst] step=%d nb=%d ext=%d n_runs=%d\n"
+            "  [inst]   compute: max=%.0fms mean=%.0fms  "
+            "flush: max=%.0fms mean=%.0fms\n"
+            "  [inst]   merge_runs(seq): total=%.0fms max=%.0fms  "
+            "par_merge: %.0fms\n"
+            "  [inst]   raw_out=%zuM  deduped=%zuM  dedup=%.1fx\n"
+            "  [inst]   worker details (compute / flush / merge_runs / n_runs / out):\n",
+            step, n_back, ext_runs, WS[0].n_runs,
+            t_compute_max, t_wall_compute/P,
+            t_flush_max,   t_wall_flush/P,
+            t_merge_runs_total, t_merge_max,
+            t_par_merge,
+            raw_total/1000000, nxt->cnt/1000000, dedup_ratio);
+        for (int i = 0; i < P; i++) {
+            fprintf(stderr,
+                "  [inst]     w%-2d  %6.0fms / %6.0fms / %6.0fms / %2d / %zuK\n",
+                i, W[i].t_compute_ms, W[i].t_flush_ms,
+                W[i].t_merge_ms, WS[i].n_runs, W[i].out_len/1000);
+        }
+    }
 
     for (int i = 0; i < P; i++) {
         free(W[i].out);
@@ -1806,7 +1870,8 @@ void count_ham_paths_sm(
     uint64_t   *res_lo,
     uint64_t   *res_hi,
     int         verbose,
-    uint64_t    ram_bytes   /* physical RAM; 0 = use conservative default */
+    uint64_t    ram_bytes,
+    int         instrument  /* 0=off, 1=per-step phase breakdown to stderr */
 ) {
     int  frontier[MAX_FS_FAST + 2];
     int *fidx = (int*)malloc((size_t)(n + 1) * sizeof(int));
@@ -1868,7 +1933,7 @@ void count_ham_paths_sm(
         size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
 
         sm_fused_sweep(curr, nxt, fs, v_idx, widxs, n_back,
-                       elim_desc, n_elim, step, n, &total, ram);
+                       elim_desc, n_elim, step, n, &total, ram, instrument);
         { SMTab *t = curr; curr = nxt; nxt = t; }
 
         /* Update frontier */
@@ -2179,7 +2244,7 @@ def _get_lib():
             int n, const int *order, const int *pos, const int *last_s,
             const int *adj_off, const int *adj_dat,
             uint64_t *res_lo, uint64_t *res_hi,
-            int verbose, uint64_t ram_bytes);
+            int verbose, uint64_t ram_bytes, int instrument);
     """)
     lib = ffi.dlopen(so_path)
     _LIB_CACHE[cache_key] = (lib, ffi)
@@ -2321,6 +2386,7 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
 
 def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 verbose: bool = False,
+                                instrument: bool = False,
                                 checkpoint_path: str = "",
                                 checkpoint_secs: float = 300.0,
                                 **kwargs) -> int:
@@ -2328,28 +2394,20 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
 
     Parameters
     ----------
-    n               : graph size
-    order           : vertex ordering (1-indexed), length n.
-    adj             : adjacency dict {v: iterable_of_neighbours} (1-indexed).
-    verbose         : if True, print per-step profiling to stderr.  Steps
-                      using file-backed runs (ext mode) are marked [ext].
-    checkpoint_path : accepted for API compatibility; ignored with warning.
-    checkpoint_secs : accepted for API compatibility; ignored.
-
-    Notes
-    -----
-    Run storage (RAM vs file-backed) is chosen automatically per step based
-    on available physical RAM.  File-backed runs are used only when the
-    predicted in-memory run data would exceed available RAM, avoiding OOM
-    for large n (≥61) while keeping pure-RAM performance for smaller steps.
+    n           : graph size
+    order       : vertex ordering (1-indexed), length n.
+    adj         : adjacency dict {v: iterable_of_neighbours} (1-indexed).
+    verbose     : print per-step frontier DP progress to stderr.
+    instrument  : print per-step phase timing breakdown to stderr, showing
+                  compute / flush / merge_runs / parallel-merge times per
+                  worker and imbalance metrics.  Implies verbose output is
+                  also useful but is independent.
     """
     import sys
     if checkpoint_path:
         print("# Warning: sort-merge backend does not yet support checkpointing; "
               "checkpoint_path ignored.", file=sys.stderr)
     lib, ffi = _get_lib()
-
-    # Pass physical RAM so the C code can make per-step ext_runs decisions.
     ram, _ = _detect_ram_and_threads()
 
     pos = [0] * (n + 1)
@@ -2377,7 +2435,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
 
     lib.count_ham_paths_sm(
         n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
-        c_res_lo, c_res_hi, int(verbose), ram,
+        c_res_lo, c_res_hi, int(verbose), ram, int(instrument),
     )
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
