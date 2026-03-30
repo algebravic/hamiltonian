@@ -1668,6 +1668,7 @@ static void sm_flush_run(SMWorkerState *ws) {
     ws->buf_len = 0;
 
     if (ws->ext_runs) {
+        size_t old_off = ws->run_fd_off;
         sm_ext_write(ws->run_fd, ws->run_map, &ws->run_fd_off, ws->buf, o);
         if (ws->n_runs == ws->runs_cap) {
             ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 16;
@@ -1675,6 +1676,20 @@ static void sm_flush_run(SMWorkerState *ws) {
                                             ws->runs_cap * sizeof(size_t));
         }
         ws->run_lens[ws->n_runs++] = o;
+        /* Advise the OS it may reclaim the just-written pages under pressure.
+           The data is safe — it will be re-faulted from the MAP_ANON region
+           when sm_merge_runs reads it back.  This keeps the working set of
+           physical pages bounded during the compute phase.               */
+#ifdef MADV_FREE
+        if (ws->run_map) {
+            size_t page = 4096;
+            size_t aligned_off = (old_off + page - 1) & ~(page - 1);
+            size_t end_off     = ws->run_fd_off & ~(page - 1);
+            if (end_off > aligned_off)
+                madvise((char *)ws->run_map + aligned_off,
+                        end_off - aligned_off, MADV_FREE);
+        }
+#endif
     } else {
         /* RAM mode: malloc a copy and append to SMRun array.             */
         SMEntry *run_data = (SMEntry*)malloc(o * sizeof(SMEntry));
@@ -1959,11 +1974,16 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     int ext_runs = sm_should_use_ext(ni, n_back, ram_bytes);
 
     /* Capacity for ext_runs backing store per worker.
-       MAP_ANON allocates physical pages lazily, so we can safely request
-       the true worst-case (pre-dedup) size: chunk × 2^n_back entries.
-       The OS will only fault in pages that are actually written.       */
+       Each flush writes at most CAP entries (after dedup, usually much
+       less).  The maximum data written is n_runs × CAP × 24B, where
+       n_runs = ⌈bpt/CAP⌉.  This is the correct tight bound — using the
+       raw bpt × 24B (pre-dedup) wastes virtual address space and triggers
+       macOS VM overcommit kills for large steps (step 39: 17.7 GB/worker
+       × 6 = 106 GB virtual → OOM on 36 GB machine).                    */
     size_t bpt_per_worker  = chunk * ((size_t)1 << n_back);
-    size_t ext_cap_bytes   = bpt_per_worker * sizeof(SMEntry);
+    size_t n_runs_per_w    = (bpt_per_worker + SM_WORKER_CAP - 1) / SM_WORKER_CAP;
+    if (n_runs_per_w == 0) n_runs_per_w = 1;
+    size_t ext_cap_bytes   = n_runs_per_w * (size_t)SM_WORKER_CAP * sizeof(SMEntry);
 
     SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
     SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
@@ -2004,13 +2024,22 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
 
-    /* Sequential sm_merge_runs: one worker at a time to bound peak memory. */
+    /* Sequential sm_merge_runs: one worker at a time.
+       Close each worker's ext backing store immediately after merge_runs
+       so its MAP_ANON physical pages are released before the next worker
+       is processed.  Without this, all 6 workers' run data (27 GB) stays
+       mapped simultaneously, causing OOM at step 39 of n=61.            */
     double t_merge_runs_total = 0.0;
     for (int i = 0; i < P; i++) {
         double tm0 = now_ms();
         W[i].out = sm_merge_runs(&WS[i], &W[i].out_len);
         W[i].t_merge_ms = now_ms() - tm0;
         t_merge_runs_total += W[i].t_merge_ms;
+        /* Free this worker's backing store now — not needed until never. */
+        sm_ext_close(WS[i].run_fd, WS[i].run_map, WS[i].run_capacity);
+        WS[i].run_fd = -1; WS[i].run_map = NULL; WS[i].run_capacity = 0;
+        free(WS[i].run_lens); WS[i].run_lens = NULL;
+        free(WS[i].runs);     WS[i].runs     = NULL;
     }
 
     /* P-way parallel merge of per-worker sorted streams into nxt. */
@@ -2066,8 +2095,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(W[i].out);
         free(WS[i].buf);
         free(WS[i].tmp);
-        free(WS[i].runs);
-        free(WS[i].run_lens);
+        free(WS[i].runs);      /* NULL if already freed above */
+        free(WS[i].run_lens);  /* NULL if already freed above */
         sm_ext_close(WS[i].run_fd, WS[i].run_map, WS[i].run_capacity);
     }
     free(S); free(W); free(WS); free(T);
