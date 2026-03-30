@@ -1469,13 +1469,13 @@ typedef struct {
 /* ── ext_runs backing store helpers ─────────────────────────────────── */
 #ifdef __APPLE__
 #  define SM_USE_SHM 1
-#  ifndef MAP_ANON
-#    define MAP_ANON MAP_ANONYMOUS
+#  ifndef MAP_ANONYMOUS
+#    define MAP_ANONYMOUS MAP_ANON   /* macOS has MAP_ANON, not MAP_ANONYMOUS */
 #  endif
 #else
 #  define SM_USE_SHM 0
 #  ifndef MAP_ANON
-#    define MAP_ANON MAP_ANONYMOUS
+#    define MAP_ANON MAP_ANONYMOUS   /* Linux has MAP_ANONYMOUS, not MAP_ANON */
 #  endif
 #endif
 
@@ -1498,7 +1498,7 @@ static int sm_ext_open(size_t capacity_bytes, void **map_out) {
     /* 1. Try MAP_ANON — works on both macOS and Linux, no fd needed.  */
     void *m = mmap(NULL, capacity_bytes,
                    PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANON,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
                    -1, 0);
     if (m != MAP_FAILED) {
         *map_out = m;
