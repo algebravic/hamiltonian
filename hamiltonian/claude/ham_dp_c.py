@@ -1668,7 +1668,6 @@ static void sm_flush_run(SMWorkerState *ws) {
     ws->buf_len = 0;
 
     if (ws->ext_runs) {
-        size_t old_off = ws->run_fd_off;
         sm_ext_write(ws->run_fd, ws->run_map, &ws->run_fd_off, ws->buf, o);
         if (ws->n_runs == ws->runs_cap) {
             ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 16;
@@ -1676,20 +1675,6 @@ static void sm_flush_run(SMWorkerState *ws) {
                                             ws->runs_cap * sizeof(size_t));
         }
         ws->run_lens[ws->n_runs++] = o;
-        /* Advise the OS it may reclaim the just-written pages under pressure.
-           The data is safe — it will be re-faulted from the MAP_ANON region
-           when sm_merge_runs reads it back.  This keeps the working set of
-           physical pages bounded during the compute phase.               */
-#ifdef MADV_FREE
-        if (ws->run_map) {
-            size_t page = 4096;
-            size_t aligned_off = (old_off + page - 1) & ~(page - 1);
-            size_t end_off     = ws->run_fd_off & ~(page - 1);
-            if (end_off > aligned_off)
-                madvise((char *)ws->run_map + aligned_off,
-                        end_off - aligned_off, MADV_FREE);
-        }
-#endif
     } else {
         /* RAM mode: malloc a copy and append to SMRun array.             */
         SMEntry *run_data = (SMEntry*)malloc(o * sizeof(SMEntry));
@@ -1731,97 +1716,60 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
     if (ws->buf_len > 0) sm_flush_run(ws);
 
     if (ws->ext_runs) {
-        /* ── Ext path: bucketed streaming merge ────────────────────── */
+        /* ── Ext path: streaming heap merge ────────────────────────── */
+        /* Each run is read through a SM_EXT_STREAM_BUF-entry buffer.
+           Peak extra RAM = n_runs × SM_EXT_STREAM_BUF × 24B (small).
+           MAP_ANON gives RAM bandwidth; sequential access + hardware
+           prefetch makes this fast without bucketing.                  */
         if (ws->n_runs == 0) { *out_len = 0; return NULL; }
 
-        int     n_runs   = ws->n_runs;
-        size_t  total    = 0;
+        int     n_runs = ws->n_runs;
+        size_t  total  = 0;
         for (int i = 0; i < n_runs; i++) total += ws->run_lens[i];
         SMEntry *out = (SMEntry *)malloc(total * sizeof(SMEntry));
 
         if (n_runs == 1) {
-            sm_ext_read(ws->run_fd, ws->run_map, 0,
-                        out, ws->run_lens[0]);
+            sm_ext_read(ws->run_fd, ws->run_map, 0, out, ws->run_lens[0]);
             *out_len = ws->run_lens[0];
             return out;
         }
 
-        /* Build per-run stream descriptors (one stream per run). */
         SMExtStream *S = (SMExtStream *)malloc(n_runs * sizeof(SMExtStream));
         SMHEntry    *h = (SMHEntry *)malloc(n_runs * sizeof(SMHEntry));
 
-        /* Compute byte offset of each run in the backing store. */
-        size_t *run_offs = (size_t *)malloc(n_runs * sizeof(size_t));
-        run_offs[0] = 0;
-        for (int i = 1; i < n_runs; i++)
-            run_offs[i] = run_offs[i-1] + ws->run_lens[i-1] * sizeof(SMEntry);
-
-        /* Allocate per-stream buffers and read first chunk of each. */
+        size_t file_off = 0;
         for (int i = 0; i < n_runs; i++) {
             S[i] = (SMExtStream){
                 .fd = ws->run_fd, .map = ws->run_map,
-                .run_off = run_offs[i], .run_len = ws->run_lens[i],
+                .run_off = file_off, .run_len = ws->run_lens[i],
                 .run_pos = 0, .buf_len = 0, .buf_pos = 0,
                 .buf = (SMEntry *)malloc(SM_EXT_STREAM_BUF * sizeof(SMEntry)),
             };
+            file_off += ws->run_lens[i] * sizeof(SMEntry);
             sm_ext_stream_refill(&S[i]);
         }
-        free(run_offs);
 
-        /* Process 256 buckets in order.  For each bucket b, the heap
-           only contains entries with top byte == b; we drain it fully
-           before advancing to b+1.  This keeps the working set in cache. */
-        size_t write_pos = 0;
-        for (int b = 0; b < 256; b++) {
-            /* Load heap with streams that have entries in bucket b. */
-            int hs = 0;
-            for (int i = 0; i < n_runs; i++) {
-                /* Advance stream past any entries with top byte < b
-                   (can happen if a bucket was empty in a previous run). */
-                while (S[i].buf_len > 0 &&
-                       sm_bucket(S[i].buf[S[i].buf_pos].key) < b) {
-                    S[i].buf_pos++;
-                    if (S[i].buf_pos >= S[i].buf_len)
-                        sm_ext_stream_refill(&S[i]);
-                }
-                if (S[i].buf_len > 0 &&
-                    sm_bucket(S[i].buf[S[i].buf_pos].key) == b) {
-                    h[hs].key = S[i].buf[S[i].buf_pos].key;
-                    h[hs].s   = i;
-                    hs++;
-                }
-            }
-            if (hs == 0) continue;
-            for (int i = hs/2-1; i >= 0; i--) sm_heap_sift(h, hs, i);
+        int hs = 0;
+        for (int i = 0; i < n_runs; i++)
+            if (S[i].buf_len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
+        for (int i = hs/2-1; i >= 0; i--) sm_heap_sift(h, hs, i);
 
-            /* Drain bucket b. */
-            while (hs > 0) {
-                int s = h[0].s;
-                if (sm_bucket(S[s].buf[S[s].buf_pos].key) != b) {
-                    h[0] = h[--hs];
-                    if (hs > 0) sm_heap_sift(h, hs, 0);
-                    continue;
-                }
-                SMEntry cur = S[s].buf[S[s].buf_pos++];
-                sm_ext_advance(h, &hs, S, s);
-                /* Check if top entry still in bucket b. */
-                if (hs > 0 && sm_bucket(h[0].key) != b) {
-                    /* Remaining streams exhausted bucket b. */
-                    out[write_pos++] = cur;
-                    continue;
-                }
-                while (hs > 0 && h[0].key == cur.key) {
-                    int s2 = h[0].s;
-                    cur.val += S[s2].buf[S[s2].buf_pos++].val;
-                    sm_ext_advance(h, &hs, S, s2);
-                }
-                out[write_pos++] = cur;
+        size_t op = 0;
+        while (hs > 0) {
+            int s = h[0].s;
+            SMEntry cur = S[s].buf[S[s].buf_pos++];
+            sm_ext_advance(h, &hs, S, s);
+            while (hs > 0 && h[0].key == cur.key) {
+                int s2 = h[0].s;
+                cur.val += S[s2].buf[S[s2].buf_pos++].val;
+                sm_ext_advance(h, &hs, S, s2);
             }
+            out[op++] = cur;
         }
 
         for (int i = 0; i < n_runs; i++) free(S[i].buf);
         free(S); free(h);
-        *out_len = write_pos;
+        *out_len = op;
         return out;
 
     } else {
