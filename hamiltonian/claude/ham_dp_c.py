@@ -50,6 +50,9 @@ import os, hashlib, subprocess, tempfile, cffi
 
 C_SOURCE = r"""
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#  define _DARWIN_C_SOURCE   /* expose MAP_ANON and other BSD extensions */
+#endif
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1469,13 +1472,17 @@ typedef struct {
 /* ── ext_runs backing store helpers ─────────────────────────────────── */
 #ifdef __APPLE__
 #  define SM_USE_SHM 1
-#  ifndef MAP_ANONYMOUS
-#    define MAP_ANONYMOUS MAP_ANON   /* macOS has MAP_ANON, not MAP_ANONYMOUS */
-#  endif
 #else
 #  define SM_USE_SHM 0
-#  ifndef MAP_ANON
-#    define MAP_ANON MAP_ANONYMOUS   /* Linux has MAP_ANONYMOUS, not MAP_ANON */
+#endif
+/* MAP_ANONYMOUS / MAP_ANON: normalise to MAP_ANONYMOUS.
+   macOS (_DARWIN_C_SOURCE): MAP_ANON defined, MAP_ANONYMOUS may not be.
+   Linux: MAP_ANONYMOUS defined, MAP_ANON may not be.                   */
+#ifndef MAP_ANONYMOUS
+#  ifdef MAP_ANON
+#    define MAP_ANONYMOUS MAP_ANON
+#  else
+#    define MAP_ANONYMOUS 0x20   /* Linux numeric fallback */
 #  endif
 #endif
 
