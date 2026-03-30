@@ -56,6 +56,8 @@ C_SOURCE = r"""
 #include <sys/mman.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 static inline double now_ms(void) {
     struct timespec ts;
@@ -1394,101 +1396,6 @@ static size_t sm_parallel_merge(SMStream *S, int P, int K,
 }
 
 /* ── SM table ───────────────────────────────────────────────────────── */
-#define SM_EXT_STREAM_BUF (1024 * 1024)   /* entries per stream buffer = 24MB */
-
-typedef struct {
-    int      fd;
-    void    *map;        /* mmap base or NULL */
-    size_t   run_off;    /* byte offset of this run's start in the file  */
-    size_t   run_len;    /* total entries in the run                     */
-    size_t   run_pos;    /* entries consumed from file so far            */
-    SMEntry *buf;        /* read buffer                                  */
-    size_t   buf_len;    /* valid entries in buf                         */
-    size_t   buf_pos;    /* next entry to read from buf                  */
-} SMExtStream;
-
-static void sm_ext_stream_refill(SMExtStream *s) {
-    if (s->run_pos >= s->run_len) { s->buf_len = 0; return; }
-    size_t remaining = s->run_len - s->run_pos;
-    size_t n  = remaining < (size_t)SM_EXT_STREAM_BUF ? remaining
-                                                       : (size_t)SM_EXT_STREAM_BUF;
-    size_t off = s->run_off + s->run_pos * sizeof(SMEntry);
-    if (s->map)
-        memcpy(s->buf, (char *)s->map + off, n * sizeof(SMEntry));
-    else
-        pread(s->fd, s->buf, n * sizeof(SMEntry), (off_t)off);
-    s->buf_pos = 0;
-    s->buf_len = n;
-    s->run_pos += n;
-}
-
-/* Advance stream s in the heap after consuming one entry.             */
-static inline void sm_ext_heap_advance(SMHEntry *h, int *hs, SMExtStream *S, int s) {
-    if (S[s].buf_pos < S[s].buf_len) {
-        h[0].key = S[s].buf[S[s].buf_pos].key;
-        sm_heap_sift(h, *hs, 0);
-    } else {
-        sm_ext_stream_refill(&S[s]);
-        if (S[s].buf_len > 0) {
-            h[0].key = S[s].buf[0].key;
-            sm_heap_sift(h, *hs, 0);
-        } else {
-            h[0] = h[--(*hs)];
-            if (*hs > 0) sm_heap_sift(h, *hs, 0);
-        }
-    }
-}
-
-static SMEntry *sm_merge_runs_ext_stream(
-    int fd, void *map,
-    const size_t *run_lens, int n_runs,
-    size_t *out_len)
-{
-    size_t total = 0;
-    for (int i = 0; i < n_runs; i++) total += run_lens[i];
-    SMEntry    *out = (SMEntry *)malloc(total * sizeof(SMEntry));
-    SMExtStream *S  = (SMExtStream *)malloc(n_runs * sizeof(SMExtStream));
-    SMHEntry    *h  = (SMHEntry *)malloc(n_runs * sizeof(SMHEntry));
-
-    /* Initialise streams and fill first buffer of each. */
-    size_t file_off = 0;
-    for (int i = 0; i < n_runs; i++) {
-        S[i] = (SMExtStream){
-            .fd = fd, .map = map,
-            .run_off = file_off, .run_len = run_lens[i],
-            .run_pos = 0, .buf_len = 0, .buf_pos = 0,
-            .buf = (SMEntry *)malloc(SM_EXT_STREAM_BUF * sizeof(SMEntry)),
-        };
-        file_off += run_lens[i] * sizeof(SMEntry);
-        sm_ext_stream_refill(&S[i]);
-    }
-
-    /* Build initial min-heap. */
-    int hs = 0;
-    for (int i = 0; i < n_runs; i++)
-        if (S[i].buf_len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
-    for (int i = hs/2 - 1; i >= 0; i--) sm_heap_sift(h, hs, i);
-
-    /* Merge + dedup loop. */
-    size_t op = 0;
-    while (hs > 0) {
-        int s = h[0].s;
-        SMEntry cur = S[s].buf[S[s].buf_pos++];
-        sm_ext_heap_advance(h, &hs, S, s);
-
-        while (hs > 0 && h[0].key == cur.key) {
-            int s2 = h[0].s;
-            cur.val += S[s2].buf[S[s2].buf_pos++].val;
-            sm_ext_heap_advance(h, &hs, S, s2);
-        }
-        out[op++] = cur;
-    }
-
-    for (int i = 0; i < n_runs; i++) free(S[i].buf);
-    free(S); free(h);
-    *out_len = op;
-    return out;
-}
 typedef struct { SMEntry *data; size_t cnt, cap; } SMTab;
 
 static SMTab *smtab_alloc(size_t cap) {
@@ -1560,13 +1467,16 @@ typedef struct {
 } SMWorkerState;
 
 /* ── ext_runs backing store helpers ─────────────────────────────────── */
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
 #ifdef __APPLE__
-#  define SM_USE_SHM 1    /* use shm_open+mmap on macOS — bypasses APFS   */
+#  define SM_USE_SHM 1
+#  ifndef MAP_ANON
+#    define MAP_ANON MAP_ANONYMOUS
+#  endif
 #else
-#  define SM_USE_SHM 0    /* Linux tmpfs is already RAM-backed via tmpfile */
+#  define SM_USE_SHM 0
+#  ifndef MAP_ANON
+#    define MAP_ANON MAP_ANONYMOUS
+#  endif
 #endif
 
 /* Open backing store for a worker's run data.
@@ -1588,12 +1498,7 @@ static int sm_ext_open(size_t capacity_bytes, void **map_out) {
     /* 1. Try MAP_ANON — works on both macOS and Linux, no fd needed.  */
     void *m = mmap(NULL, capacity_bytes,
                    PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE |
-#ifdef MAP_ANON
-                   MAP_ANON,
-#else
-                   MAP_ANONYMOUS,
-#endif
+                   MAP_PRIVATE | MAP_ANON,
                    -1, 0);
     if (m != MAP_FAILED) {
         *map_out = m;
@@ -1655,6 +1560,105 @@ static void sm_ext_close(int fd, void *map, size_t capacity_bytes) {
         munmap(map, capacity_bytes);
     if (fd >= 0) close(fd);
     /* fd == -2: MAP_ANON mode, map already released above; no fd.     */
+}
+
+/* ── Streaming ext-mode merge ─────────────────────────────────────────
+   Merges n_runs sorted runs (stored in a file or mmap) into a single
+   sorted+deduped array, reading each run through a small buffer.
+   Peak extra RAM = n_runs × SM_EXT_STREAM_BUF × 24B (e.g. 31 × 24MB = 744MB)
+   vs loading all runs simultaneously (e.g. 2.7 GB for step 38).
+   Large sequential reads → OS readahead → near-SSD-peak bandwidth.     */
+#define SM_EXT_STREAM_BUF (1024 * 1024)   /* entries per stream buffer = 24MB */
+
+typedef struct {
+    int      fd;
+    void    *map;
+    size_t   run_off;    /* byte offset of run start in file             */
+    size_t   run_len;    /* total entries in run                         */
+    size_t   run_pos;    /* entries consumed from file/map so far        */
+    SMEntry *buf;
+    size_t   buf_len;
+    size_t   buf_pos;
+} SMExtStream;
+
+static void sm_ext_stream_refill(SMExtStream *s) {
+    if (s->run_pos >= s->run_len) { s->buf_len = 0; return; }
+    size_t remaining = s->run_len - s->run_pos;
+    size_t n = remaining < (size_t)SM_EXT_STREAM_BUF ? remaining
+                                                      : (size_t)SM_EXT_STREAM_BUF;
+    size_t off = s->run_off + s->run_pos * sizeof(SMEntry);
+    if (s->map)
+        memcpy(s->buf, (const char *)s->map + off, n * sizeof(SMEntry));
+    else
+        pread(s->fd, s->buf, n * sizeof(SMEntry), (off_t)off);
+    s->buf_pos = 0;
+    s->buf_len = n;
+    s->run_pos += n;
+}
+
+/* Advance stream s in the heap by one entry; refill its buffer if empty. */
+static inline void sm_ext_advance(SMHEntry *h, int *hs,
+                                   SMExtStream *S, int s) {
+    if (S[s].buf_pos < S[s].buf_len) {
+        h[0].key = S[s].buf[S[s].buf_pos].key;
+        sm_heap_sift(h, *hs, 0);
+    } else {
+        sm_ext_stream_refill(&S[s]);
+        if (S[s].buf_len > 0) {
+            h[0].key = S[s].buf[0].key;
+            sm_heap_sift(h, *hs, 0);
+        } else {
+            h[0] = h[--(*hs)];
+            if (*hs > 0) sm_heap_sift(h, *hs, 0);
+        }
+    }
+}
+
+static SMEntry *sm_merge_runs_ext_stream(
+    int fd, void *map,
+    const size_t *run_lens, int n_runs,
+    size_t *out_len)
+{
+    size_t total = 0;
+    for (int i = 0; i < n_runs; i++) total += run_lens[i];
+    SMEntry     *out = (SMEntry *)malloc(total * sizeof(SMEntry));
+    SMExtStream *S   = (SMExtStream *)malloc(n_runs * sizeof(SMExtStream));
+    SMHEntry    *h   = (SMHEntry *)malloc(n_runs * sizeof(SMHEntry));
+
+    size_t file_off = 0;
+    for (int i = 0; i < n_runs; i++) {
+        S[i] = (SMExtStream){
+            .fd = fd, .map = map,
+            .run_off = file_off, .run_len = run_lens[i],
+            .run_pos = 0, .buf_len = 0, .buf_pos = 0,
+            .buf = (SMEntry *)malloc(SM_EXT_STREAM_BUF * sizeof(SMEntry)),
+        };
+        file_off += run_lens[i] * sizeof(SMEntry);
+        sm_ext_stream_refill(&S[i]);
+    }
+
+    int hs = 0;
+    for (int i = 0; i < n_runs; i++)
+        if (S[i].buf_len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
+    for (int i = hs/2 - 1; i >= 0; i--) sm_heap_sift(h, hs, i);
+
+    size_t op = 0;
+    while (hs > 0) {
+        int s = h[0].s;
+        SMEntry cur = S[s].buf[S[s].buf_pos++];
+        sm_ext_advance(h, &hs, S, s);
+        while (hs > 0 && h[0].key == cur.key) {
+            int s2 = h[0].s;
+            cur.val += S[s2].buf[S[s2].buf_pos++].val;
+            sm_ext_advance(h, &hs, S, s2);
+        }
+        out[op++] = cur;
+    }
+
+    for (int i = 0; i < n_runs; i++) free(S[i].buf);
+    free(S); free(h);
+    *out_len = op;
+    return out;
 }
 
 /* ── Work-stealing shared micro-chunk queue ─────────────────────────── */
@@ -2328,7 +2332,8 @@ def _get_lib():
         # Linux needs -lrt for shm_open; macOS has it in libc
         rt_flag = [] if platform.system() == "Darwin" else ["-lrt"]
         result = subprocess.run(
-            [compiler, "-O3", "-march=native", "-shared", "-fPIC", "-std=c11"]
+            [compiler, "-O3", "-march=native", "-shared", "-fPIC", "-std=c11",
+             "-D_POSIX_C_SOURCE=200809L"]
             + d_flags
             + ["-o", so_path, c_path, "-lpthread"] + rt_flag,
             capture_output=True,
