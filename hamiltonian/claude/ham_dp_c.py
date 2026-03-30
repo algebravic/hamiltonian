@@ -1444,29 +1444,30 @@ static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
 
 typedef struct { SMEntry *data; size_t len; } SMRun;
 
-typedef struct {
+/* Align to cache line (128B on Apple Silicon, 64B on x86).
+   Without this, all workers share 2-3 cache lines, and mid-compute
+   flushes by one worker invalidate neighbouring workers' buf_len fields,
+   causing 3-4× slowdown specifically at n_runs=2 steps.               */
+#if defined(__APPLE__) && defined(__aarch64__)
+#  define SM_CACHE_ALIGN __attribute__((aligned(128)))
+#else
+#  define SM_CACHE_ALIGN __attribute__((aligned(64)))
+#endif
+
+typedef struct SM_CACHE_ALIGN {
     /* worker scratch (reused across runs) */
     SMEntry *buf;   /* output accumulation buffer, SM_WORKER_CAP entries */
     SMEntry *tmp;   /* radix sort scratch,         SM_WORKER_CAP entries */
     size_t   buf_len;
-    /* completed sorted+deduped runs — two storage modes:
-       ext_runs=0: in-memory SMRun array (small n, fits in RAM)
-       ext_runs=1: written to backing store; run_lens[] records lengths
-
-       Backing store strategy (selected at compile time):
-         macOS  — shm_open() gives an anonymous POSIX shared memory fd
-                  backed by the VM system at full RAM bandwidth, bypassing
-                  APFS journal overhead that makes tmpfile() 38× slower.
-         Linux  — tmpfile() lands on tmpfs (RAM-backed) so it's fast;
-                  shm_open is available but offers no advantage.         */
+    /* completed sorted+deduped runs */
     int      ext_runs;
-    SMRun   *runs;           /* RAM mode */
+    SMRun   *runs;
     int      n_runs, runs_cap;
-    int      run_fd;         /* ext mode: fd from shm_open or tmpfile     */
-    void    *run_map;        /* ext mode: mmap base (macOS) or NULL       */
-    size_t   run_capacity;   /* ext mode: total bytes allocated           */
-    size_t   run_fd_off;     /* ext mode: current write offset in bytes   */
-    size_t  *run_lens;       /* ext mode: length of each run in entries   */
+    int      run_fd;
+    void    *run_map;
+    size_t   run_capacity;
+    size_t   run_fd_off;
+    size_t  *run_lens;
 } SMWorkerState;
 
 /* ── ext_runs backing store helpers ─────────────────────────────────── */
