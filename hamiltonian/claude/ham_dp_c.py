@@ -1394,6 +1394,101 @@ static size_t sm_parallel_merge(SMStream *S, int P, int K,
 }
 
 /* ── SM table ───────────────────────────────────────────────────────── */
+#define SM_EXT_STREAM_BUF (1024 * 1024)   /* entries per stream buffer = 24MB */
+
+typedef struct {
+    int      fd;
+    void    *map;        /* mmap base or NULL */
+    size_t   run_off;    /* byte offset of this run's start in the file  */
+    size_t   run_len;    /* total entries in the run                     */
+    size_t   run_pos;    /* entries consumed from file so far            */
+    SMEntry *buf;        /* read buffer                                  */
+    size_t   buf_len;    /* valid entries in buf                         */
+    size_t   buf_pos;    /* next entry to read from buf                  */
+} SMExtStream;
+
+static void sm_ext_stream_refill(SMExtStream *s) {
+    if (s->run_pos >= s->run_len) { s->buf_len = 0; return; }
+    size_t remaining = s->run_len - s->run_pos;
+    size_t n  = remaining < (size_t)SM_EXT_STREAM_BUF ? remaining
+                                                       : (size_t)SM_EXT_STREAM_BUF;
+    size_t off = s->run_off + s->run_pos * sizeof(SMEntry);
+    if (s->map)
+        memcpy(s->buf, (char *)s->map + off, n * sizeof(SMEntry));
+    else
+        pread(s->fd, s->buf, n * sizeof(SMEntry), (off_t)off);
+    s->buf_pos = 0;
+    s->buf_len = n;
+    s->run_pos += n;
+}
+
+/* Advance stream s in the heap after consuming one entry.             */
+static inline void sm_ext_heap_advance(SMHEntry *h, int *hs, SMExtStream *S, int s) {
+    if (S[s].buf_pos < S[s].buf_len) {
+        h[0].key = S[s].buf[S[s].buf_pos].key;
+        sm_heap_sift(h, *hs, 0);
+    } else {
+        sm_ext_stream_refill(&S[s]);
+        if (S[s].buf_len > 0) {
+            h[0].key = S[s].buf[0].key;
+            sm_heap_sift(h, *hs, 0);
+        } else {
+            h[0] = h[--(*hs)];
+            if (*hs > 0) sm_heap_sift(h, *hs, 0);
+        }
+    }
+}
+
+static SMEntry *sm_merge_runs_ext_stream(
+    int fd, void *map,
+    const size_t *run_lens, int n_runs,
+    size_t *out_len)
+{
+    size_t total = 0;
+    for (int i = 0; i < n_runs; i++) total += run_lens[i];
+    SMEntry    *out = (SMEntry *)malloc(total * sizeof(SMEntry));
+    SMExtStream *S  = (SMExtStream *)malloc(n_runs * sizeof(SMExtStream));
+    SMHEntry    *h  = (SMHEntry *)malloc(n_runs * sizeof(SMHEntry));
+
+    /* Initialise streams and fill first buffer of each. */
+    size_t file_off = 0;
+    for (int i = 0; i < n_runs; i++) {
+        S[i] = (SMExtStream){
+            .fd = fd, .map = map,
+            .run_off = file_off, .run_len = run_lens[i],
+            .run_pos = 0, .buf_len = 0, .buf_pos = 0,
+            .buf = (SMEntry *)malloc(SM_EXT_STREAM_BUF * sizeof(SMEntry)),
+        };
+        file_off += run_lens[i] * sizeof(SMEntry);
+        sm_ext_stream_refill(&S[i]);
+    }
+
+    /* Build initial min-heap. */
+    int hs = 0;
+    for (int i = 0; i < n_runs; i++)
+        if (S[i].buf_len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
+    for (int i = hs/2 - 1; i >= 0; i--) sm_heap_sift(h, hs, i);
+
+    /* Merge + dedup loop. */
+    size_t op = 0;
+    while (hs > 0) {
+        int s = h[0].s;
+        SMEntry cur = S[s].buf[S[s].buf_pos++];
+        sm_ext_heap_advance(h, &hs, S, s);
+
+        while (hs > 0 && h[0].key == cur.key) {
+            int s2 = h[0].s;
+            cur.val += S[s2].buf[S[s2].buf_pos++].val;
+            sm_ext_heap_advance(h, &hs, S, s2);
+        }
+        out[op++] = cur;
+    }
+
+    for (int i = 0; i < n_runs; i++) free(S[i].buf);
+    free(S); free(h);
+    *out_len = op;
+    return out;
+}
 typedef struct { SMEntry *data; size_t cnt, cap; } SMTab;
 
 static SMTab *smtab_alloc(size_t cap) {
@@ -1475,30 +1570,57 @@ typedef struct {
 #endif
 
 /* Open backing store for a worker's run data.
-   capacity_bytes: maximum bytes that will be written (must be exact).
-   On macOS: shm_open + single ftruncate + mmap → RAM bandwidth.
-   On Linux: tmpfile → tmpfs (also RAM-backed).
-   Returns fd and sets *map_out to the mapped base address (or NULL).   */
+   Strategy (in order of preference):
+     1. MAP_ANON mmap (macOS + Linux): anonymous VM, RAM bandwidth,
+        no filesystem, no ftruncate size limit, lazy physical allocation.
+        fd=-2 sentinel signals map-only mode to sm_ext_write/read/close.
+     2. shm_open + ftruncate + mmap (macOS fallback for small sizes):
+        POSIX shm, also RAM-backed but has per-object size limits.
+     3. tmpfile (Linux / final fallback): tmpfs on Linux = RAM bandwidth;
+        APFS on macOS = catastrophically slow, avoid if possible.
+
+   We prefer MAP_ANON because it works for any size, has no quota
+   limits, and avoids all filesystem involvement on macOS.              */
 static int sm_ext_open(size_t capacity_bytes, void **map_out) {
     *map_out = NULL;
+    if (capacity_bytes == 0) capacity_bytes = sizeof(SMEntry);
+
+    /* 1. Try MAP_ANON — works on both macOS and Linux, no fd needed.  */
+    void *m = mmap(NULL, capacity_bytes,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE |
+#ifdef MAP_ANON
+                   MAP_ANON,
+#else
+                   MAP_ANONYMOUS,
+#endif
+                   -1, 0);
+    if (m != MAP_FAILED) {
+        *map_out = m;
+        return -2;          /* sentinel: map-only mode, no fd           */
+    }
+
 #if SM_USE_SHM
+    /* 2. Try shm_open (macOS only, works for small-ish sizes).        */
     static volatile int shm_seq = 0;
     char name[64];
     int seq = __sync_fetch_and_add(&shm_seq, 1);
     snprintf(name, sizeof(name), "/ham_dp_%d_%d", (int)getpid(), seq);
     int fd = shm_open(name, O_CREAT | O_RDWR, 0600);
-    shm_unlink(name);   /* remove name; fd stays valid until close() */
-    if (fd < 0) return -1;
-    if (capacity_bytes == 0) capacity_bytes = 1;
-    if (ftruncate(fd, (off_t)capacity_bytes) < 0) { close(fd); return -1; }
-    void *m = mmap(NULL, capacity_bytes, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (m == MAP_FAILED) { close(fd); return -1; }
-    *map_out = m;
-    return fd;
-#else
+    shm_unlink(name);
+    if (fd >= 0) {
+        if (ftruncate(fd, (off_t)capacity_bytes) == 0) {
+            void *sm = mmap(NULL, capacity_bytes,
+                            PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (sm != MAP_FAILED) { *map_out = sm; return fd; }
+        }
+        close(fd);
+    }
+#endif
+
+    /* 3. Fall back to tmpfile (Linux tmpfs = fast; macOS APFS = slow).*/
     FILE *f = tmpfile();
     return f ? fileno(f) : -1;
-#endif
 }
 
 /* Write n entries at byte offset *off; advance *off.
@@ -1527,11 +1649,12 @@ static void sm_ext_read(int fd, const void *map, size_t off,
     }
 }
 
-/* Close and unmap a backing store.                                     */
+/* Close and release a backing store.                                   */
 static void sm_ext_close(int fd, void *map, size_t capacity_bytes) {
     if (map && map != MAP_FAILED)
         munmap(map, capacity_bytes);
     if (fd >= 0) close(fd);
+    /* fd == -2: MAP_ANON mode, map already released above; no fd.     */
 }
 
 /* ── Work-stealing shared micro-chunk queue ─────────────────────────── */
@@ -1605,36 +1728,18 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
     if (ws->buf_len > 0) sm_flush_run(ws);
 
     if (ws->ext_runs) {
-        /* Ext mode: read runs back from shm/tmpfile one at a time.
-           Called sequentially from main thread — only one worker's data
-           in RAM at a time.                                              */
+        /* Streaming ext merge: read each run through a small buffer so
+           peak RAM = n_runs × SM_EXT_STREAM_BUF × 24B, not total data.  */
         if (ws->n_runs == 0) { *out_len = 0; return NULL; }
         if (ws->n_runs == 1) {
             size_t len = ws->run_lens[0];
-            SMEntry *d = (SMEntry*)malloc(len * sizeof(SMEntry));
+            SMEntry *d = (SMEntry *)malloc(len * sizeof(SMEntry));
             sm_ext_read(ws->run_fd, ws->run_map, 0, d, len);
             *out_len = len;
             return d;
         }
-        /* Load all runs, merge, free one by one */
-        size_t total = 0;
-        for (int i = 0; i < ws->n_runs; i++) total += ws->run_lens[i];
-        SMEntry  *out   = (SMEntry*)malloc(total * sizeof(SMEntry));
-        SMEntry **rdata = (SMEntry**)malloc(ws->n_runs * sizeof(SMEntry*));
-        SMStream  *S    = (SMStream*)malloc(ws->n_runs * sizeof(SMStream));
-        size_t off = 0;
-        for (int i = 0; i < ws->n_runs; i++) {
-            size_t len = ws->run_lens[i];
-            rdata[i] = (SMEntry*)malloc(len * sizeof(SMEntry));
-            sm_ext_read(ws->run_fd, ws->run_map, off, rdata[i], len);
-            off += len * sizeof(SMEntry);
-            S[i] = (SMStream){ rdata[i], 0, len };
-        }
-        *out_len = sm_merge(S, ws->n_runs, out);
-        free(S);
-        for (int i = 0; i < ws->n_runs; i++) free(rdata[i]);
-        free(rdata);
-        return out;
+        return sm_merge_runs_ext_stream(
+            ws->run_fd, ws->run_map, ws->run_lens, ws->n_runs, out_len);
 
     } else {
         /* RAM mode: unchanged from original implementation.              */
@@ -1753,9 +1858,12 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     size_t chunk = (ni + P - 1) / P;
     int ext_runs = sm_should_use_ext(ni, n_back, ram_bytes);
 
-    /* Worst-case capacity per worker for ext_runs shm region. */
-    size_t bpt_per_worker = chunk * ((size_t)1 << n_back);
-    size_t ext_cap_bytes  = bpt_per_worker * sizeof(SMEntry);
+    /* Capacity for ext_runs backing store per worker.
+       MAP_ANON allocates physical pages lazily, so we can safely request
+       the true worst-case (pre-dedup) size: chunk × 2^n_back entries.
+       The OS will only fault in pages that are actually written.       */
+    size_t bpt_per_worker  = chunk * ((size_t)1 << n_back);
+    size_t ext_cap_bytes   = bpt_per_worker * sizeof(SMEntry);
 
     SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
     SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
