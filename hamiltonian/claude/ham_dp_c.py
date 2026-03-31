@@ -1479,12 +1479,27 @@ static void *sm_par_rad_count(void *arg) {
 
 static void *sm_par_rad_scatter(void *arg) {
     SMParRadJob *j = (SMParRadJob *)arg;
-    size_t pos[256];
-    memcpy(pos, j->off, 256 * sizeof(size_t));
+    /* Each thread gets its own RadixBuf (~196 KB) for write-combining.
+       Without this, every entry write to j->dst[pos[b]] causes a random
+       cache-line load across the full output buffer (up to 2.5 GB for
+       si=87M), making the scatter 32× more DRAM-latency-bound than the
+       sequential rbuf_pass which batches 32 entries before each flush.
+       With RadixBuf: we amortise 6 cache-line writes over 32 entries,
+       matching the sequential efficiency while still parallelising.     */
+    RadixBuf *rb = (RadixBuf *)malloc(sizeof(RadixBuf));
+    for (int b = 0; b < 256; b++) { rb->prefix[b] = j->off[b]; rb->cnt[b] = 0; }
     for (size_t i = j->lo; i < j->hi; i++) {
         int b = (eh_hash(j->src[i].key) >> j->shift) & 0xff;
-        j->dst[pos[b]++] = j->src[i];
+        rb->slots[b][rb->cnt[b]++] = j->src[i];
+        if (rb->cnt[b] == SM_RBUF_SIZE) {
+            memcpy(j->dst + rb->prefix[b], rb->slots[b], SM_RBUF_SIZE * sizeof(SMEntry));
+            rb->prefix[b] += SM_RBUF_SIZE; rb->cnt[b] = 0;
+        }
     }
+    for (int b = 0; b < 256; b++)
+        if (rb->cnt[b])
+            memcpy(j->dst + rb->prefix[b], rb->slots[b], rb->cnt[b] * sizeof(SMEntry));
+    free(rb);
     return NULL;
 }
 
