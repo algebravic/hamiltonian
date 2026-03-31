@@ -1172,13 +1172,19 @@ typedef struct {
 static void rbuf_pass(const SMEntry *src, size_t n, SMEntry *dst,
                       int shift, RadixBuf *rb) {
     size_t cnt[SM_RBUCKETS] = {0};
-    for (size_t i = 0; i < n; i++) cnt[(src[i].key >> shift) & 0xff]++;
+    /* Use eh_hash(key) bits for bucket assignment.  Raw key bits are highly
+       skewed (bits 56-63 take only 2 values for n=61), so the top passes of
+       an unmodified LSD sort push all entries into 2 of 256 buckets.
+       eh_hash is bijective, so sorting by eh_hash(key) is a valid total order:
+       identical original keys always get the same hash, preserving dedup
+       correctness; all internal merge/heap comparisons use the same hash.  */
+    for (size_t i = 0; i < n; i++) cnt[(eh_hash(src[i].key) >> shift) & 0xff]++;
     size_t p = 0;
     for (int b = 0; b < SM_RBUCKETS; b++) {
         rb->prefix[b] = p; p += cnt[b]; rb->cnt[b] = 0;
     }
     for (size_t i = 0; i < n; i++) {
-        int b = (src[i].key >> shift) & 0xff;
+        int b = (eh_hash(src[i].key) >> shift) & 0xff;
         rb->slots[b][rb->cnt[b]++] = src[i];
         if (rb->cnt[b] == SM_RBUF_SIZE) {
             memcpy(dst + rb->prefix[b], rb->slots[b], SM_RBUF_SIZE * sizeof(SMEntry));
@@ -1209,8 +1215,8 @@ typedef struct { u64 key; int s; } SMHEntry;
 static void sm_heap_sift(SMHEntry *h, int n, int i) {
     for (;;) {
         int m = i, l = 2*i+1, r = 2*i+2;
-        if (l < n && h[l].key < h[m].key) m = l;
-        if (r < n && h[r].key < h[m].key) m = r;
+        if (l < n && eh_hash(h[l].key) < eh_hash(h[m].key)) m = l;
+        if (r < n && eh_hash(h[r].key) < eh_hash(h[m].key)) m = r;
         if (m == i) break;
         SMHEntry t = h[i]; h[i] = h[m]; h[m] = t; i = m;
     }
@@ -1278,12 +1284,14 @@ static void *sm_par_merge_thread(void *arg) {
     return NULL;
 }
 
-/* Binary search: index of first entry with key >= target in sorted array. */
-static size_t sm_lower_bound(const SMEntry *a, size_t n, u64 target) {
+/* Binary search: index of first entry in hash-sorted array a[0..n) whose
+   eh_hash(key) >= target_hash.  Used by sm_parallel_merge to split streams
+   at hash-space splitter values.                                           */
+static size_t sm_lower_bound(const SMEntry *a, size_t n, u64 target_hash) {
     size_t lo = 0, hi = n;
     while (lo < hi) {
         size_t mid = (lo + hi) >> 1;
-        if (a[mid].key < target) lo = mid + 1; else hi = mid;
+        if (eh_hash(a[mid].key) < target_hash) lo = mid + 1; else hi = mid;
     }
     return lo;
 }
@@ -1316,7 +1324,10 @@ static size_t sm_parallel_merge(SMStream *S, int P, int K,
         int s = SM_SAMPLES_PER_STREAM;
         for (int k = 0; k < s; k++) {
             size_t idx = (size_t)k * (len > 1 ? len - 1 : 0) / (s > 1 ? s - 1 : 1);
-            samples[ns++] = S[i].buf[idx].key;
+            /* Sample eh_hash(key) values: the hash is uniformly distributed
+               even when raw keys cluster in just 2-4 top-byte values, giving
+               accurate quantile estimates and balanced thread work.         */
+            samples[ns++] = eh_hash(S[i].buf[idx].key);
         }
     }
     /* Insertion sort on samples (tiny array) */
@@ -1697,11 +1708,19 @@ static void sm_flush_run(SMWorkerState *ws) {
    For n_runs=2, working set drops from 480 MB → 1.9 MB (L2).
    For n=61 ext steps (n_runs=19), drops from 8 GB → 32 MB (L2/L3).    */
 
-/* Top-byte bucket of a key (0..255). */
-static inline int sm_bucket(u64 key) { return (int)(key >> 56); }
+/* Hash-based bucket of a key (0..255).
+   Keys have bits 56-61 always zero and only bits 62-63 varying in the high
+   byte, so raw top-byte extraction gives only 2-4 distinct buckets out of
+   256.  Using eh_hash first mixes all key bits uniformly, producing a
+   near-perfect 256-way split and enabling effective cache reuse in the
+   bucketed merge and balanced work distribution in sm_parallel_merge.
+   eh_hash is bijective, so bucket membership is stable and dedup by original
+   key remains correct.                                                    */
+static inline int sm_bucket(u64 key) { return (int)(eh_hash(key) >> 56); }
 
-/* Binary search: index of first entry in sorted array a[0..n) whose
-   top-byte bucket is >= b.                                              */
+/* Binary search: index of first entry in hash-sorted array a[0..n) whose
+   hash-bucket is >= b.  Since sm_bucket = top byte of eh_hash, and the array
+   is sorted by eh_hash(key), bucket values are monotone non-decreasing.    */
 static size_t sm_bucket_lower(const SMEntry *a, size_t n, int b) {
     size_t lo = 0, hi = n;
     while (lo < hi) {
@@ -1922,16 +1941,15 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     int ext_runs = sm_should_use_ext(ni, n_back, ram_bytes);
 
     /* Capacity for ext_runs backing store per worker.
-       Each flush writes at most CAP entries (after dedup, usually much
-       less).  The maximum data written is n_runs × CAP × 24B, where
-       n_runs = ⌈bpt/CAP⌉.  This is the correct tight bound — using the
-       raw bpt × 24B (pre-dedup) wastes virtual address space and triggers
-       macOS VM overcommit kills for large steps (step 39: 17.7 GB/worker
-       × 6 = 106 GB virtual → OOM on 36 GB machine).                    */
+       Must cover the true worst-case bytes written: all bpt entries before
+       any dedup.  Using n_runs_per_w × CAP underestimates when the actual
+       n_runs exceeds the formula (which happens when CAP is small relative
+       to bpt), causing sm_ext_write to overflow the MAP_ANON region and
+       subsequent reads to return zeros → silent data loss and wrong answers.
+       MAP_ANON allocates physical pages lazily, so this large virtual
+       reservation costs nothing until pages are actually written.         */
     size_t bpt_per_worker  = chunk * ((size_t)1 << n_back);
-    size_t n_runs_per_w    = (bpt_per_worker + SM_WORKER_CAP - 1) / SM_WORKER_CAP;
-    if (n_runs_per_w == 0) n_runs_per_w = 1;
-    size_t ext_cap_bytes   = n_runs_per_w * (size_t)SM_WORKER_CAP * sizeof(SMEntry);
+    size_t ext_cap_bytes   = bpt_per_worker * sizeof(SMEntry);
 
     SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
     SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
