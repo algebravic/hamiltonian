@@ -1426,166 +1426,30 @@ static void smtab_ensure(SMTab *t, size_t needed) {
     t->data = (SMEntry*)realloc(t->data, t->cap * sizeof(SMEntry));
 }
 
-/* ── Parallel SM introduce ───────────────────────────────────────────
-   For large si the sequential radix sort is the dominant bottleneck.
-   rbuf_pass writes 256 interleaved scatter streams across a ≤6 GB output
-   array; the hardware prefetcher on Apple Silicon tracks ~8-16 streams per
-   core, so 256 streams cause DRAM-latency-bound scatter (≈100ns/miss).
-   At si=162M this produces ~25s single-threaded despite high bandwidth.
-
-   Parallel LSD radix sort (one pass):
-     1. P threads count local histograms in parallel (O(n/P) each).
-     2. Sequential global prefix sum (256×P additions, <1µs).
-     3. P threads each scatter their n/P chunk to pre-assigned global
-        positions per bucket (disjoint address ranges, no synchronisation).
-   Thread 0's scatter for bucket b writes to [global_start[b], global_start[b]+cnt[0][b]).
-   Thread t's range starts where thread t-1 ends — provably disjoint. ✓
-
-   Each thread's scatter works on n/P entries → n/P/256 per bucket ≈ 106K
-   entries at step 36 (162M entries, P=6). Independent per-core prefetcher
-   handles 256 streams of 106K entries = 2.5MB each → still beats DRAM alone,
-   and the parallel wall-time is reduced by P×.
-*/
-
-typedef struct {
-    const SMEntry *src; SMEntry *dst;
-    size_t lo, hi; int fs;
-} SMParIntroJob;
-
-static void *sm_par_intro_worker(void *arg) {
-    SMParIntroJob *j = (SMParIntroJob *)arg;
-    for (size_t i = j->lo; i < j->hi; i++) {
-        j->dst[i].key = introduce(j->src[i].key, j->fs);
-        j->dst[i].val = j->src[i].val;
-    }
-    return NULL;
-}
-
-typedef struct {
-    SMEntry *src, *dst;
-    size_t   lo, hi;
-    int      shift;
-    size_t   cnt[256];  /* local histogram (count phase output) */
-    size_t   off[256];  /* scatter-start positions (filled by main thread) */
-} SMParRadJob;
-
-static void *sm_par_rad_count(void *arg) {
-    SMParRadJob *j = (SMParRadJob *)arg;
-    memset(j->cnt, 0, 256 * sizeof(size_t));
-    for (size_t i = j->lo; i < j->hi; i++)
-        j->cnt[(eh_hash(j->src[i].key) >> j->shift) & 0xff]++;
-    return NULL;
-}
-
-static void *sm_par_rad_scatter(void *arg) {
-    SMParRadJob *j = (SMParRadJob *)arg;
-    /* Each thread gets its own RadixBuf (~196 KB) for write-combining.
-       Without this, every entry write to j->dst[pos[b]] causes a random
-       cache-line load across the full output buffer (up to 2.5 GB for
-       si=87M), making the scatter 32× more DRAM-latency-bound than the
-       sequential rbuf_pass which batches 32 entries before each flush.
-       With RadixBuf: we amortise 6 cache-line writes over 32 entries,
-       matching the sequential efficiency while still parallelising.     */
-    RadixBuf *rb = (RadixBuf *)malloc(sizeof(RadixBuf));
-    for (int b = 0; b < 256; b++) { rb->prefix[b] = j->off[b]; rb->cnt[b] = 0; }
-    for (size_t i = j->lo; i < j->hi; i++) {
-        int b = (eh_hash(j->src[i].key) >> j->shift) & 0xff;
-        rb->slots[b][rb->cnt[b]++] = j->src[i];
-        if (rb->cnt[b] == SM_RBUF_SIZE) {
-            memcpy(j->dst + rb->prefix[b], rb->slots[b], SM_RBUF_SIZE * sizeof(SMEntry));
-            rb->prefix[b] += SM_RBUF_SIZE; rb->cnt[b] = 0;
-        }
-    }
-    for (int b = 0; b < 256; b++)
-        if (rb->cnt[b])
-            memcpy(j->dst + rb->prefix[b], rb->slots[b], rb->cnt[b] * sizeof(SMEntry));
-    free(rb);
-    return NULL;
-}
-
-/* Parallel 8-pass LSD radix sort.  Result always ends in 'a' (8 passes = even).
-   Uses P threads for count and scatter phases; prefix sum is sequential (tiny). */
-static void sm_par_radix_sort(SMEntry *a, SMEntry *tmp, size_t n, int P) {
-    if (n < 2) return;
-    if (P <= 1) { sm_radix_sort(a, tmp, n); return; }
-
-    SMParRadJob *jobs = (SMParRadJob *)malloc(P * sizeof(SMParRadJob));
-    pthread_t   *T    = (pthread_t   *)malloc(P * sizeof(pthread_t));
-    size_t chunk = (n + P - 1) / P;
-
-    for (int pass = 0; pass < 8; pass++) {
-        SMEntry *psrc = (pass & 1) ? tmp : a;
-        SMEntry *pdst = (pass & 1) ? a   : tmp;
-        int shift = pass * 8;
-
-        /* Initialise jobs for this pass */
-        for (int t = 0; t < P; t++) {
-            size_t lo = (size_t)t * chunk;
-            size_t hi = lo + chunk < n ? lo + chunk : n;
-            jobs[t].src = psrc; jobs[t].dst = pdst;
-            jobs[t].lo  = lo;   jobs[t].hi  = hi;
-            jobs[t].shift = shift;
-        }
-
-        /* Phase 1: parallel count */
-        for (int t = 0; t < P; t++)
-            pthread_create(&T[t], NULL, sm_par_rad_count, &jobs[t]);
-        for (int t = 0; t < P; t++) pthread_join(T[t], NULL);
-
-        /* Phase 2: sequential global prefix sum + per-thread offsets
-           global_start[b] = number of entries in buckets 0..b-1 (across all threads).
-           Thread t's scatter range in bucket b: [global_start[b] + sum_{s<t} cnt[s][b],
-                                                   global_start[b] + sum_{s<=t} cnt[s][b]).
-           These ranges are contiguous and disjoint within bucket b. */
-        size_t acc = 0;
-        for (int b = 0; b < 256; b++) {
-            size_t g = acc;
-            for (int t = 0; t < P; t++) {
-                jobs[t].off[b] = g;
-                g += jobs[t].cnt[b];
-            }
-            acc = g;
-        }
-
-        /* Phase 3: parallel scatter */
-        for (int t = 0; t < P; t++)
-            pthread_create(&T[t], NULL, sm_par_rad_scatter, &jobs[t]);
-        for (int t = 0; t < P; t++) pthread_join(T[t], NULL);
-    }
-    /* After 8 passes (even), result is in 'a'. ✓ */
-    free(jobs); free(T);
-}
-
 /* ── SM introduce ───────────────────────────────────────────────────── */
 /* After copying src→dst, src->data is no longer read and can serve as
    the radix-sort scratch buffer, eliminating the separate intro_tmp
-   allocation (which was si × 24B = up to 13 GB for n=61 step 39).    */
+   allocation (which was si × 24B = up to 13 GB for n=61 step 39).
+
+   NOTE: a parallel radix sort was tried here and reverted.  The scatter
+   phase is memory-bandwidth-bound, not CPU-bound; adding P threads
+   multiplies memory-controller write pressure by P without increasing
+   bandwidth.  The 4 simultaneous scatter streams saturate the write
+   queues, evict buf/tmp from SLC, and slow subsequent worker flushes
+   by 9× (measured: n=59 step 30 flush 1.1s → 10.6s).  Sequential
+   rbuf_pass with its 196KB RadixBuf fits in one P-core's L2 and issues
+   orderly 768-byte write-combining flushes.  For large si (e.g. 163M
+   at n=61 step 36) the 25s sequential sort is still the best option on
+   this hardware.                                                        */
 static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
-    int P = SM_NTHREADS;
-    size_t n = src->cnt;
-    smtab_ensure(dst, n);
-    dst->cnt = n;
-    if (n == 0) return;
-
-    /* Phase 1: parallel introduce transform (src → dst) */
-    SMParIntroJob *ijobs = (SMParIntroJob *)malloc(P * sizeof(SMParIntroJob));
-    pthread_t     *T     = (pthread_t     *)malloc(P * sizeof(pthread_t));
-    size_t chunk = (n + P - 1) / P;
-    for (int t = 0; t < P; t++) {
-        ijobs[t] = (SMParIntroJob){
-            .src = src->data, .dst = dst->data,
-            .lo  = (size_t)t * chunk,
-            .hi  = ((size_t)t + 1) * chunk < n ? ((size_t)t + 1) * chunk : n,
-            .fs  = fs,
-        };
-        pthread_create(&T[t], NULL, sm_par_intro_worker, &ijobs[t]);
+    smtab_ensure(dst, src->cnt);
+    for (size_t i = 0; i < src->cnt; i++) {
+        dst->data[i].key = introduce(src->data[i].key, fs);
+        dst->data[i].val = src->data[i].val;
     }
-    for (int t = 0; t < P; t++) pthread_join(T[t], NULL);
-    free(ijobs); free(T);
-
-    /* Phase 2: parallel LSD radix sort of dst, using src->data as scratch.
-       src->data is fully consumed by phase 1 and safe to overwrite.      */
-    sm_par_radix_sort(dst->data, (SMEntry *)src->data, n, P);
+    dst->cnt = src->cnt;
+    /* src->data is fully read; cast away const to reuse as sort scratch. */
+    sm_radix_sort(dst->data, (SMEntry *)src->data, dst->cnt);
 }
 
 /* ── SM worker (capped buffer + run accumulation) ───────────────────── */
