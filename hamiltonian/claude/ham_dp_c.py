@@ -1251,6 +1251,126 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
     return op;
 }
 
+/* ── Block-buffered K-way merge with dedup (sm_merge_bb) ───────────────
+   Replaces sm_merge in latency-sensitive paths.  Each SMStream is wrapped
+   in a SM_BB_BUF-entry read buffer:
+
+     sm_bb_fill() reads SM_BB_BUF entries sequentially from the underlying
+     array with a single memcpy — one DRAM round trip, sequential access,
+     hardware-prefetcher-friendly.  The merge loop then reads from blk[]
+     which is L1/L2 resident for SM_BB_BUF≤32.
+
+   Latency model (K streams, n elements total, T_DRAM=100ns):
+     sm_merge:    n × T_DRAM                          (1 miss/element)
+     sm_merge_bb: (n / SM_BB_BUF) × T_DRAM            (1 miss per block)
+   Speedup ≈ SM_BB_BUF = 32×.  On large steps this converts the merge
+   from latency-stall-bound (7% CPU) to bandwidth-bound (80%+ CPU).
+
+   Buffer pool per call:  K × SM_BB_BUF × 24B
+     K=6  (parallel merge):  6×32×24 =  4.6 KB  → L1
+     K=19 (ext merge runs): 19×32×24 = 14.6 KB  → L1
+   Both fit in L1; no heap allocation needed for K≤SM_BB_KSTACK.        */
+
+#define SM_BB_BUF     32   /* block buffer entries per stream              */
+#define SM_BB_KSTACK  32   /* max K to stack-allocate (avoids malloc)      */
+
+typedef struct {
+    const SMEntry *base;   /* pointer into the sorted run/slice            */
+    size_t         pos;    /* next unread index in base[]                  */
+    size_t         len;    /* total entries in base[]                      */
+    SMEntry        blk[SM_BB_BUF]; /* read buffer (in L1 during merge)    */
+    int            bpos;   /* current read position in blk[]               */
+    int            blen;   /* valid entries in blk[]                       */
+} SMBufStr;
+
+static inline void sm_bb_init(SMBufStr *s, const SMEntry *base, size_t len) {
+    s->base = base; s->pos = 0; s->len = len; s->bpos = s->blen = 0;
+}
+
+/* Fill blk[] from the underlying array.  One sequential memcpy per call.  */
+static inline void sm_bb_fill(SMBufStr *s) {
+    size_t rem = s->len - s->pos;
+    int n = (int)(rem < (size_t)SM_BB_BUF ? rem : (size_t)SM_BB_BUF);
+    memcpy(s->blk, s->base + s->pos, (size_t)n * sizeof(SMEntry));
+    s->pos += (size_t)n;
+    s->bpos = 0;
+    s->blen = n;
+}
+
+/* Is stream exhausted?  Triggers a refill if the buffer is empty.
+   Returns 1 (true) only when both buffer and underlying array are empty.  */
+static inline int sm_bb_empty(SMBufStr *s) {
+    if (s->bpos < s->blen) return 0;
+    if (s->pos  >= s->len) return 1;
+    sm_bb_fill(s);
+    return (s->blen == 0);
+}
+
+/* Current key, no side effects (stream must not be empty).               */
+static inline u64 sm_bb_key(const SMBufStr *s) {
+    return s->blk[s->bpos].key;
+}
+
+/* Consume and return current entry (stream must not be empty).           */
+static inline SMEntry sm_bb_pop(SMBufStr *s) {
+    return s->blk[s->bpos++];
+}
+
+/* Block-buffered K-way merge with dedup.  Same interface as sm_merge.    */
+static size_t sm_merge_bb(SMStream *S, int K, SMEntry *out) {
+    /* Stack-allocate for common small K; heap for large K.               */
+    SMBufStr  stk_b[SM_BB_KSTACK];
+    SMHEntry  stk_h[SM_BB_KSTACK];
+    SMBufStr *B = (K <= SM_BB_KSTACK) ? stk_b
+                                       : (SMBufStr*)malloc((size_t)K * sizeof(SMBufStr));
+    SMHEntry *h = (K <= SM_BB_KSTACK) ? stk_h
+                                       : (SMHEntry*)malloc((size_t)K * sizeof(SMHEntry));
+
+    /* Initialise buffered streams and pre-fill first block.              */
+    for (int i = 0; i < K; i++) {
+        sm_bb_init(&B[i], S[i].buf, S[i].len);
+        if (S[i].len > 0) sm_bb_fill(&B[i]);
+    }
+
+    /* Build initial min-heap (compare by eh_hash of raw key).            */
+    int hs = 0;
+    for (int i = 0; i < K; i++)
+        if (!sm_bb_empty(&B[i])) { h[hs].key = sm_bb_key(&B[i]); h[hs].s = i; hs++; }
+    for (int i = hs/2-1; i >= 0; i--) sm_heap_sift(h, hs, i);
+
+    size_t op = 0;
+    while (hs > 0) {
+        int s = h[0].s;
+        SMEntry cur = sm_bb_pop(&B[s]);           /* consume minimum entry */
+
+        /* Advance stream s in the heap.                                  */
+        if (!sm_bb_empty(&B[s])) {
+            h[0].key = sm_bb_key(&B[s]);
+            sm_heap_sift(h, hs, 0);
+        } else {
+            h[0] = h[--hs];
+            if (hs > 0) sm_heap_sift(h, hs, 0);
+        }
+
+        /* Dedup: accumulate values from all streams sharing the same key. */
+        while (hs > 0 && h[0].key == cur.key) {
+            int s2 = h[0].s;
+            cur.val += sm_bb_pop(&B[s2]).val;
+            if (!sm_bb_empty(&B[s2])) {
+                h[0].key = sm_bb_key(&B[s2]);
+                sm_heap_sift(h, hs, 0);
+            } else {
+                h[0] = h[--hs];
+                if (hs > 0) sm_heap_sift(h, hs, 0);
+            }
+        }
+        out[op++] = cur;
+    }
+
+    if (K > SM_BB_KSTACK) { free(B); free(h); }
+    return op;
+}
+
 /* ── Parallel P-way merge via key-range splitting ───────────────────────
    Splits the P sorted input streams into K key ranges, assigns one merge
    thread per range.  Each thread merges its P sub-streams directly into a
@@ -1280,7 +1400,7 @@ typedef struct {
 
 static void *sm_par_merge_thread(void *arg) {
     SMParMergeJob *j = (SMParMergeJob *)arg;
-    j->out_cnt = sm_merge(j->subs, j->P, j->out);
+    j->out_cnt = sm_merge_bb(j->subs, j->P, j->out);
     return NULL;
 }
 
@@ -1312,7 +1432,7 @@ static size_t sm_parallel_merge(SMStream *S, int P, int K,
 
     /* Fall back to single-threaded for small inputs */
     if (K <= 1 || total < SM_PAR_MERGE_THRESH)
-        return sm_merge(S, P, out);
+        return sm_merge_bb(S, P, out);
 
     /* ── Step 1: collect sample keys ──────────────────────────────── */
     int n_samples = P * SM_SAMPLES_PER_STREAM;
@@ -1598,7 +1718,12 @@ static void sm_ext_close(int fd, void *map, size_t capacity_bytes) {
    Peak extra RAM = n_runs × SM_EXT_STREAM_BUF × 24B (e.g. 31 × 24MB = 744MB)
    vs loading all runs simultaneously (e.g. 2.7 GB for step 38).
    Large sequential reads → OS readahead → near-SSD-peak bandwidth.     */
-#define SM_EXT_STREAM_BUF (1024 * 1024)   /* entries per stream buffer = 24MB */
+#define SM_EXT_STREAM_BUF 16384   /* entries per stream buffer = 384 KB.
+   Sized so all stream buffers fit in SLC (12 MB):
+     worst case 20 runs × 384 KB = 7.7 MB < 12 MB SLC.
+   Old value (1 M = 24 MB each) caused 20 × 24 MB = 480 MB of active
+   buffers, all DRAM-resident → every buffer access was a 100 ns miss.
+   New value: buffer entries stay in SLC → ~30-100x lower latency.    */
 
 typedef struct {
     int      fd;
@@ -1846,7 +1971,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
             }
             if (active == 0) continue;
             /* Small N-way merge for this bucket. */
-            write_pos += sm_merge(S, n_runs, out + write_pos);
+            write_pos += sm_merge_bb(S, n_runs, out + write_pos);
         }
 
         free(S); free(bounds);
@@ -2032,6 +2157,10 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     double t_par_merge = now_ms() - t_par0;
 
     if (instrument) {
+        /* Print sm_merge_bb buffer parameters for reference. */
+        fprintf(stderr,
+            "  [inst] merge_bb: SM_BB_BUF=%d SM_EXT_STREAM_BUF=%d\n",
+            SM_BB_BUF, SM_EXT_STREAM_BUF);
         /* Per-worker breakdown */
         double t_compute_max = 0, t_flush_max = 0, t_merge_max = 0;
         for (int i = 0; i < P; i++) {
