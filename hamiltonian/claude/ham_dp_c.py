@@ -2113,11 +2113,17 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
                 lens[i] = cnt;
             }
 
-            /* Free originals using the saved pointers, not arrs[2*i] which
-               may already have been overwritten (i==0 case above).           */
+            /* Free originals via saved pointers (safe against aliasing).
+               Null-out rules:
+                 Final merge (cur_P==2): result is in nxt, so NULL both
+                   input slots unconditionally.
+                 Non-final (else branch): result is in arrs[i].  When i==0,
+                   arrs[i] and arrs[2*i] are the SAME slot — nulling arrs[2*i]
+                   would destroy the result we just stored there.  Skip it.
+                   arrs[2*i+1] is always a distinct slot (2i+1 > i).         */
             free(in_left);
             free(in_right);
-            arrs[2*i]   = NULL;
+            if (cur_P == 2 || i != 0) arrs[2*i] = NULL;
             arrs[2*i+1] = NULL;
         }
 
