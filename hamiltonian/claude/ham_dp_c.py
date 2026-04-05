@@ -1973,7 +1973,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
             }
             if (active == 0) continue;
             /* Small N-way merge for this bucket. */
-            write_pos += sm_merge_bb(S, n_runs, out + write_pos);
+            write_pos += sm_merge(S, n_runs, out + write_pos);
         }
 
         free(S); free(bounds);
