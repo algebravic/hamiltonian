@@ -2086,20 +2086,25 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
             };
             size_t cnt;
 
+            /* Save input pointers BEFORE any assignment to arrs[i].
+               When i==0, arrs[i] and arrs[2*i] are the same slot; assigning
+               arrs[i]=merged would overwrite arrs[0] and then free(arrs[0])
+               would free the result instead of the original input.            */
+            SMEntry *in_left  = arrs[2*i];
+            SMEntry *in_right = arrs[2*i+1];
+
             if (cur_P == 2) {
                 /* Final merge: allocate nxt for exact pair size, not raw_total.
                    This is the key memory saving: nxt = deduped bytes, not raw. */
                 smtab_ensure(nxt, cap + 1);
-                cnt       = sm_merge_bb(S, 2, nxt->data);
-                nxt->cnt  = cnt;
-                /* arrs[0] and arrs[1] freed below; nxt->data is not owned here */
+                cnt      = sm_merge_bb(S, 2, nxt->data);
+                nxt->cnt = cnt;
             } else {
                 SMEntry *merged = (SMEntry*)malloc(cap * sizeof(SMEntry));
                 cnt = sm_merge_bb(S, 2, merged);
-                /* Shrink to actual (deduped) size so later levels don't see
-                   the pessimistic cap allocation still consuming physical pages.
-                   On macOS, realloc to smaller size unmaps the tail via the
-                   libmalloc large-allocation path, returning pages to the OS. */
+                /* Shrink to actual (deduped) size: on macOS the libmalloc
+                   large-allocation path returns physical pages to the OS,
+                   reducing RSS before the next pair is allocated.             */
                 if (cnt < cap) {
                     SMEntry *sh = (SMEntry*)realloc(merged, cnt * sizeof(SMEntry));
                     if (sh) merged = sh;
@@ -2108,8 +2113,12 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
                 lens[i] = cnt;
             }
 
-            free(arrs[2*i]);   arrs[2*i]   = NULL;
-            free(arrs[2*i+1]); arrs[2*i+1] = NULL;
+            /* Free originals using the saved pointers, not arrs[2*i] which
+               may already have been overwritten (i==0 case above).           */
+            free(in_left);
+            free(in_right);
+            arrs[2*i]   = NULL;
+            arrs[2*i+1] = NULL;
         }
 
         /* Carry forward the odd element when cur_P is odd. */
