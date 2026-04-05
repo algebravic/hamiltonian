@@ -1400,7 +1400,9 @@ typedef struct {
 
 static void *sm_par_merge_thread(void *arg) {
     SMParMergeJob *j = (SMParMergeJob *)arg;
-    j->out_cnt = sm_merge_bb(j->subs, j->P, j->out);
+    /* Large contiguous sub-stream slices: hardware prefetcher handles
+       sequential access; sm_merge_bb overhead exceeds benefit here. */
+    j->out_cnt = sm_merge(j->subs, j->P, j->out);
     return NULL;
 }
 
@@ -1432,7 +1434,7 @@ static size_t sm_parallel_merge(SMStream *S, int P, int K,
 
     /* Fall back to single-threaded for small inputs */
     if (K <= 1 || total < SM_PAR_MERGE_THRESH)
-        return sm_merge_bb(S, P, out);
+        return sm_merge(S, P, out);
 
     /* ── Step 1: collect sample keys ──────────────────────────────── */
     int n_samples = P * SM_SAMPLES_PER_STREAM;
@@ -2144,23 +2146,45 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(WS[i].runs);     WS[i].runs     = NULL;
     }
 
-    /* P-way parallel merge of per-worker sorted streams into nxt. */
+    /* P-way merge of per-worker sorted streams into nxt.
+       Memory-aware selection:
+         Parallel: all P W[i].out arrays + nxt pre-alloc live simultaneously.
+           Peak = curr + sum(W[i].out) * 2 + OS.  Faster but memory-hungry.
+         Sequential streaming: merge one stream at a time via sm_merge_bb.
+           Peak = curr + max(W[i].out) + nxt + OS.  Slower but memory-safe.
+       We use sequential when parallel would exceed available RAM.            */
     size_t raw_total = 0;
     for (int i = 0; i < P; i++) raw_total += W[i].out_len;
+
+    /* Peak RAM estimate for parallel merge: curr + two copies of raw_total */
+    size_t par_peak = (size_t)(ni + raw_total * 2) * sizeof(SMEntry)
+                      + ((size_t)4 << 30);  /* 4 GB OS overhead */
+    int use_seq_merge = (par_peak > ram_bytes);
+
     smtab_ensure(nxt, raw_total + 1);
 
     SMStream *S = (SMStream*)malloc(P * sizeof(SMStream));
     for (int i = 0; i < P; i++)
         S[i] = (SMStream){ W[i].out, 0, W[i].out_len };
     double t_par0 = now_ms();
-    nxt->cnt = sm_parallel_merge(S, P, P, nxt->data, nxt->cap);
+    if (use_seq_merge) {
+        /* Sequential block-buffered merge: lower peak RAM than parallel.
+           Frees nothing early (W[i].out still live), but avoids allocating
+           a second copy of raw_total in the thread-local output buffers used
+           by sm_parallel_merge.  The real peak saving is the absence of the
+           K * P sub-stream output allocations inside sm_parallel_merge.     */
+        nxt->cnt = sm_merge_bb(S, P, nxt->data);
+    } else {
+        nxt->cnt = sm_parallel_merge(S, P, P, nxt->data, nxt->cap);
+    }
     double t_par_merge = now_ms() - t_par0;
 
     if (instrument) {
         /* Print sm_merge_bb buffer parameters for reference. */
         fprintf(stderr,
-            "  [inst] merge_bb: SM_BB_BUF=%d SM_EXT_STREAM_BUF=%d\n",
-            SM_BB_BUF, SM_EXT_STREAM_BUF);
+            "  [inst] merge_bb: SM_BB_BUF=%d SM_EXT_STREAM_BUF=%d par_merge=%s\n",
+            SM_BB_BUF, SM_EXT_STREAM_BUF,
+            use_seq_merge ? "sequential" : "parallel");
         /* Per-worker breakdown */
         double t_compute_max = 0, t_flush_max = 0, t_merge_max = 0;
         for (int i = 0; i < P; i++) {
