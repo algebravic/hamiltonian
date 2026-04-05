@@ -2045,6 +2045,93 @@ static void *sm_worker_runs(void *arg) {
     return NULL;
 }
 
+
+/* ── sm_pairwise_merge_into ─────────────────────────────────────────────────
+   Merge P sorted+deduped arrays into nxt using a binary-tree reduction.
+   Each level processes pairs sequentially, freeing inputs immediately and
+   reallocing each result to its actual (deduped) size.
+
+   Memory profile for P=6, step 38 (raw_total=23.7 GB, deduped=12.4 GB):
+
+     Level 0 – three sequential 2-way merges of W pairs:
+       Peak per pair: curr + W_all + T_pair_alloc ≈ 7.7+23.7+7.9+OS = 43.3 GB
+       After each pair: W pair freed, T shrunk to actual size (~4.4 GB)
+       After level 0:   curr + T01+T23+T45 ≈ 7.7+3×4.4+OS = 24.0 GB   ← fits!
+
+     Level 1 – merge T01+T23 → T0123:
+       Peak: curr + T01(4.4) + T23(4.4) + T45(4.4) + T0123(8.8) + OS ≈ 33.7 GB ← fits!
+       After T0123 shrunk to actual: curr + T45(4.4) + T0123(8.3) + OS ≈ 24.1 GB
+
+     Level 2 – final merge T0123+T45 → nxt (smtab_ensure for actual size):
+       Peak: curr + T0123(8.3) + T45(4.4) + nxt(12.4) + OS ≈ 36.8 GB   ← near fit!
+
+   Compare current code: curr + W_all + nxt_for_raw = 59.1 GB peak.
+
+   Correctness: 2-way merge with dedup is associative for aggregation — the
+   same key appearing in multiple input arrays gets its values summed at each
+   merge step, giving the same result as a flat P-way merge.                 */
+static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
+                                    SMTab *nxt) {
+    if (P == 0) { nxt->cnt = 0; return; }
+
+    int cur_P = P;
+    while (cur_P > 1) {
+        int new_P = (cur_P + 1) / 2;
+
+        for (int i = 0; i < cur_P / 2; i++) {
+            size_t cap = lens[2*i] + lens[2*i+1];
+            SMStream S[2] = {
+                { arrs[2*i],   0, lens[2*i]   },
+                { arrs[2*i+1], 0, lens[2*i+1] },
+            };
+            size_t cnt;
+
+            if (cur_P == 2) {
+                /* Final merge: allocate nxt for exact pair size, not raw_total.
+                   This is the key memory saving: nxt = deduped bytes, not raw. */
+                smtab_ensure(nxt, cap + 1);
+                cnt       = sm_merge_bb(S, 2, nxt->data);
+                nxt->cnt  = cnt;
+                /* arrs[0] and arrs[1] freed below; nxt->data is not owned here */
+            } else {
+                SMEntry *merged = (SMEntry*)malloc(cap * sizeof(SMEntry));
+                cnt = sm_merge_bb(S, 2, merged);
+                /* Shrink to actual (deduped) size so later levels don't see
+                   the pessimistic cap allocation still consuming physical pages.
+                   On macOS, realloc to smaller size unmaps the tail via the
+                   libmalloc large-allocation path, returning pages to the OS. */
+                if (cnt < cap) {
+                    SMEntry *sh = (SMEntry*)realloc(merged, cnt * sizeof(SMEntry));
+                    if (sh) merged = sh;
+                }
+                arrs[i] = merged;
+                lens[i] = cnt;
+            }
+
+            free(arrs[2*i]);   arrs[2*i]   = NULL;
+            free(arrs[2*i+1]); arrs[2*i+1] = NULL;
+        }
+
+        /* Carry forward the odd element when cur_P is odd. */
+        if (cur_P & 1) {
+            arrs[new_P - 1] = arrs[cur_P - 1];
+            lens[new_P - 1] = lens[cur_P - 1];
+            arrs[cur_P - 1] = NULL;  /* prevent double-free */
+        }
+        cur_P = new_P;
+    }
+
+    /* cur_P == 1 only when P was 1 to begin with (while loop never ran). */
+    if (arrs[0] != NULL) {
+        smtab_ensure(nxt, lens[0] + 1);
+        nxt->cnt = lens[0];
+        if (arrs[0] != nxt->data)
+            memcpy(nxt->data, arrs[0], lens[0] * sizeof(SMEntry));
+        free(arrs[0]);
+        arrs[0] = NULL;
+    }
+}
+
 /* ── SM fused sweep ─────────────────────────────────────────────────── */
 /* Predict whether run data will exceed available RAM.
    Conservative dedup estimate of 2× (actual is typically 3-6×) ensures
@@ -2146,45 +2233,61 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(WS[i].runs);     WS[i].runs     = NULL;
     }
 
-    /* P-way merge of per-worker sorted streams into nxt.
-       Memory-aware selection:
-         Parallel: all P W[i].out arrays + nxt pre-alloc live simultaneously.
-           Peak = curr + sum(W[i].out) * 2 + OS.  Faster but memory-hungry.
-         Sequential streaming: merge one stream at a time via sm_merge_bb.
-           Peak = curr + max(W[i].out) + nxt + OS.  Slower but memory-safe.
-       We use sequential when parallel would exceed available RAM.            */
+    /* Final merge of P per-worker sorted streams into nxt.
+       Two strategies based on peak RAM estimate:
+
+       Parallel (low memory): sm_parallel_merge using K=P threads.
+         Peak = curr + W_all + nxt_for_raw_total.  Fast but memory-hungry.
+
+       Pairwise binary tree (high memory): sm_pairwise_merge_into.
+         Merges pairs sequentially, freeing each pair's inputs immediately
+         and reallocing intermediates to their actual (deduped) size.
+         Defers smtab_ensure(nxt) to the final level (allocates for the
+         actual pair sizes, not raw_total).
+         Peak ≈ curr + W_all + T_one_pair  (level 0, brief)
+         then: curr + T_level0_deduped + T_level1  (fits in RAM)
+         then: curr + T_final_pair + nxt_exact     (fits in RAM)
+         Slower (sequential 2-way merges) but avoids catastrophic swap.   */
     size_t raw_total = 0;
     for (int i = 0; i < P; i++) raw_total += W[i].out_len;
 
-    /* Peak RAM estimate for parallel merge: curr + two copies of raw_total */
+    /* Peak estimate for parallel: curr + W_all + nxt_for_raw_total + OS */
     size_t par_peak = (size_t)(ni + raw_total * 2) * sizeof(SMEntry)
-                      + ((size_t)4 << 30);  /* 4 GB OS overhead */
-    int use_seq_merge = (par_peak > ram_bytes);
+                      + ((size_t)4 << 30);
+    int use_pairwise = (par_peak > ram_bytes);
 
-    smtab_ensure(nxt, raw_total + 1);
+    /* Transfer W[i].out ownership to local arrays; NULL W[i].out so the
+       cleanup loop's free(W[i].out) becomes a safe no-op.                */
+    SMEntry **pw_arrs = (SMEntry**)malloc((size_t)P * sizeof(SMEntry*));
+    size_t   *pw_lens = (size_t  *)malloc((size_t)P * sizeof(size_t));
+    for (int i = 0; i < P; i++) {
+        pw_arrs[i] = W[i].out; W[i].out = NULL;
+        pw_lens[i] = W[i].out_len;
+    }
 
-    SMStream *S = (SMStream*)malloc(P * sizeof(SMStream));
-    for (int i = 0; i < P; i++)
-        S[i] = (SMStream){ W[i].out, 0, W[i].out_len };
     double t_par0 = now_ms();
-    if (use_seq_merge) {
-        /* Sequential block-buffered merge: lower peak RAM than parallel.
-           Frees nothing early (W[i].out still live), but avoids allocating
-           a second copy of raw_total in the thread-local output buffers used
-           by sm_parallel_merge.  The real peak saving is the absence of the
-           K * P sub-stream output allocations inside sm_parallel_merge.     */
-        nxt->cnt = sm_merge_bb(S, P, nxt->data);
+    if (use_pairwise) {
+        sm_pairwise_merge_into(pw_arrs, pw_lens, P, nxt);
     } else {
+        /* Parallel merge: pre-allocate nxt for raw_total (safe upper bound). */
+        smtab_ensure(nxt, raw_total + 1);
+        SMStream *S = (SMStream*)malloc((size_t)P * sizeof(SMStream));
+        for (int i = 0; i < P; i++)
+            S[i] = (SMStream){ pw_arrs[i], 0, pw_lens[i] };
         nxt->cnt = sm_parallel_merge(S, P, P, nxt->data, nxt->cap);
+        free(S);
+        for (int i = 0; i < P; i++) { free(pw_arrs[i]); pw_arrs[i] = NULL; }
     }
     double t_par_merge = now_ms() - t_par0;
+    free(pw_arrs);
+    free(pw_lens);
 
     if (instrument) {
         /* Print sm_merge_bb buffer parameters for reference. */
         fprintf(stderr,
             "  [inst] merge_bb: SM_BB_BUF=%d SM_EXT_STREAM_BUF=%d par_merge=%s\n",
             SM_BB_BUF, SM_EXT_STREAM_BUF,
-            use_seq_merge ? "sequential" : "parallel");
+            use_pairwise  ? "pairwise"  : "parallel");
         /* Per-worker breakdown */
         double t_compute_max = 0, t_flush_max = 0, t_merge_max = 0;
         for (int i = 0; i < P; i++) {
@@ -2229,7 +2332,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(WS[i].run_lens);  /* NULL if already freed above */
         sm_ext_close(WS[i].run_fd, WS[i].run_map, WS[i].run_capacity);
     }
-    free(S); free(W); free(WS); free(T);
+    free(W); free(WS); free(T);
 }
 
 /* ── Top-level SM entry point ───────────────────────────────────────── */
