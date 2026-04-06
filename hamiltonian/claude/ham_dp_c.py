@@ -1160,7 +1160,6 @@ void count_ham_paths_peh(
 typedef struct { u64 key; u128 val; } SMEntry;
 
 /* ── Buffered 8-bit LSD radix sort ─────────────────────────────────── */
-#define SM_RBUF_SIZE 32
 #define SM_RBUCKETS  256
 
 typedef struct {
@@ -1271,8 +1270,6 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
      K=19 (ext merge runs): 19×32×24 = 14.6 KB  → L1
    Both fit in L1; no heap allocation needed for K≤SM_BB_KSTACK.        */
 
-#define SM_BB_BUF 128   /* M3 Pro tuned */
-#define SM_BB_KSTACK 128
 
 typedef struct {
     const SMEntry *base;   /* pointer into the sorted run/slice            */
@@ -1423,7 +1420,6 @@ static size_t sm_lower_bound(const SMEntry *a, size_t n, u64 target_hash) {
    Falls back to single-threaded sm_merge when K=1 or input is small.
    Writing directly into the caller's buffer avoids the extra 16GB malloc
    that would otherwise coexist with W[i].out and nxt->data at step 39. */
-#define SM_PAR_MERGE_THRESH 50000000  /* use parallel merge above 50M entries */
 #define SM_SAMPLES_PER_STREAM 64
 
 static size_t sm_parallel_merge(SMStream *S, int P, int K,
@@ -1576,7 +1572,7 @@ static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
 
 /* ── SM worker (capped buffer + run accumulation) ───────────────────── */
 #ifndef SM_NTHREADS
-#define SM_NTHREADS 4
+#define SM_NTHREADS 6
 #endif
 
 /* Per-worker buffer cap (entries).  Bounds peak RAM to
@@ -1720,7 +1716,6 @@ static void sm_ext_close(int fd, void *map, size_t capacity_bytes) {
    Peak extra RAM = n_runs × SM_EXT_STREAM_BUF × 24B (e.g. 31 × 24MB = 744MB)
    vs loading all runs simultaneously (e.g. 2.7 GB for step 38).
    Large sequential reads → OS readahead → near-SSD-peak bandwidth.     */
-#define SM_EXT_STREAM_BUF 1024   /* 24KB/stream floor; dynamic formula overrides */
 
 typedef struct {
     int      fd;
@@ -2169,7 +2164,6 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
    reports the correct value.  On M3 Pro: 12582912 (12 MB).
    This constant is used only for the dynamic buffer-size formula.          */
 #ifndef SM_SLC_BYTES
-#  define SM_SLC_BYTES (12582912)   /* 12MB SLC */
 #endif
 
 static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
@@ -2844,12 +2838,54 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
     cap_m = max(8, min(128, cap_bytes // (1024 * 1024)))
     sm_worker_cap = cap_m * 1024 * 1024
 
+    # ── SM buffer tuning constants ───────────────────────────────────────
+    # Load from machine.yaml (written by tune_params.py) if it exists next
+    # to this script; otherwise fall back to analytical defaults.
+    import yaml as _yaml, pathlib as _pl
+    _here = _pl.Path(__file__).parent
+    _yaml_path = _here / "machine.yaml"
+    _tuned = {}
+    if _yaml_path.exists():
+        try:
+            with open(_yaml_path) as _f:
+                _tuned = _yaml.safe_load(_f) or {}
+        except Exception:
+            pass  # silently fall back to defaults
+
+    def _t(key, default):
+        """Return tuned value from YAML or the analytical default."""
+        return int(_tuned.get(key, default))
+
+    # Defaults are derived analytically from hardware geometry.
+    # SM_RBUF_SIZE: fill L2 with RadixBuf (256 buckets × size × 24B ≤ L2)
+    rbuf_default  = 1
+    while (rbuf_default * 2) * 256 * 24 <= l2: rbuf_default *= 2
+    rbuf_default  = min(rbuf_default, 128)   # practical cap
+
+    # SM_BB_BUF: fill L1 with block-merge buffers (P × size × 24B ≤ L1)
+    bb_default    = 1
+    while (bb_default * 2) * n_threads * 24 <= l1d: bb_default *= 2
+    bb_default    = min(bb_default, 512)
+
+    # SM_EXT_STREAM_BUF: floor; dynamic formula in C overrides per step
+    ext_default   = max(256, l3 // (100 * 24))   # rough: 1% of SLC each
+
+    # SM_SLC_BYTES: the SLC (L3) size itself
+    slc_bytes     = l3
+
     return {
-        "EH_BKT_CAP":    bkt_cap,
-        "RSORT_THRESH":  thresh,
-        "RSORT_BITS":    bits,
-        "SM_NTHREADS":   n_threads,
-        "SM_WORKER_CAP": sm_worker_cap,
+        "EH_BKT_CAP":          bkt_cap,
+        "RSORT_THRESH":        thresh,
+        "RSORT_BITS":          bits,
+        "SM_NTHREADS":         _t("SM_NTHREADS",         n_threads),
+        "SM_WORKER_CAP":       _t("SM_WORKER_CAP",       sm_worker_cap),
+        "SM_RBUF_SIZE":        _t("SM_RBUF_SIZE",        rbuf_default),
+        "SM_BB_BUF":           _t("SM_BB_BUF",           bb_default),
+        "SM_BB_KSTACK":        _t("SM_BB_KSTACK",        max(_t("SM_BB_BUF", bb_default), 32)),
+        "SM_EXT_STREAM_BUF":   _t("SM_EXT_STREAM_BUF",  ext_default),
+        "SM_PAR_MERGE_THRESH": _t("SM_PAR_MERGE_THRESH", 50_000_000),
+        "SM_STEAL_FACTOR":     _t("SM_STEAL_FACTOR",     32),
+        "SM_SLC_BYTES":        _t("SM_SLC_BYTES",        slc_bytes),
     }
 
 
