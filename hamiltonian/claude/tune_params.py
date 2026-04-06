@@ -506,6 +506,7 @@ rec = {
     'SM_BB_BUF':         rec_B,
     'SM_BB_KSTACK':      max(rec_B, 32),
     'SM_EXT_STREAM_BUF': rec_C,
+    'SM_SLC_BYTES_MB':   SLC>>20,
 }
 
 print(f"\n{'='*62}")
@@ -522,6 +523,7 @@ print(f"""
   #define SM_BB_KSTACK       {rec['SM_BB_KSTACK']}
   /* Fixed fallback; dynamic formula: SLC_bytes / (P*n_runs*24) */
   #define SM_EXT_STREAM_BUF  {rec['SM_EXT_STREAM_BUF']}
+  #define SM_SLC_BYTES       ({SLC})   /* {SLC>>20}MB */
 """)
 
 DEFS = [
@@ -530,11 +532,12 @@ DEFS = [
     ('SM_RBUF_SIZE',    32),
     ('SM_BB_BUF',       32),
     ('SM_EXT_STREAM_BUF', 16384),
+    ('SM_SLC_BYTES_MB', 12),
 ]
 print("  Changes from ham_dp_c.py defaults:")
 changed = False
 for name, default in DEFS:
-    key   = name.replace('_CAP_M','_CAP')
+    key   = name.replace('_CAP_M','_CAP').replace('_BYTES_MB','_BYTES')
     new   = rec.get(name) or rec.get(name+'_M')
     if new != default:
         changed = True
@@ -561,8 +564,12 @@ if ARGS.output:
          f'#define SM_BB_BUF {rec_B}'),
         (r'#define SM_BB_KSTACK\s+\d+',
          f'#define SM_BB_KSTACK {max(rec_B,32)}'),
-        (r'#define SM_EXT_STREAM_BUF\s+\d+',
-         f'#define SM_EXT_STREAM_BUF {rec_C}'),
+        # Replace ONLY the #define line (\d+ stops before any comment/whitespace)
+        (r'#define SM_EXT_STREAM_BUF\s+\d+[^\n]*',
+         f'#define SM_EXT_STREAM_BUF {rec_C}   /* {rec_C*24//1024}KB/stream floor; dynamic formula overrides */'),
+        # SM_SLC_BYTES: drives the dynamic buffer formula in sm_global_ext_merge
+        (r'#\s+define SM_SLC_BYTES \([^)]+\)[^\n]*',
+         f'#  define SM_SLC_BYTES ({SLC})   /* {SLC>>20}MB SLC */'),
     ]
     done = []
     for pat, repl in patches:
