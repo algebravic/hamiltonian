@@ -2147,6 +2147,168 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
     }
 }
 
+
+/* ── sm_global_ext_merge ────────────────────────────────────────────────────
+   Single-pass K-way merge directly from all P workers' ext (SSD) runs into
+   nxt, bypassing the intermediate W[i].out RAM arrays entirely.
+
+   This is the standard external-sort merge pass, generalised to cover all
+   P workers' runs in one heap operation.
+
+   Memory profile compared to the old two-phase approach
+   (sm_merge_runs → W[i].out → pairwise/parallel merge → nxt):
+
+     Old: curr + W_all + T_pair + OS    e.g. n=61 step 39 → 60 GB → swap
+     New: curr + nxt  + stream_bufs     e.g. n=61 step 39 → 29 GB → no swap
+
+   where stream_bufs = total_streams × SM_EXT_STREAM_BUF × 24B.
+   For step 39: 258 streams × 2978 entries (sized to fill SLC) = 141 MB.
+
+   Per-stream buffer sizing (the Aiken et al. capacity-boundary principle):
+     Optimal buf ≈ SLC_bytes / total_streams / sizeof(SMEntry).
+   We compute this per call so it adapts to the actual run count.
+   Clamped below at SM_EXT_STREAM_BUF (the compile-time lower bound) and
+   above at 1 MB (to avoid excessive malloc overhead for very few streams). */
+
+/* SLC size hint — adjust for your machine.  The tuner (tune_params.py)
+   reports the correct value.  On M3 Pro: 12582912 (12 MB).
+   This constant is used only for the dynamic buffer-size formula.          */
+#ifndef SM_SLC_BYTES
+#  define SM_SLC_BYTES (12 * 1024 * 1024)
+#endif
+
+static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
+                                   SMTab *nxt, size_t raw_total,
+                                   double *t_merge_ms_out) {
+    /* Count total streams and build a flat stream descriptor array. */
+    int total_streams = 0;
+    for (int i = 0; i < P; i++) total_streams += WS[i].n_runs;
+
+    if (total_streams == 0) {
+        smtab_ensure(nxt, 1);
+        nxt->cnt = 0;
+        *t_merge_ms_out = 0;
+        return 0;
+    }
+
+    /* Dynamic per-stream buffer: fill SLC with all stream buffers.
+       Clamped to [SM_EXT_STREAM_BUF, 1M] entries.                          */
+    size_t dyn_buf = (size_t)SM_SLC_BYTES / ((size_t)total_streams * sizeof(SMEntry));
+    if (dyn_buf < (size_t)SM_EXT_STREAM_BUF) dyn_buf = (size_t)SM_EXT_STREAM_BUF;
+    if (dyn_buf > (size_t)(1 << 20))         dyn_buf = (size_t)(1 << 20);
+
+    /* Allocate nxt for raw_total (dedup will shrink actual count).          */
+    smtab_ensure(nxt, raw_total + 1);
+
+    /* Build one SMExtStream per run across all workers.                     */
+    SMExtStream *S = (SMExtStream*)malloc((size_t)total_streams * sizeof(SMExtStream));
+    SMHEntry    *h = (SMHEntry*)  malloc((size_t)total_streams * sizeof(SMHEntry));
+    int si = 0;
+    for (int w = 0; w < P; w++) {
+        size_t file_off = 0;
+        for (int r = 0; r < WS[w].n_runs; r++) {
+            S[si] = (SMExtStream){
+                .fd      = WS[w].run_fd,
+                .map     = WS[w].run_map,
+                .run_off = file_off,
+                .run_len = WS[w].run_lens[r],
+                .run_pos = 0,
+                .buf_len = 0,
+                .buf_pos = 0,
+                .buf     = (SMEntry*)malloc(dyn_buf * sizeof(SMEntry)),
+            };
+            /* Override the global SM_EXT_STREAM_BUF with the dynamic value. */
+            S[si].buf_len = 0;  /* will be filled by refill below */
+            file_off += WS[w].run_lens[r] * sizeof(SMEntry);
+            /* Manual refill using dyn_buf instead of SM_EXT_STREAM_BUF.    */
+            {
+                SMExtStream *s = &S[si];
+                size_t rem = s->run_len - s->run_pos;
+                size_t n   = rem < dyn_buf ? rem : dyn_buf;
+                size_t off = s->run_off + s->run_pos * sizeof(SMEntry);
+                if (s->map)
+                    memcpy(s->buf, (const char*)s->map + off, n * sizeof(SMEntry));
+                else
+                    pread(s->fd, s->buf, n * sizeof(SMEntry), (off_t)off);
+                s->buf_pos = 0; s->buf_len = (size_t)n; s->run_pos += n;
+            }
+            si++;
+        }
+    }
+
+    /* Build initial min-heap.                                               */
+    int hs = 0;
+    for (int i = 0; i < total_streams; i++)
+        if (S[i].buf_len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
+    for (int i = hs/2-1; i >= 0; i--) sm_heap_sift(h, hs, i);
+
+    double t0 = now_ms();
+    size_t op  = 0;
+
+    /* K-way merge with dedup — same logic as the single-worker ext merge.
+       Inline refill uses dyn_buf so SLC-fit is respected.                  */
+    while (hs > 0) {
+        int s_idx = h[0].s;
+        SMEntry cur = S[s_idx].buf[S[s_idx].buf_pos++];
+
+        /* Advance stream s_idx in the heap. */
+        if (S[s_idx].buf_pos < S[s_idx].buf_len) {
+            h[0].key = S[s_idx].buf[S[s_idx].buf_pos].key;
+            sm_heap_sift(h, hs, 0);
+        } else {
+            /* Refill with dyn_buf. */
+            SMExtStream *s = &S[s_idx];
+            if (s->run_pos < s->run_len) {
+                size_t rem = s->run_len - s->run_pos;
+                size_t n   = rem < dyn_buf ? rem : dyn_buf;
+                size_t off = s->run_off + s->run_pos * sizeof(SMEntry);
+                if (s->map) memcpy(s->buf,(const char*)s->map+off,n*sizeof(SMEntry));
+                else pread(s->fd, s->buf, n*sizeof(SMEntry), (off_t)off);
+                s->buf_pos = 0; s->buf_len = n; s->run_pos += n;
+                h[0].key = s->buf[0].key;
+                sm_heap_sift(h, hs, 0);
+            } else {
+                h[0] = h[--hs];
+                if (hs > 0) sm_heap_sift(h, hs, 0);
+            }
+        }
+
+        /* Dedup: accumulate from all streams with the same key.             */
+        while (hs > 0 && h[0].key == cur.key) {
+            int s2 = h[0].s;
+            cur.val += S[s2].buf[S[s2].buf_pos++].val;
+
+            if (S[s2].buf_pos < S[s2].buf_len) {
+                h[0].key = S[s2].buf[S[s2].buf_pos].key;
+                sm_heap_sift(h, hs, 0);
+            } else {
+                SMExtStream *s = &S[s2];
+                if (s->run_pos < s->run_len) {
+                    size_t rem = s->run_len - s->run_pos;
+                    size_t n   = rem < dyn_buf ? rem : dyn_buf;
+                    size_t off = s->run_off + s->run_pos * sizeof(SMEntry);
+                    if (s->map) memcpy(s->buf,(const char*)s->map+off,n*sizeof(SMEntry));
+                    else pread(s->fd, s->buf, n*sizeof(SMEntry), (off_t)off);
+                    s->buf_pos = 0; s->buf_len = n; s->run_pos += n;
+                    h[0].key = s->buf[0].key;
+                    sm_heap_sift(h, hs, 0);
+                } else {
+                    h[0] = h[--hs];
+                    if (hs > 0) sm_heap_sift(h, hs, 0);
+                }
+            }
+        }
+        nxt->data[op++] = cur;
+    }
+
+    *t_merge_ms_out = now_ms() - t0;
+    nxt->cnt = op;
+
+    for (int i = 0; i < total_streams; i++) free(S[i].buf);
+    free(S); free(h);
+    return op;
+}
+
 /* ── SM fused sweep ─────────────────────────────────────────────────── */
 /* Predict whether run data will exceed available RAM.
    Conservative dedup estimate of 2× (actual is typically 3-6×) ensures
@@ -2230,79 +2392,93 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
 
-    /* Sequential sm_merge_runs: one worker at a time.
-       Close each worker's ext backing store immediately after merge_runs
-       so its MAP_ANON physical pages are released before the next worker
-       is processed.  Without this, all 6 workers' run data (27 GB) stays
-       mapped simultaneously, causing OOM at step 39 of n=61.            */
-    double t_merge_runs_total = 0.0;
-    for (int i = 0; i < P; i++) {
-        double tm0 = now_ms();
-        W[i].out = sm_merge_runs(&WS[i], &W[i].out_len);
-        W[i].t_merge_ms = now_ms() - tm0;
-        t_merge_runs_total += W[i].t_merge_ms;
-        /* Free this worker's backing store now — not needed until never. */
-        sm_ext_close(WS[i].run_fd, WS[i].run_map, WS[i].run_capacity);
-        WS[i].run_fd = -1; WS[i].run_map = NULL; WS[i].run_capacity = 0;
-        free(WS[i].run_lens); WS[i].run_lens = NULL;
-        free(WS[i].runs);     WS[i].runs     = NULL;
-    }
-
-    /* Final merge of P per-worker sorted streams into nxt.
-       Two strategies based on peak RAM estimate:
-
-       Parallel (low memory): sm_parallel_merge using K=P threads.
-         Peak = curr + W_all + nxt_for_raw_total.  Fast but memory-hungry.
-
-       Pairwise binary tree (high memory): sm_pairwise_merge_into.
-         Merges pairs sequentially, freeing each pair's inputs immediately
-         and reallocing intermediates to their actual (deduped) size.
-         Defers smtab_ensure(nxt) to the final level (allocates for the
-         actual pair sizes, not raw_total).
-         Peak ≈ curr + W_all + T_one_pair  (level 0, brief)
-         then: curr + T_level0_deduped + T_level1  (fits in RAM)
-         then: curr + T_final_pair + nxt_exact     (fits in RAM)
-         Slower (sequential 2-way merges) but avoids catastrophic swap.   */
+    /* Compute raw_total for pre-allocation and instrumentation. */
     size_t raw_total = 0;
-    for (int i = 0; i < P; i++) raw_total += W[i].out_len;
 
-    /* Peak estimate for parallel: curr + W_all + nxt_for_raw_total + OS */
-    size_t par_peak = (size_t)(ni + raw_total * 2) * sizeof(SMEntry)
-                      + ((size_t)4 << 30);
-    int use_pairwise = (par_peak > ram_bytes);
+    /* ── Merge strategy ─────────────────────────────────────────────────
+       ext_runs path (large steps): sm_global_ext_merge
+         All P workers' runs are already on SSD.  Merge directly from SSD
+         into nxt in a single K-way heap pass; no W[i].out RAM arrays.
+         Peak RAM: curr + nxt + stream_bufs (≈100-200 MB).
+         Contrast with old two-phase (sm_merge_runs → pairwise):
+           Peak RAM: curr + W_all + T_pair → 60 GB at n=61 step 39.
 
-    /* Transfer W[i].out ownership to local arrays; NULL W[i].out so the
-       cleanup loop's free(W[i].out) becomes a safe no-op.                */
-    SMEntry **pw_arrs = (SMEntry**)malloc((size_t)P * sizeof(SMEntry*));
-    size_t   *pw_lens = (size_t  *)malloc((size_t)P * sizeof(size_t));
-    for (int i = 0; i < P; i++) {
-        pw_arrs[i] = W[i].out; W[i].out = NULL;
-        pw_lens[i] = W[i].out_len;
-    }
+       RAM path (small/medium steps): sm_merge_runs (per-worker) then
+         parallel or pairwise merge into nxt, as before.                 */
+    double t_par0, t_par_merge, t_merge_runs_total = 0.0;
+    int use_pairwise = 0;
+    const char *merge_path;
 
-    double t_par0 = now_ms();
-    if (use_pairwise) {
-        sm_pairwise_merge_into(pw_arrs, pw_lens, P, nxt);
+    if (ext_runs) {
+        /* Global ext merge: SSD → nxt directly.
+           Flush any residual buf to ext first (workers already did this
+           in sm_worker_runs, but guard for safety).                      */
+        for (int i = 0; i < P; i++) {
+            if (WS[i].buf_len > 0) sm_flush_run(&WS[i]);
+            for (int r = 0; r < WS[i].n_runs; r++)
+                raw_total += WS[i].run_lens[r];
+        }
+        merge_path = "global_ext";
+        double t_gm = 0;
+        t_par0 = now_ms();
+        sm_global_ext_merge(WS, P, nxt, raw_total, &t_gm);
+        t_par_merge = now_ms() - t_par0;
+
+        /* Release all ext backing stores now that merge is complete.    */
+        for (int i = 0; i < P; i++) {
+            sm_ext_close(WS[i].run_fd, WS[i].run_map, WS[i].run_capacity);
+            WS[i].run_fd = -1; WS[i].run_map = NULL; WS[i].run_capacity = 0;
+            free(WS[i].run_lens); WS[i].run_lens = NULL;
+        }
+
     } else {
-        /* Parallel merge: pre-allocate nxt for raw_total (safe upper bound). */
-        smtab_ensure(nxt, raw_total + 1);
-        SMStream *S = (SMStream*)malloc((size_t)P * sizeof(SMStream));
-        for (int i = 0; i < P; i++)
-            S[i] = (SMStream){ pw_arrs[i], 0, pw_lens[i] };
-        nxt->cnt = sm_parallel_merge(S, P, P, nxt->data, nxt->cap);
-        free(S);
-        for (int i = 0; i < P; i++) { free(pw_arrs[i]); pw_arrs[i] = NULL; }
+        /* RAM path: per-worker merge_runs then final P-way merge. */
+        for (int i = 0; i < P; i++) {
+            double tm0 = now_ms();
+            W[i].out = sm_merge_runs(&WS[i], &W[i].out_len);
+            W[i].t_merge_ms = now_ms() - tm0;
+            t_merge_runs_total += W[i].t_merge_ms;
+            free(WS[i].runs); WS[i].runs = NULL;
+        }
+        for (int i = 0; i < P; i++) raw_total += W[i].out_len;
+
+        /* Peak estimate for parallel: curr + W_all + nxt_raw + OS */
+        size_t par_peak = (size_t)(ni + raw_total * 2) * sizeof(SMEntry)
+                          + ((size_t)4 << 30);
+        use_pairwise = (par_peak > ram_bytes);
+
+        SMEntry **pw_arrs = (SMEntry**)malloc((size_t)P * sizeof(SMEntry*));
+        size_t   *pw_lens = (size_t  *)malloc((size_t)P * sizeof(size_t));
+        for (int i = 0; i < P; i++) {
+            pw_arrs[i] = W[i].out; W[i].out = NULL;
+            pw_lens[i] = W[i].out_len;
+        }
+
+        t_par0 = now_ms();
+        if (use_pairwise) {
+            merge_path = "pairwise";
+            sm_pairwise_merge_into(pw_arrs, pw_lens, P, nxt);
+        } else {
+            merge_path = "parallel";
+            smtab_ensure(nxt, raw_total + 1);
+            SMStream *S = (SMStream*)malloc((size_t)P * sizeof(SMStream));
+            for (int i = 0; i < P; i++)
+                S[i] = (SMStream){ pw_arrs[i], 0, pw_lens[i] };
+            nxt->cnt = sm_parallel_merge(S, P, P, nxt->data, nxt->cap);
+            free(S);
+            for (int i = 0; i < P; i++) { free(pw_arrs[i]); pw_arrs[i] = NULL; }
+        }
+        t_par_merge = now_ms() - t_par0;
+        free(pw_arrs);
+        free(pw_lens);
     }
-    double t_par_merge = now_ms() - t_par0;
-    free(pw_arrs);
-    free(pw_lens);
 
     if (instrument) {
         /* Print sm_merge_bb buffer parameters for reference. */
         fprintf(stderr,
             "  [inst] merge_bb: SM_BB_BUF=%d SM_EXT_STREAM_BUF=%d par_merge=%s\n",
             SM_BB_BUF, SM_EXT_STREAM_BUF,
-            use_pairwise  ? "pairwise"  : "parallel");
+            merge_path);
         /* Per-worker breakdown */
         double t_compute_max = 0, t_flush_max = 0, t_merge_max = 0;
         for (int i = 0; i < P; i++) {
@@ -2325,7 +2501,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             "par_merge: %.0fms\n"
             "  [inst]   raw_out=%zuM  deduped=%zuM  dedup=%.1fx\n"
             "  [inst]   worker details (compute / flush / merge_runs / n_runs / out):\n",
-            step, n_back, ext_runs, WS[0].n_runs,
+            step, n_back, ext_runs,
+            ext_runs ? (int)(raw_total / (SM_WORKER_CAP/2)) : WS[0].n_runs,
             t_compute_max, t_wall_compute/P,
             t_flush_max,   t_wall_flush/P,
             t_merge_runs_total, t_merge_max,
