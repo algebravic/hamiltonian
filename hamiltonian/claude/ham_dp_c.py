@@ -2839,18 +2839,29 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
     sm_worker_cap = cap_m * 1024 * 1024
 
     # ── SM buffer tuning constants ───────────────────────────────────────
-    # Load from machine.yaml (written by tune_params.py) if it exists next
-    # to this script; otherwise fall back to analytical defaults.
+    # Load from machine.yaml (written by tune_params.py).
+    # Search order:
+    #   1. _MACHINE_YAML_PATH if set via set_machine_yaml() / --machine-yaml
+    #   2. machine.yaml next to this script
+    #   3. machine.yaml in the current working directory
+    # Falls back to analytical defaults if no file is found.
     import yaml as _yaml, pathlib as _pl
     _here = _pl.Path(__file__).parent
-    _yaml_path = _here / "machine.yaml"
+    _candidates = []
+    if _MACHINE_YAML_PATH is not None:
+        _candidates.append(_pl.Path(_MACHINE_YAML_PATH))
+    _candidates.append(_here / "machine.yaml")
+    _candidates.append(_pl.Path.cwd() / "machine.yaml")
     _tuned = {}
-    if _yaml_path.exists():
-        try:
-            with open(_yaml_path) as _f:
-                _tuned = _yaml.safe_load(_f) or {}
-        except Exception:
-            pass  # silently fall back to defaults
+    for _yaml_path in _candidates:
+        if _yaml_path.exists():
+            try:
+                with open(_yaml_path) as _f:
+                    _tuned = _yaml.safe_load(_f) or {}
+                if _tuned:
+                    break   # use first file that loads non-empty
+            except Exception:
+                pass  # try next candidate
 
     def _t(key, default):
         """Return tuned value from YAML or the analytical default."""
@@ -2890,6 +2901,30 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Optional path to machine.yaml (set via set_machine_yaml() before first use,
+# or via the --machine-yaml CLI flag in the calling script).
+# None → search for machine.yaml next to this file, then current directory.
+_MACHINE_YAML_PATH: str | None = None
+
+def set_machine_yaml(path: str | None) -> None:
+    """Override the machine.yaml path used by _derive_build_constants.
+
+    Call this before any DP function if you want to use a non-default
+    machine configuration file (e.g. machine_m3pro.yaml vs machine_m3.yaml).
+    Clears the compiled-library cache so the next call recompiles with the
+    new constants.
+
+    Parameters
+    ----------
+    path : str or None
+        Absolute or relative path to a YAML file produced by tune_params.py.
+        None resets to the default search (machine.yaml next to this file,
+        then current directory).
+    """
+    global _MACHINE_YAML_PATH, _LIB_CACHE
+    _MACHINE_YAML_PATH = path
+    _LIB_CACHE = {}   # force recompile with new constants
+
 _LIB_CACHE: dict = {}
 
 def _get_lib():

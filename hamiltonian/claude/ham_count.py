@@ -435,6 +435,8 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
 
 def main():
     args = parse_args()
+    # Apply machine-yaml override before the C library is compiled.
+    set_machine_yaml(getattr(args, 'machine_yaml', None))
     use_pw = not args.no_pw
 
     print("# Compiling C library …", flush=True)
