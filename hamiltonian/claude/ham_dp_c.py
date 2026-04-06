@@ -1271,8 +1271,8 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
      K=19 (ext merge runs): 19×32×24 = 14.6 KB  → L1
    Both fit in L1; no heap allocation needed for K≤SM_BB_KSTACK.        */
 
-#define SM_BB_BUF     16   /* M3 Pro tuned */
-#define SM_BB_KSTACK  32
+#define SM_BB_BUF 128   /* M3 Pro tuned */
+#define SM_BB_KSTACK 128
 
 typedef struct {
     const SMEntry *base;   /* pointer into the sorted run/slice            */
@@ -1576,7 +1576,7 @@ static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
 
 /* ── SM worker (capped buffer + run accumulation) ───────────────────── */
 #ifndef SM_NTHREADS
-#define SM_NTHREADS 6
+#define SM_NTHREADS 4
 #endif
 
 /* Per-worker buffer cap (entries).  Bounds peak RAM to
@@ -2169,7 +2169,7 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
    reports the correct value.  On M3 Pro: 12582912 (12 MB).
    This constant is used only for the dynamic buffer-size formula.          */
 #ifndef SM_SLC_BYTES
-#  define SM_SLC_BYTES (12 * 1024 * 1024)   /* M3 Pro 12MB SLC */
+#  define SM_SLC_BYTES (12582912)   /* 12MB SLC */
 #endif
 
 static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
