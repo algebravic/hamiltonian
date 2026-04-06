@@ -549,33 +549,39 @@ if not changed:
 # Patch file
 # ─────────────────────────────────────────────────────────────────────────────
 if ARGS.output:
-    print(f"\n{'='*62}")
-    print(f"Patching {ARGS.output}")
-    print(f"{'='*62}")
-    with open(ARGS.output) as f: src = f.read()
-    patches = [
-        (r'#define SM_NTHREADS\s+\d+',
-         f'#define SM_NTHREADS {rec_D}'),
-        (r'#define SM_WORKER_CAP\s+\([^)]+\)',
-         f'#define SM_WORKER_CAP ({cap_p2>>20} * 1024 * 1024)'),
-        (r'#define SM_RBUF_SIZE\s+\d+',
-         f'#define SM_RBUF_SIZE {rec_A}'),
-        (r'#define SM_BB_BUF\s+\d+',
-         f'#define SM_BB_BUF {rec_B}'),
-        (r'#define SM_BB_KSTACK\s+\d+',
-         f'#define SM_BB_KSTACK {max(rec_B,32)}'),
-        # Replace ONLY the #define line (\d+ stops before any comment/whitespace)
-        (r'#define SM_EXT_STREAM_BUF\s+\d+[^\n]*',
-         f'#define SM_EXT_STREAM_BUF {rec_C}   /* {rec_C*24//1024}KB/stream floor; dynamic formula overrides */'),
-        # SM_SLC_BYTES: drives the dynamic buffer formula in sm_global_ext_merge
-        (r'#\s+define SM_SLC_BYTES \([^)]+\)[^\n]*',
-         f'#  define SM_SLC_BYTES ({SLC})   /* {SLC>>20}MB SLC */'),
-    ]
-    done = []
-    for pat, repl in patches:
-        new_src, n = re.subn(pat, repl, src)
-        if n: done.append(repl.split()[1]); src = new_src
-    with open(ARGS.output,'w') as f: f.write(src)
-    print(f"  Patched {len(done)} defines: {', '.join(done)}")
+    # Write machine.yaml next to the specified file (or current dir).
+    import pathlib, yaml as _yaml
+    out_dir  = pathlib.Path(ARGS.output).parent
+    yaml_path = out_dir / "machine.yaml"
+    yaml_data = {
+        # Tuning constants: written by tune_params.py, read by _derive_build_constants.
+        # All SM_ values are passed to gcc via -D flags; none are hardcoded in C.
+        "SM_NTHREADS":         rec_D,
+        "SM_WORKER_CAP":       cap_p2,            # entries (not MB)
+        "SM_RBUF_SIZE":        rec_A,
+        "SM_BB_BUF":           rec_B,
+        "SM_BB_KSTACK":        max(rec_B, 32),
+        "SM_EXT_STREAM_BUF":   rec_C,
+        "SM_SLC_BYTES":        SLC,               # bytes
+        "SM_PAR_MERGE_THRESH": 50_000_000,
+        "SM_STEAL_FACTOR":     32,
+        # Hardware info (informational; not used by build)
+        "_cpu":    CPU[:60],
+        "_ram_gb": RAM >> 30,
+        "_l1_kb":  L1  >> 10,
+        "_l2_kb":  L2  >> 10,
+        "_slc_mb": SLC >> 20,
+    }
+    with open(yaml_path, "w") as _f:
+        _yaml.dump(yaml_data, _f, default_flow_style=False, sort_keys=True)
+    print(f"\n" + "="*62)
+    print(f"Wrote {yaml_path}")
+    print("="*62)
+    for k, v in yaml_data.items():
+        if not k.startswith("_"):
+            print(f"  {k:<24} = {v}")
+    print()
+    print("  ham_dp_c.py will pick up these values automatically at")
+    print("  next build (no patching of C source needed).")
 
 print("\nDone.")
