@@ -1160,7 +1160,7 @@ void count_ham_paths_peh(
 typedef struct { u64 key; u128 val; } SMEntry;
 
 /* ── Buffered 8-bit LSD radix sort ─────────────────────────────────── */
-#define SM_RBUF_SIZE  32
+#define SM_RBUF_SIZE 32
 #define SM_RBUCKETS  256
 
 typedef struct {
@@ -1271,8 +1271,8 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
      K=19 (ext merge runs): 19×32×24 = 14.6 KB  → L1
    Both fit in L1; no heap allocation needed for K≤SM_BB_KSTACK.        */
 
-#define SM_BB_BUF     32   /* block buffer entries per stream              */
-#define SM_BB_KSTACK  32   /* max K to stack-allocate (avoids malloc)      */
+#define SM_BB_BUF     16   /* M3 Pro tuned */
+#define SM_BB_KSTACK  32
 
 typedef struct {
     const SMEntry *base;   /* pointer into the sorted run/slice            */
@@ -1583,7 +1583,7 @@ static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
    curr + P * 2 * SM_WORKER_CAP * 24B regardless of state count.
    32M entries = 768 MB per worker buf; total 6*2*768MB = 9.2 GB.       */
 #ifndef SM_WORKER_CAP
-#define SM_WORKER_CAP (32 * 1024 * 1024)
+#define SM_WORKER_CAP (16 * 1024 * 1024)
 #endif
 
 typedef struct { SMEntry *data; size_t len; } SMRun;
@@ -1720,12 +1720,7 @@ static void sm_ext_close(int fd, void *map, size_t capacity_bytes) {
    Peak extra RAM = n_runs × SM_EXT_STREAM_BUF × 24B (e.g. 31 × 24MB = 744MB)
    vs loading all runs simultaneously (e.g. 2.7 GB for step 38).
    Large sequential reads → OS readahead → near-SSD-peak bandwidth.     */
-#define SM_EXT_STREAM_BUF 16384   /* entries per stream buffer = 384 KB.
-   Sized so all stream buffers fit in SLC (12 MB):
-     worst case 20 runs × 384 KB = 7.7 MB < 12 MB SLC.
-   Old value (1 M = 24 MB each) caused 20 × 24 MB = 480 MB of active
-   buffers, all DRAM-resident → every buffer access was a 100 ns miss.
-   New value: buffer entries stay in SLC → ~30-100x lower latency.    */
+#define SM_EXT_STREAM_BUF 1024   /* 24KB/stream floor; dynamic formula overrides */
 
 typedef struct {
     int      fd;
@@ -2174,7 +2169,7 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
    reports the correct value.  On M3 Pro: 12582912 (12 MB).
    This constant is used only for the dynamic buffer-size formula.          */
 #ifndef SM_SLC_BYTES
-#  define SM_SLC_BYTES (12 * 1024 * 1024)
+#  define SM_SLC_BYTES (12 * 1024 * 1024)   /* M3 Pro 12MB SLC */
 #endif
 
 static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
