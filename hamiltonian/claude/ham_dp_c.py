@@ -2861,13 +2861,14 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
     _candidates.append(_here / "machine.yaml")
     _candidates.append(_pl.Path.cwd() / "machine.yaml")
     _tuned = {}
+    _yaml_used = None
     for _yaml_path in _candidates:
         if _yaml_path.exists():
             try:
                 with open(_yaml_path) as _f:
                     _tuned = _yaml.safe_load(_f) or {}
                 if _tuned:
-                    print(f"Used {_f} for parameters.")
+                    _yaml_used = _yaml_path
                     break   # use first file that loads non-empty
             except Exception:
                 pass  # try next candidate
@@ -2954,6 +2955,20 @@ def _get_lib():
     so_path = os.path.join(build_dir, "ham_dp.so")
 
     if not os.path.exists(so_path):
+        # Report which machine.yaml was used (or that defaults were applied)
+        # Re-derive just to get _yaml_used; _derive_build_constants already ran above
+        import pathlib as _pl2
+        _here2 = _pl2.Path(__file__).parent
+        _cands2 = []
+        if _MACHINE_YAML_PATH is not None:
+            _cands2.append(_pl2.Path(_MACHINE_YAML_PATH))
+        _cands2.append(_here2 / "machine.yaml")
+        _cands2.append(_pl2.Path.cwd() / "machine.yaml")
+        _yaml_report = next((str(p) for p in _cands2 if p.exists()), None)
+        if _yaml_report:
+            print(f"# machine.yaml: {_yaml_report}", flush=True)
+        else:
+            print("# machine.yaml: not found — using analytical defaults", flush=True)
         with open(c_path, "w") as f:
             f.write(C_SOURCE)
         d_flags = [f"-D{k}={v}" for k, v in consts.items()]
@@ -3266,7 +3281,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):
