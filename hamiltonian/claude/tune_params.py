@@ -466,7 +466,11 @@ print("  The efficiency threshold is intentionally NOT used to override P_CORES"
 print("  because short benchmark runs are too noisy (scheduling jitter, thermal")
 print("  state, E-core interference) to reliably distinguish 2 from 4 threads.")
 
-max_t = min(P_CORES+E_CORES, 16)
+# Cap benchmark at 32 threads: enough to see scaling behaviour on any machine,
+# avoids multi-minute runs on 192-core servers, and prevents index overflow.
+# P_CORES may exceed this on large Linux boxes (e.g. 96 or 192 cores).
+bench_cap = 32
+max_t = min(P_CORES + E_CORES, bench_cap)
 wpp   = 5_000_000 if not QUICK else 1_000_000
 # Run benchmark 3 times and take the best to reduce jitter
 tputs = ffi.new(f'double[{max_t}]')
@@ -485,18 +489,26 @@ for nt in range(1, max_t+1):
     is_p = (nt <= P_CORES)
     mk  = ' (P-core)' if is_p else ' (E-core)'
     print(f"  {nt:>8}  {t/1e6:>8.1f}  {sp:>8.2f}x  {eff:>9.0f}%{mk}")
+if P_CORES > max_t:
+    print(f"  (benchmark capped at {max_t} threads; {P_CORES} P-cores detected)")
 
 # Primary recommendation: all P-cores.
-# Only reduce if the benchmark shows negative scaling (pathological case,
-# e.g. NUMA or heavily hyperthreaded machine where P_CORES is overcounted).
+# Only reduce if the benchmark (within bench_cap) shows the throughput
+# curve has already peaked — i.e. NUMA effects or hyperthreading overhead
+# dominate before we reach bench_cap.
+best_bench = max(range(max_t), key=lambda i: best_tputs[i]) + 1  # 1-indexed
+# Extrapolate: if scaling is still positive at bench_cap, assume all P-cores
+# are useful (common on large workstations and servers with good NUMA locality).
+still_scaling = (best_bench == max_t)
 rec_D = P_CORES
-best_P = max(range(1, P_CORES+1), key=lambda n: best_tputs[n-1])
-if best_P < P_CORES:
-    print(f"\n  ⚠  Benchmark peak at {best_P} threads < P_CORES ({P_CORES}).")
-    print(f"     This may indicate thermal throttling or OS detection error.")
-    print(f"     Using P_CORES={P_CORES}; override manually in machine.yaml if needed.")
+if not still_scaling and best_bench < min(P_CORES, max_t):
+    # Throughput peaked before the benchmark ceiling — real saturation
+    print(f"\n  ⚠  Throughput peaked at {best_bench} threads (before cap of {max_t}).")
+    print(f"     This may indicate NUMA effects or SMT overhead.")
+    print(f"     Using P_CORES={P_CORES}; override SM_NTHREADS in machine.yaml if needed.")
 print(f"\n  OS-reported P-cores: {P_CORES}  E-cores: {E_CORES}")
-print(f"  Benchmark peak:      {best_P} threads")
+print(f"  Benchmark peak (within {max_t}): {best_bench} threads"
+      + ("  (still scaling at cap)" if still_scaling else ""))
 print(f"  → Recommended SM_NTHREADS = {rec_D}  (= P_CORES, hardware-defined)")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +525,7 @@ avail = RAM - OS_MARGIN - int(0.4*RAM)
 cap_max = avail // (rec_D * 2 * ENTRY)
 cap_p2  = 1
 while cap_p2*2 <= cap_max: cap_p2 *= 2
-cap_p2  = max(4<<20, cap_p2)
+cap_p2  = max(4<<20, min(256<<20, cap_p2))  # clamp [4M, 256M] entries
 
 print(f"\n  RAM={RAM>>30}GB, P={rec_D}, OS+margin={OS_MARGIN>>30}GB")
 print(f"  Budget for worker bufs ≈ {avail>>30}GB")
