@@ -2867,6 +2867,7 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
                 with open(_yaml_path) as _f:
                     _tuned = _yaml.safe_load(_f) or {}
                 if _tuned:
+                    print(f"Used {_f} for parameters.")
                     break   # use first file that loads non-empty
             except Exception:
                 pass  # try next candidate
