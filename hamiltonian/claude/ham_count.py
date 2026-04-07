@@ -303,8 +303,12 @@ def parse_args():
                         "Higher values reduce memory usage at the cost of more "
                         "hash probes per insert.  85 is recommended on machines "
                         "where peak two-table memory exceeds available RAM.")
-    p.add_argument("--machine-yaml", type=str, default=None,
-                   help="YAML file describing parameters for the current machine")
+    p.add_argument("--machine-yaml", default=None, metavar="PATH",
+                   help="Path to machine.yaml produced by tune_params.py "
+                        "(e.g. machine_m3pro.yaml). Overrides the default "
+                        "search: (1) machine.yaml next to ham_dp_c.py, "
+                        "(2) machine.yaml in the current directory. "
+                        "The C library recompiles automatically if constants change.")
     return p.parse_args()
 
 
