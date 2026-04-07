@@ -2558,7 +2558,15 @@ void count_ham_paths_sm(
            being read).  After this, curr->data holds garbage but its
            allocation is still live; we free it before launching workers
            so it doesn't contribute to peak memory during the sweep.    */
-        smtab_ensure(nxt, curr->cnt);  /* grow nxt if needed before introduce */
+        /* Free nxt->data before growing it to avoid a realloc peak of
+           curr + old_nxt + new_nxt simultaneously.  At step 39 (n=61):
+             curr=15.1GB  old_nxt=12.4GB  new_nxt=15.1GB  → 46.6GB → swap
+           After this free, smtab_ensure does a fresh malloc (not realloc):
+             curr=15.1GB  new_nxt=15.1GB  → 34.2GB → fits in 36GB.
+           smtab_ensure handles data==NULL by calling malloc instead of
+           realloc, so the free here is always safe.                        */
+        free(nxt->data); nxt->data = NULL; nxt->cap = 0;
+        smtab_ensure(nxt, curr->cnt);
         double t_intro0 = now_ms();
         sm_introduce(curr, nxt, fs);
         double t_intro_ms = now_ms() - t_intro0;

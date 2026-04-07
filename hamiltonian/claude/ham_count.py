@@ -57,7 +57,7 @@ from math import isqrt
 
 import networkx as nx
 
-from .ham_dp_c import count_hamiltonian_paths_c, count_hamiltonian_paths_sm, _get_lib
+from .ham_dp_c import count_hamiltonian_paths_c, count_hamiltonian_paths_sm, _get_lib, set_machine_yaml
 from .ham_ordering import build_graph, best_bfs_order, frontier_stats, sa_refine_order, best_multistart_order, validate_multistart_orders
 
 
