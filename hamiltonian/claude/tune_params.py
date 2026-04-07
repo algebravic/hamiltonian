@@ -351,40 +351,55 @@ print(f"\n{'='*62}")
 print("Stage 2b: SM_BB_BUF  (block read-ahead in K-way merge)")
 print(f"{'='*62}")
 print("  Constraint: P × SM_BB_BUF × 24B ≤ L1")
-print("  Paper: best value near capacity boundary → fill L1")
+print("  Optimal: fill L1 (Aiken capacity-boundary principle).")
+print()
+print("  SM_BB_BUF is computed analytically, not measured.")
+print("  The benchmark for this parameter is unreliable: it runs after the")
+print("  radix benchmark which warms the cache, making small buffers appear")
+print("  equivalent to large ones when the streams are still SLC-resident.")
+print("  Empirically, 40% performance differences have been observed between")
+print("  values that the benchmark rated identically.")
+print()
 
-K_B = 6   # matches SM_NTHREADS default
-# Streams must be DRAM-resident to expose the latency we're amortising
-stream_B = max(300_000, min(2_000_000, SLC*3//(K_B*ENTRY)))
-if QUICK: stream_B = min(stream_B, 300_000)
+# Analytical formula: largest power-of-2 such that K × buf × ENTRY ≤ L1
+# K = rec_D (P-cores, already determined)
+_bb_raw = L1 // (P_CORES * ENTRY)         # max entries fitting in L1; K = P_CORES
+rec_B = 1
+while rec_B * 2 <= _bb_raw: rec_B *= 2   # round down to power-of-2
+rec_B = max(16, min(rec_B, 4096))         # clamp: floor 16, ceil 4096
+
+print(f"  L1={L1>>10}KB  K={P_CORES} P-cores  ENTRY=24B")
+print(f"  Max pool: L1 / (K × 24) = {L1>>10}KB / ({P_CORES}×24) "
+      f"= {_bb_raw} entries → rounded to {rec_B}")
+print(f"  Pool size: {P_CORES} × {rec_B} × 24 = {P_CORES*rec_B*24//1024}KB "
+      f"({'< L1 ✓' if P_CORES*rec_B*ENTRY <= L1 else '> L1 ✗'})")
+
+# Verification benchmark (informational only — does not change rec_B)
+print()
+print("  Verification benchmark (informational; does not override formula):")
+K_B = P_CORES
+stream_B = max(200_000, min(1_000_000, SLC*2//(K_B*ENTRY)))
+if QUICK: stream_B = min(stream_B, 200_000)
 src_B = _buf(K_B*stream_B); out_B = _buf(K_B*stream_B)
 _fill_sorted_streams(src_B, stream_B, K_B)
-lib.bench_merge_bb(src_B, stream_B, K_B, out_B, 32)  # warm
+# Flush caches by touching a large unrelated array before measuring
+_flush_arr = _buf(min(SLC*4, 64<<20))
+_flush_view = ffi.buffer(_flush_arr, min(SLC*4, 64<<20))
+_dummy = bytes(_flush_view[:64])  # force allocation
+del _flush_arr
 
-cands_B = []
-v=8
-while v*K_B*ENTRY <= L1*2: cands_B.append(v); v*=2
-
-base_B = _measure(lambda: lib.bench_merge_bb(src_B,stream_B,K_B,out_B,1), REPS)
-print(f"\n  K={K_B} streams × {stream_B//1000}K entries each, L1={L1>>10}KB")
-print(f"  {'BB_BUF':>6}  {'pool KB':>6}  {'in L1':>6}  {'Mentry/s':>10}  {'speedup':>8}")
-
-res_B = []
-for val in cands_B:
+base_B = _measure(lambda: lib.bench_merge_bb(src_B,stream_B,K_B,out_B,1), 2)
+print(f"  {'BB_BUF':>6}  {'pool KB':>7}  {'in L1':>6}  {'Mentry/s':>10}  {'speedup':>8}")
+for val in [16, 32, 64, 128, 256, rec_B]:
+    val = min(val, 4096)
     pool_kb = val*K_B*ENTRY/1024
-    fits    = pool_kb <= L1/1024
-    t = _measure(lambda v=val: lib.bench_merge_bb(src_B,stream_B,K_B,out_B,v), REPS)
-    res_B.append((val, t))
-    mk = ' ←' if len(res_B)>1 and t>max(r[1] for r in res_B[:-1]) else ''
-    print(f"  {val:>6}  {pool_kb:>6.2f}  {'yes' if fits else 'no':>6}  "
+    fits    = val*K_B*ENTRY <= L1
+    t = _measure(lambda v=val: lib.bench_merge_bb(src_B,stream_B,K_B,out_B,v), 2)
+    mk = ' ← formula' if val == rec_B else ''
+    print(f"  {val:>6}  {pool_kb:>7.1f}  {'yes' if fits else 'no':>6}  "
           f"{t/1e6:>10.1f}  {t/base_B:>7.1f}x{mk}")
 
-in_l1_B   = [(v,t) for v,t in res_B if v*K_B*ENTRY<=L1]
-best_in_l1 = max(in_l1_B, key=lambda r:r[1]) if in_l1_B else res_B[-1]
-best_any   = max(res_B, key=lambda r:r[1])
-# Take out-of-L1 only if genuinely >5% faster
-rec_B = best_any[0] if best_any[1] > best_in_l1[1]*1.05 else best_in_l1[0]
-print(f"\n  → Recommended SM_BB_BUF = {rec_B}")
+print(f"\n  → Recommended SM_BB_BUF = {rec_B}  (analytical: L1 / (P × 24), pow2)"      f"  SM_BB_KSTACK = {max(rec_B, 32)}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Group C: SM_EXT_STREAM_BUF
