@@ -1,3 +1,4 @@
 /poetry.lock
 /hamiltonian/__pycache__/
 /hamiltonian/claude/machine.yaml
+*.yaml
