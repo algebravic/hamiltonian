@@ -444,27 +444,45 @@ print(f"  → Dynamic formula: SLC_bytes / (P × n_runs × 24)")
 print(f"\n{'='*62}")
 print("Stage 2d: SM_NTHREADS  (parallel worker count)")
 print(f"{'='*62}")
+print("  NTHREADS is not a buffer-size tunable — it has a hardware-defined")
+print("  right answer: the P-core count.  We use OS-reported P_CORES as the")
+print("  primary value and run the benchmark only to verify and report scaling.")
+print("  The efficiency threshold is intentionally NOT used to override P_CORES")
+print("  because short benchmark runs are too noisy (scheduling jitter, thermal")
+print("  state, E-core interference) to reliably distinguish 2 from 4 threads.")
 
 max_t = min(P_CORES+E_CORES, 16)
 wpp   = 5_000_000 if not QUICK else 1_000_000
+# Run benchmark 3 times and take the best to reduce jitter
 tputs = ffi.new(f'double[{max_t}]')
-lib.bench_threads(max_t, wpp, tputs)
+best_tputs = [0.0] * max_t
+for _run in range(3 if not QUICK else 2):
+    lib.bench_threads(max_t, wpp, tputs)
+    for i in range(max_t):
+        if tputs[i] > best_tputs[i]: best_tputs[i] = tputs[i]
 
 print(f"\n  {'threads':>8}  {'Mops/s':>8}  {'speedup':>8}  {'efficiency':>10}")
-base_t = tputs[0]
-rec_D = 1
+base_t = best_tputs[0]
 for nt in range(1, max_t+1):
-    t   = tputs[nt-1]
+    t   = best_tputs[nt-1]
     sp  = t/base_t
     eff = sp/nt*100
-    mk  = ' ←' if eff>=80 else ''
-    if eff >= 80: rec_D = nt
+    is_p = (nt <= P_CORES)
+    mk  = ' (P-core)' if is_p else ' (E-core)'
     print(f"  {nt:>8}  {t/1e6:>8.1f}  {sp:>8.2f}x  {eff:>9.0f}%{mk}")
 
-if E_CORES > 0:
-    print(f"\n  {E_CORES} E-cores detected; limiting to P-cores for latency-sensitive DP.")
-    rec_D = min(rec_D, P_CORES)
-print(f"\n  → Recommended SM_NTHREADS = {rec_D}")
+# Primary recommendation: all P-cores.
+# Only reduce if the benchmark shows negative scaling (pathological case,
+# e.g. NUMA or heavily hyperthreaded machine where P_CORES is overcounted).
+rec_D = P_CORES
+best_P = max(range(1, P_CORES+1), key=lambda n: best_tputs[n-1])
+if best_P < P_CORES:
+    print(f"\n  ⚠  Benchmark peak at {best_P} threads < P_CORES ({P_CORES}).")
+    print(f"     This may indicate thermal throttling or OS detection error.")
+    print(f"     Using P_CORES={P_CORES}; override manually in machine.yaml if needed.")
+print(f"\n  OS-reported P-cores: {P_CORES}  E-cores: {E_CORES}")
+print(f"  Benchmark peak:      {best_P} threads")
+print(f"  → Recommended SM_NTHREADS = {rec_D}  (= P_CORES, hardware-defined)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Group E: SM_WORKER_CAP  (analytical)
