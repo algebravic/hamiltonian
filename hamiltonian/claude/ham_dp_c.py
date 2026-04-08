@@ -1159,6 +1159,18 @@ void count_ham_paths_peh(
 
 typedef struct { u64 key; u128 val; } SMEntry;
 
+/* Fatal OOM handler — prints location and aborts cleanly.
+   On macOS, malloc returns NULL under pressure rather than killing the
+   process; without this the program crashes with a confusing SIGSEGV.  */
+#define SM_OOM(bytes) do { \
+    fprintf(stderr, "\nFATAL: out of memory allocating %zu bytes (%s:%d)\n" \
+                    "       Reduce SM_WORKER_CAP or use a machine with more RAM.\n", \
+            (size_t)(bytes), __FILE__, __LINE__); \
+    abort(); \
+} while(0)
+#define SM_ALLOC_CHECK(ptr, bytes) \
+    do { if (!(ptr)) SM_OOM(bytes); } while(0)
+
 /* ── Buffered 8-bit LSD radix sort ─────────────────────────────────── */
 #define SM_RBUCKETS  256
 
@@ -1874,6 +1886,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
         size_t  total  = 0;
         for (int i = 0; i < n_runs; i++) total += ws->run_lens[i];
         SMEntry *out = (SMEntry *)malloc(total * sizeof(SMEntry));
+        SM_ALLOC_CHECK(out, total * sizeof(SMEntry));
 
         if (n_runs == 1) {
             sm_ext_read(ws->run_fd, ws->run_map, 0, out, ws->run_lens[0]);
@@ -1882,7 +1895,9 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
         }
 
         SMExtStream *S = (SMExtStream *)malloc(n_runs * sizeof(SMExtStream));
+        SM_ALLOC_CHECK(S, n_runs * sizeof(SMExtStream));
         SMHEntry    *h = (SMHEntry *)malloc(n_runs * sizeof(SMHEntry));
+        SM_ALLOC_CHECK(h, n_runs * sizeof(SMHEntry));
 
         size_t file_off = 0;
         for (int i = 0; i < n_runs; i++) {
@@ -1892,6 +1907,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
                 .run_pos = 0, .buf_len = 0, .buf_pos = 0,
                 .buf = (SMEntry *)malloc(SM_EXT_STREAM_BUF * sizeof(SMEntry)),
             };
+            SM_ALLOC_CHECK(S[i].buf, SM_EXT_STREAM_BUF * sizeof(SMEntry));
             file_off += ws->run_lens[i] * sizeof(SMEntry);
             sm_ext_stream_refill(&S[i]);
         }
@@ -1933,12 +1949,14 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
         size_t  total  = 0;
         for (int i = 0; i < n_runs; i++) total += ws->runs[i].len;
         SMEntry  *out = (SMEntry *)malloc(total * sizeof(SMEntry));
+        SM_ALLOC_CHECK(out, total * sizeof(SMEntry));
 
         /* For each run, find the 257 bucket boundary indices via
            binary search.  bounds[i][b] = first index in run i with
            top byte >= b.  This costs O(n_runs × 256 × log(run_size))
            ≈ negligible.                                                */
         size_t (*bounds)[257] = malloc(n_runs * sizeof(*bounds));
+        SM_ALLOC_CHECK(bounds, n_runs * sizeof(*bounds));
         for (int i = 0; i < n_runs; i++) {
             const SMEntry *d = ws->runs[i].data;
             size_t len       = ws->runs[i].len;
@@ -2091,6 +2109,7 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
                 nxt->cnt = cnt;
             } else {
                 SMEntry *merged = (SMEntry*)malloc(cap * sizeof(SMEntry));
+                SM_ALLOC_CHECK(merged, cap * sizeof(SMEntry));
                 cnt = sm_merge_bb(S, 2, merged);
                 /* Shrink to actual (deduped) size: on macOS the libmalloc
                    large-allocation path returns physical pages to the OS,
@@ -2206,6 +2225,7 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
                 .buf_pos = 0,
                 .buf     = (SMEntry*)malloc(dyn_buf * sizeof(SMEntry)),
             };
+            SM_ALLOC_CHECK(S[si].buf, dyn_buf * sizeof(SMEntry));
             /* Override the global SM_EXT_STREAM_BUF with the dynamic value. */
             S[si].buf_len = 0;  /* will be filled by refill below */
             file_off += WS[w].run_lens[r] * sizeof(SMEntry);
@@ -3281,7 +3301,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-        from ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):
