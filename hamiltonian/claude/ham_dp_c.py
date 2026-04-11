@@ -71,6 +71,29 @@ static inline double now_ms(void) {
 typedef unsigned __int128 u128;
 typedef uint64_t          u64;
 
+/* ── Runtime configuration: replaces compile-time -D SM_ constants ───
+   Set once via sm_configure() (called from Python after dlopen).      */
+typedef struct {
+    int    nthreads; size_t worker_cap; int rbuf_size; int bb_buf;
+    size_t ext_stream_buf; size_t slc_bytes;
+    size_t par_merge_thresh; int steal_factor; size_t rsort_thresh;
+} SMConfig;
+static SMConfig sm_cfg = {
+    .nthreads=6,.worker_cap=16*1024*1024,.rbuf_size=32,.bb_buf=32,
+    .ext_stream_buf=1024,.slc_bytes=12*1024*1024,
+    .par_merge_thresh=50000000,.steal_factor=32,.rsort_thresh=1<<19
+};
+void sm_configure(int nthreads,size_t worker_cap,int rbuf_size,
+                  int bb_buf,size_t ext_stream_buf,size_t slc_bytes,
+                  size_t par_merge_thresh,int steal_factor,
+                  size_t rsort_thresh) {
+    sm_cfg.nthreads=nthreads; sm_cfg.worker_cap=worker_cap;
+    sm_cfg.rbuf_size=rbuf_size; sm_cfg.bb_buf=bb_buf;
+    sm_cfg.ext_stream_buf=ext_stream_buf; sm_cfg.slc_bytes=slc_bytes;
+    sm_cfg.par_merge_thresh=par_merge_thresh;
+    sm_cfg.steal_factor=steal_factor; sm_cfg.rsort_thresh=rsort_thresh;
+}
+
 #define KEY_MARKER  ((u64)1 << 63)
 #define KEY_NC_BIT  ((u64)1 << 62)
 /* 4 bits per frontier slot + 2 flag bits → max 15 slots in 64 bits. */
@@ -443,9 +466,6 @@ static u128 *eh_lookup(EHT *t, u64 key) {
 #define RSORT_BITS       10                     /* tuned at compile time     */
 #endif
 #define RSORT_SLOTS      (1 << RSORT_BITS)      /* 1024 partitions           */
-#ifndef RSORT_THRESH
-#define RSORT_THRESH     (1 << 19)              /* states threshold           */
-#endif
 #define RSORT_SLOT_CAP   (20 * 1024)            /* entries per slot: 20K     */
 #define RSORT_FLAT_N     (RSORT_SLOTS * RSORT_SLOT_CAP) /* 20M entries total */
 #define RSORT_FLUSH_THRESH (RSORT_FLAT_N / 2)   /* flush at ~10M total       */
@@ -641,7 +661,7 @@ static void fused_sweep(EHT *curr, EHT *nxt,
 
     eh_reset(nxt);
 
-    int use_rsort = (curr->cnt >= RSORT_THRESH);
+    int use_rsort = (curr->cnt >= sm_cfg.rsort_thresh);
     RSortBuf rb = {0};
     if (use_rsort) rsort_init(&rb,   nxt, 0);
 
@@ -872,7 +892,7 @@ void count_ham_paths_c(
 
         /* ---- A. Introduce v ------------------------------------------ */
         {
-            int use_rsort_a = (curr->cnt >= RSORT_THRESH);
+            int use_rsort_a = (curr->cnt >= sm_cfg.rsort_thresh);
             RSortBuf rb_a = {0};
             eh_reset(nxt);
             if (use_rsort_a) rsort_init(&rb_a, nxt, 0);
@@ -926,7 +946,7 @@ void count_ham_paths_c(
             /* B: sequential per-back-edge sweeps. */
             for (int j = 0; j < n_back; j++) {
                 int w_idx = widxs[j];
-                int use_rsort_b = (curr->cnt >= RSORT_THRESH);
+                int use_rsort_b = (curr->cnt >= sm_cfg.rsort_thresh);
                 RSortBuf rb_b = {0};
                 eh_reset(nxt);
                 if (use_rsort_b) rsort_init(&rb_b, nxt, 0);
@@ -983,7 +1003,7 @@ void count_ham_paths_c(
             /* C: eliminate vertices one at a time (ascending order). */
             for (int e = 0; e < n_elim; e++) {
                 int u_idx = elim_idxs_asc[e];
-                int use_rsort_c = (curr->cnt >= RSORT_THRESH);
+                int use_rsort_c = (curr->cnt >= sm_cfg.rsort_thresh);
                 RSortBuf rb_c = {0};
                 eh_reset(nxt);
                 if (use_rsort_c) rsort_init(&rb_c, nxt, 0);
@@ -1148,10 +1168,10 @@ void count_ham_paths_peh(
                         worker merges all its runs; the main thread then does
                         a P-way merge+dedup of the P per-worker streams.
 
-   Buffer cap: SM_WORKER_CAP entries per worker buf.  For large n where
+   Buffer cap: sm_cfg.worker_cap entries per worker buf.  For large n where
    bpt = chunk*2^n_back would exceed this, the worker accumulates multiple
    sorted runs instead of one big allocation.  This bounds peak memory to
-       curr + P * 2 * SM_WORKER_CAP * 24B
+       curr + P * 2 * sm_cfg.worker_cap * 24B
    regardless of state count, preventing the OOM seen at n=61 step 37+.
    ====================================================================== */
 
@@ -1164,7 +1184,7 @@ typedef struct { u64 key; u128 val; } SMEntry;
    process; without this the program crashes with a confusing SIGSEGV.  */
 #define SM_OOM(bytes) do { \
     fprintf(stderr, "\nFATAL: out of memory allocating %zu bytes (%s:%d)\n" \
-                    "       Reduce SM_WORKER_CAP or use a machine with more RAM.\n", \
+                    "       Reduce sm_cfg.worker_cap or use a machine with more RAM.\n", \
             (size_t)(bytes), __FILE__, __LINE__); \
     abort(); \
 } while(0)
@@ -1175,13 +1195,21 @@ typedef struct { u64 key; u128 val; } SMEntry;
 #define SM_RBUCKETS  256
 
 typedef struct {
-    SMEntry slots[SM_RBUCKETS][SM_RBUF_SIZE];
-    size_t  cnt[SM_RBUCKETS];
-    size_t  prefix[SM_RBUCKETS];
+    SMEntry *slots; size_t cnt[SM_RBUCKETS]; size_t prefix[SM_RBUCKETS];
 } RadixBuf;
+static RadixBuf *sm_rbuf_alloc(void) {
+    int rbs = sm_cfg.rbuf_size;
+    RadixBuf *rb = (RadixBuf *)malloc(sizeof(RadixBuf));
+    if (!rb) SM_OOM(sizeof(RadixBuf));
+    rb->slots = (SMEntry *)malloc((size_t)SM_RBUCKETS*rbs*sizeof(SMEntry));
+    if (!rb->slots) SM_OOM((size_t)SM_RBUCKETS*rbs*sizeof(SMEntry));
+    memset(rb->cnt,0,sizeof(rb->cnt)); return rb;
+}
+static void sm_rbuf_free(RadixBuf *rb){if(rb){free(rb->slots);free(rb);}}
 
 static void rbuf_pass(const SMEntry *src, size_t n, SMEntry *dst,
                       int shift, RadixBuf *rb) {
+    int rbs = sm_cfg.rbuf_size;
     size_t cnt[SM_RBUCKETS] = {0};
     /* Use eh_hash(key) bits for bucket assignment.  Raw key bits are highly
        skewed (bits 56-63 take only 2 values for n=61), so the top passes of
@@ -1196,27 +1224,28 @@ static void rbuf_pass(const SMEntry *src, size_t n, SMEntry *dst,
     }
     for (size_t i = 0; i < n; i++) {
         int b = (eh_hash(src[i].key) >> shift) & 0xff;
-        rb->slots[b][rb->cnt[b]++] = src[i];
-        if (rb->cnt[b] == SM_RBUF_SIZE) {
-            memcpy(dst + rb->prefix[b], rb->slots[b], SM_RBUF_SIZE * sizeof(SMEntry));
-            rb->prefix[b] += SM_RBUF_SIZE; rb->cnt[b] = 0;
+        rb->slots[b*rbs + rb->cnt[b]++] = src[i];
+        if (rb->cnt[b] == (size_t)rbs) {
+            memcpy(dst + rb->prefix[b], rb->slots + b*rbs,
+                   (size_t)rbs * sizeof(SMEntry));
+            rb->prefix[b] += (size_t)rbs; rb->cnt[b] = 0;
         }
     }
     for (int b = 0; b < SM_RBUCKETS; b++)
         if (rb->cnt[b])
-            memcpy(dst + rb->prefix[b], rb->slots[b], rb->cnt[b] * sizeof(SMEntry));
+            memcpy(dst+rb->prefix[b], rb->slots+b*rbs, rb->cnt[b]*sizeof(SMEntry));
 }
 
 /* 8-pass LSD radix sort; result ends in 'a' (even pass count). */
 static void sm_radix_sort(SMEntry *a, SMEntry *tmp, size_t n) {
     if (n < 2) return;
-    RadixBuf *rb = (RadixBuf*)malloc(sizeof(RadixBuf));
+    RadixBuf *rb = sm_rbuf_alloc();
     for (int pass = 0; pass < 8; pass++) {
         SMEntry *src = (pass & 1) ? tmp : a;
         SMEntry *dst = (pass & 1) ? a   : tmp;
         rbuf_pass(src, n, dst, pass * 8, rb);
     }
-    free(rb);
+    sm_rbuf_free(rb);
 }
 
 /* ── P-way merge with dedup (min-heap) ─────────────────────────────── */
@@ -1264,30 +1293,30 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
 
 /* ── Block-buffered K-way merge with dedup (sm_merge_bb) ───────────────
    Replaces sm_merge in latency-sensitive paths.  Each SMStream is wrapped
-   in a SM_BB_BUF-entry read buffer:
+   in a sm_cfg.bb_buf-entry read buffer:
 
-     sm_bb_fill() reads SM_BB_BUF entries sequentially from the underlying
+     sm_bb_fill() reads sm_cfg.bb_buf entries sequentially from the underlying
      array with a single memcpy — one DRAM round trip, sequential access,
      hardware-prefetcher-friendly.  The merge loop then reads from blk[]
-     which is L1/L2 resident for SM_BB_BUF≤32.
+     which is L1/L2 resident for sm_cfg.bb_buf≤32.
 
    Latency model (K streams, n elements total, T_DRAM=100ns):
      sm_merge:    n × T_DRAM                          (1 miss/element)
-     sm_merge_bb: (n / SM_BB_BUF) × T_DRAM            (1 miss per block)
-   Speedup ≈ SM_BB_BUF = 32×.  On large steps this converts the merge
+     sm_merge_bb: (n / sm_cfg.bb_buf) × T_DRAM            (1 miss per block)
+   Speedup ≈ sm_cfg.bb_buf = 32×.  On large steps this converts the merge
    from latency-stall-bound (7% CPU) to bandwidth-bound (80%+ CPU).
 
-   Buffer pool per call:  K × SM_BB_BUF × 24B
+   Buffer pool per call:  K × sm_cfg.bb_buf × 24B
      K=6  (parallel merge):  6×32×24 =  4.6 KB  → L1
      K=19 (ext merge runs): 19×32×24 = 14.6 KB  → L1
-   Both fit in L1; no heap allocation needed for K≤SM_BB_KSTACK.        */
+   Both fit in L1; no heap allocation needed for K≤512.        */
 
 
 typedef struct {
     const SMEntry *base;   /* pointer into the sorted run/slice            */
     size_t         pos;    /* next unread index in base[]                  */
     size_t         len;    /* total entries in base[]                      */
-    SMEntry        blk[SM_BB_BUF]; /* read buffer (in L1 during merge)    */
+    SMEntry       *blk;             /* bb_buf entries, pool-allocated       */
     int            bpos;   /* current read position in blk[]               */
     int            blen;   /* valid entries in blk[]                       */
 } SMBufStr;
@@ -1299,7 +1328,7 @@ static inline void sm_bb_init(SMBufStr *s, const SMEntry *base, size_t len) {
 /* Fill blk[] from the underlying array.  One sequential memcpy per call.  */
 static inline void sm_bb_fill(SMBufStr *s) {
     size_t rem = s->len - s->pos;
-    int n = (int)(rem < (size_t)SM_BB_BUF ? rem : (size_t)SM_BB_BUF);
+    int n = (int)(rem < (size_t)sm_cfg.bb_buf ? rem : (size_t)sm_cfg.bb_buf);
     memcpy(s->blk, s->base + s->pos, (size_t)n * sizeof(SMEntry));
     s->pos += (size_t)n;
     s->bpos = 0;
@@ -1327,17 +1356,18 @@ static inline SMEntry sm_bb_pop(SMBufStr *s) {
 
 /* Block-buffered K-way merge with dedup.  Same interface as sm_merge.    */
 static size_t sm_merge_bb(SMStream *S, int K, SMEntry *out) {
-    /* Stack-allocate for common small K; heap for large K.               */
-    SMBufStr  stk_b[SM_BB_KSTACK];
-    SMHEntry  stk_h[SM_BB_KSTACK];
-    SMBufStr *B = (K <= SM_BB_KSTACK) ? stk_b
-                                       : (SMBufStr*)malloc((size_t)K * sizeof(SMBufStr));
-    SMHEntry *h = (K <= SM_BB_KSTACK) ? stk_h
-                                       : (SMHEntry*)malloc((size_t)K * sizeof(SMHEntry));
+    int bbs = sm_cfg.bb_buf;
+    SMBufStr *B = (SMBufStr *)malloc((size_t)K * sizeof(SMBufStr));
+    if (!B) SM_OOM((size_t)K * sizeof(SMBufStr));
+    SMHEntry *h = (SMHEntry *)malloc((size_t)K * sizeof(SMHEntry));
+    if (!h) SM_OOM((size_t)K * sizeof(SMHEntry));
+    SMEntry *blk_pool = (SMEntry *)malloc((size_t)K * bbs * sizeof(SMEntry));
+    if (!blk_pool) SM_OOM((size_t)K * bbs * sizeof(SMEntry));
 
     /* Initialise buffered streams and pre-fill first block.              */
     for (int i = 0; i < K; i++) {
-        sm_bb_init(&B[i], S[i].buf, S[i].len);
+        B[i].base=S[i].buf; B[i].pos=0; B[i].len=S[i].len;
+        B[i].blk=blk_pool+(size_t)i*bbs; B[i].bpos=0; B[i].blen=0;
         if (S[i].len > 0) sm_bb_fill(&B[i]);
     }
 
@@ -1376,7 +1406,7 @@ static size_t sm_merge_bb(SMStream *S, int K, SMEntry *out) {
         out[op++] = cur;
     }
 
-    if (K > SM_BB_KSTACK) { free(B); free(h); }
+    free(B); free(h); free(blk_pool);
     return op;
 }
 
@@ -1441,7 +1471,7 @@ static size_t sm_parallel_merge(SMStream *S, int P, int K,
     for (int i = 0; i < P; i++) total += S[i].len;
 
     /* Fall back to single-threaded for small inputs */
-    if (K <= 1 || total < SM_PAR_MERGE_THRESH)
+    if (K <= 1 || total < sm_cfg.par_merge_thresh)
         return sm_merge(S, P, out);
 
     /* ── Step 1: collect sample keys ──────────────────────────────── */
@@ -1583,16 +1613,10 @@ static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
 }
 
 /* ── SM worker (capped buffer + run accumulation) ───────────────────── */
-#ifndef SM_NTHREADS
-#define SM_NTHREADS 6
-#endif
 
 /* Per-worker buffer cap (entries).  Bounds peak RAM to
-   curr + P * 2 * SM_WORKER_CAP * 24B regardless of state count.
+   curr + P * 2 * sm_cfg.worker_cap * 24B regardless of state count.
    32M entries = 768 MB per worker buf; total 6*2*768MB = 9.2 GB.       */
-#ifndef SM_WORKER_CAP
-#define SM_WORKER_CAP (16 * 1024 * 1024)
-#endif
 
 typedef struct { SMEntry *data; size_t len; } SMRun;
 
@@ -1608,8 +1632,8 @@ typedef struct { SMEntry *data; size_t len; } SMRun;
 
 typedef struct SM_CACHE_ALIGN {
     /* worker scratch (reused across runs) */
-    SMEntry *buf;   /* output accumulation buffer, SM_WORKER_CAP entries */
-    SMEntry *tmp;   /* radix sort scratch,         SM_WORKER_CAP entries */
+    SMEntry *buf;   /* output accumulation buffer, sm_cfg.worker_cap entries */
+    SMEntry *tmp;   /* radix sort scratch,         sm_cfg.worker_cap entries */
     size_t   buf_len;
     /* completed sorted+deduped runs */
     int      ext_runs;
@@ -1725,7 +1749,7 @@ static void sm_ext_close(int fd, void *map, size_t capacity_bytes) {
 /* ── Streaming ext-mode merge ─────────────────────────────────────────
    Merges n_runs sorted runs (stored in a file or mmap) into a single
    sorted+deduped array, reading each run through a small buffer.
-   Peak extra RAM = n_runs × SM_EXT_STREAM_BUF × 24B (e.g. 31 × 24MB = 744MB)
+   Peak extra RAM = n_runs × sm_cfg.ext_stream_buf × 24B (e.g. 31 × 24MB = 744MB)
    vs loading all runs simultaneously (e.g. 2.7 GB for step 38).
    Large sequential reads → OS readahead → near-SSD-peak bandwidth.     */
 
@@ -1743,8 +1767,8 @@ typedef struct {
 static void sm_ext_stream_refill(SMExtStream *s) {
     if (s->run_pos >= s->run_len) { s->buf_len = 0; return; }
     size_t remaining = s->run_len - s->run_pos;
-    size_t n = remaining < (size_t)SM_EXT_STREAM_BUF ? remaining
-                                                      : (size_t)SM_EXT_STREAM_BUF;
+    size_t n = remaining < (size_t)sm_cfg.ext_stream_buf ? remaining
+                                                      : (size_t)sm_cfg.ext_stream_buf;
     size_t off = s->run_off + s->run_pos * sizeof(SMEntry);
     if (s->map)
         memcpy(s->buf, (const char *)s->map + off, n * sizeof(SMEntry));
@@ -1774,9 +1798,6 @@ static inline void sm_ext_advance(SMHEntry *h, int *hs,
 }
 
 /* ── Work-stealing shared micro-chunk queue ─────────────────────────── */
-#ifndef SM_STEAL_FACTOR
-#define SM_STEAL_FACTOR 32
-#endif
 
 typedef struct {
     volatile size_t next;
@@ -1877,7 +1898,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
     if (ws->ext_runs) {
         /* ── Ext path: streaming heap merge ────────────────────────── */
         /* Each run is read through a SM_EXT_STREAM_BUF-entry buffer.
-           Peak extra RAM = n_runs × SM_EXT_STREAM_BUF × 24B (small).
+           Peak extra RAM = n_runs × sm_cfg.ext_stream_buf × 24B (small).
            MAP_ANON gives RAM bandwidth; sequential access + hardware
            prefetch makes this fast without bucketing.                  */
         if (ws->n_runs == 0) { *out_len = 0; return NULL; }
@@ -1905,9 +1926,9 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
                 .fd = ws->run_fd, .map = ws->run_map,
                 .run_off = file_off, .run_len = ws->run_lens[i],
                 .run_pos = 0, .buf_len = 0, .buf_pos = 0,
-                .buf = (SMEntry *)malloc(SM_EXT_STREAM_BUF * sizeof(SMEntry)),
+                .buf = (SMEntry *)malloc(sm_cfg.ext_stream_buf * sizeof(SMEntry)),
             };
-            SM_ALLOC_CHECK(S[i].buf, SM_EXT_STREAM_BUF * sizeof(SMEntry));
+            SM_ALLOC_CHECK(S[i].buf, sm_cfg.ext_stream_buf * sizeof(SMEntry));
             file_off += ws->run_lens[i] * sizeof(SMEntry);
             sm_ext_stream_refill(&S[i]);
         }
@@ -2024,7 +2045,7 @@ static void *sm_worker_runs(void *arg) {
             }
             ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
             raw_out++;
-            if (ws->buf_len == SM_WORKER_CAP) {
+            if (ws->buf_len == sm_cfg.worker_cap) {
                 double tf0 = now_ms();
                 sm_flush_run(ws);
                 t_flush_acc += now_ms() - tf0;
@@ -2170,20 +2191,18 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
      Old: curr + W_all + T_pair + OS    e.g. n=61 step 39 → 60 GB → swap
      New: curr + nxt  + stream_bufs     e.g. n=61 step 39 → 29 GB → no swap
 
-   where stream_bufs = total_streams × SM_EXT_STREAM_BUF × 24B.
+   where stream_bufs = total_streams × sm_cfg.ext_stream_buf × 24B.
    For step 39: 258 streams × 2978 entries (sized to fill SLC) = 141 MB.
 
    Per-stream buffer sizing (the Aiken et al. capacity-boundary principle):
      Optimal buf ≈ SLC_bytes / total_streams / sizeof(SMEntry).
    We compute this per call so it adapts to the actual run count.
-   Clamped below at SM_EXT_STREAM_BUF (the compile-time lower bound) and
+   Clamped below at sm_cfg.ext_stream_buf (the compile-time lower bound) and
    above at 1 MB (to avoid excessive malloc overhead for very few streams). */
 
 /* SLC size hint — adjust for your machine.  The tuner (tune_params.py)
    reports the correct value.  On M3 Pro: 12582912 (12 MB).
    This constant is used only for the dynamic buffer-size formula.          */
-#ifndef SM_SLC_BYTES
-#endif
 
 static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
                                    SMTab *nxt, size_t raw_total,
@@ -2200,13 +2219,23 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
     }
 
     /* Dynamic per-stream buffer: fill SLC with all stream buffers.
-       Clamped to [SM_EXT_STREAM_BUF, 1M] entries.                          */
-    size_t dyn_buf = (size_t)SM_SLC_BYTES / ((size_t)total_streams * sizeof(SMEntry));
-    if (dyn_buf < (size_t)SM_EXT_STREAM_BUF) dyn_buf = (size_t)SM_EXT_STREAM_BUF;
+       Clamped to [sm_cfg.ext_stream_buf, 1M] entries.                          */
+    size_t dyn_buf = (size_t)sm_cfg.slc_bytes / ((size_t)total_streams * sizeof(SMEntry));
+    if (dyn_buf < (size_t)sm_cfg.ext_stream_buf) dyn_buf = (size_t)sm_cfg.ext_stream_buf;
     if (dyn_buf > (size_t)(1 << 20))         dyn_buf = (size_t)(1 << 20);
 
-    /* Allocate nxt for raw_total (dedup will shrink actual count).          */
-    smtab_ensure(nxt, raw_total + 1);
+    /* Allocate nxt with a RAM-safe initial capacity and grow ×1.5 as needed.
+       We cannot use raw_total: at n=61 step 39, raw_total=2B × 24B = 48GB
+       which exceeds the 36GB M3 Pro.  curr->data has already been freed by
+       the caller (sm_fused_sweep) so the available RAM is ~32GB.
+       Starting at 64M entries and growing ×1.5 reaches 677M in 6 reallocs;
+       each realloc peaks at old×24 + new×24 < 32GB at all steps.          */
+    {
+        size_t init_cap = (size_t)64 << 20;   /* 64M entries = 1.5 GB    */
+        if (init_cap < (size_t)total_streams * 2)
+            init_cap = (size_t)total_streams * 2;
+        smtab_ensure(nxt, init_cap);
+    }
 
     /* Build one SMExtStream per run across all workers.                     */
     SMExtStream *S = (SMExtStream*)malloc((size_t)total_streams * sizeof(SMExtStream));
@@ -2307,7 +2336,21 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
                 }
             }
         }
+        /* Grow nxt ×1.5 if needed: peak = old×24 + new×24 + OS < 36GB.   */
+        if (op >= nxt->cap) {
+            size_t new_cap = nxt->cap + (nxt->cap >> 1); /* ×1.5          */
+            if (new_cap < nxt->cap + 1) new_cap = nxt->cap + 1;
+            SMEntry *p = (SMEntry *)realloc(nxt->data, new_cap * sizeof(SMEntry));
+            if (!p) SM_OOM(new_cap * sizeof(SMEntry));
+            nxt->data = p; nxt->cap = new_cap;
+        }
         nxt->data[op++] = cur;
+    }
+    /* Shrink to exact size to free unused capacity. */
+    if (op < nxt->cap) {
+        SMEntry *p = (SMEntry *)realloc(nxt->data, op * sizeof(SMEntry));
+        if (p || op == 0) { nxt->data = p; nxt->cap = op; }
+        /* If realloc-shrink fails, keep the oversized buffer — no data loss. */
     }
 
     *t_merge_ms_out = now_ms() - t0;
@@ -2324,8 +2367,8 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
    we switch to ext earlier than strictly necessary — safe but not wasteful
    since the threshold only triggers on genuinely large steps.            */
 static int sm_should_use_ext(size_t si, int nb, size_t ram_bytes) {
-    size_t P   = SM_NTHREADS;
-    size_t CAP = SM_WORKER_CAP;
+    size_t P   = sm_cfg.nthreads;
+    size_t CAP = sm_cfg.worker_cap;
     size_t chunk   = (si + P - 1) / P;
     size_t bpt     = chunk * ((size_t)1 << nb);
     size_t n_runs  = bpt > CAP ? (bpt + CAP - 1) / CAP : 1;
@@ -2346,7 +2389,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             u128 *total,
                             size_t ram_bytes,
                             int instrument) {
-    int P = SM_NTHREADS;
+    int P = sm_cfg.nthreads;
     size_t ni    = curr->cnt;
     size_t chunk = (ni + P - 1) / P;
     int ext_runs = sm_should_use_ext(ni, n_back, ram_bytes);
@@ -2371,8 +2414,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) {
         size_t lo = (size_t)i * chunk;
         size_t hi = lo + chunk < ni ? lo + chunk : ni;
-        WS[i].buf      = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
-        WS[i].tmp      = (SMEntry*)malloc(SM_WORKER_CAP * sizeof(SMEntry));
+        WS[i].buf      = (SMEntry*)malloc(sm_cfg.worker_cap * sizeof(SMEntry));
+        WS[i].tmp      = (SMEntry*)malloc(sm_cfg.worker_cap * sizeof(SMEntry));
         WS[i].buf_len    = 0;
         WS[i].ext_runs   = ext_runs;
         WS[i].n_runs     = 0;
@@ -2426,6 +2469,21 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             if (WS[i].buf_len > 0) sm_flush_run(&WS[i]);
             for (int r = 0; r < WS[i].n_runs; r++)
                 raw_total += WS[i].run_lens[r];
+        }
+        /* Free curr->data now: workers have finished reading it and
+           global_ext_merge reads from WS[i] ext files, not curr.
+           Freeing curr (up to 15 GB at n=61 step 39) ensures the
+           ×1.5-growth reallocs in sm_global_ext_merge stay under 36 GB.
+           curr->data = NULL makes the outer cleanup free() a no-op.       */
+        free(curr->data); curr->data = NULL; curr->cap = 0;
+
+        /* Free worker scratch buffers before the merge: they held pre-flush
+           data and are no longer needed now that all runs are on SSD.
+           This saves P×2×sm_cfg.worker_cap×24B (4.6–9.2GB) during the merge,
+           making the peak curr+nxt+stream_bufs+OS independent of CAP.    */
+        for (int i = 0; i < P; i++) {
+            free(WS[i].buf); WS[i].buf = NULL;
+            free(WS[i].tmp); WS[i].tmp = NULL;
         }
         merge_path = "global_ext";
         double t_gm = 0;
@@ -2485,8 +2543,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     if (instrument) {
         /* Print sm_merge_bb buffer parameters for reference. */
         fprintf(stderr,
-            "  [inst] merge_bb: SM_BB_BUF=%d SM_EXT_STREAM_BUF=%d par_merge=%s\n",
-            SM_BB_BUF, SM_EXT_STREAM_BUF,
+            "  [inst] merge_bb: SM_BB_BUF=%d SM_EXT_STREAM_BUF=%zu par_merge=%s\n",
+            sm_cfg.bb_buf, sm_cfg.ext_stream_buf,
             merge_path);
         /* Per-worker breakdown */
         double t_compute_max = 0, t_flush_max = 0, t_merge_max = 0;
@@ -2511,7 +2569,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             "  [inst]   raw_out=%zuM  deduped=%zuM  dedup=%.1fx\n"
             "  [inst]   worker details (compute / flush / merge_runs / n_runs / out):\n",
             step, n_back, ext_runs,
-            ext_runs ? (int)(raw_total / (SM_WORKER_CAP/2)) : WS[0].n_runs,
+            ext_runs ? (int)(raw_total / (sm_cfg.worker_cap/2)) : WS[0].n_runs,
             t_compute_max, t_wall_compute/P,
             t_flush_max,   t_wall_flush/P,
             t_merge_runs_total, t_merge_max,
@@ -2527,8 +2585,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
 
     for (int i = 0; i < P; i++) {
         free(W[i].out);
-        free(WS[i].buf);
-        free(WS[i].tmp);
+        free(WS[i].buf);   /* may already be NULL if ext path freed early */
+        free(WS[i].tmp);   /* free(NULL) is a no-op per C99               */
         free(WS[i].runs);      /* NULL if already freed above */
         free(WS[i].run_lens);  /* NULL if already freed above */
         sm_ext_close(WS[i].run_fd, WS[i].run_map, WS[i].run_capacity);
@@ -2914,19 +2972,11 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
     # SM_SLC_BYTES: the SLC (L3) size itself
     slc_bytes     = l3
 
+    # Only the two compile-time constants are returned; everything else is
+    # passed at runtime via sm_configure() after dlopen().
     return {
-        "EH_BKT_CAP":          bkt_cap,
-        "RSORT_THRESH":        thresh,
-        "RSORT_BITS":          bits,
-        "SM_NTHREADS":         _t("SM_NTHREADS",         n_threads),
-        "SM_WORKER_CAP":       _t("SM_WORKER_CAP",       sm_worker_cap),
-        "SM_RBUF_SIZE":        _t("SM_RBUF_SIZE",        rbuf_default),
-        "SM_BB_BUF":           _t("SM_BB_BUF",           bb_default),
-        "SM_BB_KSTACK":        _t("SM_BB_KSTACK",        max(_t("SM_BB_BUF", bb_default), 32)),
-        "SM_EXT_STREAM_BUF":   _t("SM_EXT_STREAM_BUF",  ext_default),
-        "SM_PAR_MERGE_THRESH": _t("SM_PAR_MERGE_THRESH", 50_000_000),
-        "SM_STEAL_FACTOR":     _t("SM_STEAL_FACTOR",     32),
-        "SM_SLC_BYTES":        _t("SM_SLC_BYTES",        slc_bytes),
+        "EH_BKT_CAP":  bkt_cap,
+        "RSORT_BITS":  bits,
     }
 
 
@@ -2964,7 +3014,10 @@ def _get_lib():
     consts = _derive_build_constants(l1d, l2, l3, cl)
 
     src_hash = hashlib.md5(C_SOURCE.encode()).hexdigest()[:12]
-    const_sig = "_".join(f"{k}{v}" for k, v in sorted(consts.items()))
+    # Cache key: C source hash + only the two compile-time params.
+    # Runtime params (SM_WORKER_CAP, SM_BB_BUF, etc.) no longer affect the binary;
+    # changing machine.yaml does not trigger recompilation.
+    const_sig = f"EH{consts['EH_BKT_CAP']}_RB{consts['RSORT_BITS']}"
     cache_key = f"{src_hash}_{const_sig}"
     if cache_key in _LIB_CACHE:
         return _LIB_CACHE[cache_key]
@@ -3008,6 +3061,11 @@ def _get_lib():
 
     ffi = cffi.FFI()
     ffi.cdef("""
+        void sm_configure(int nthreads, size_t worker_cap, int rbuf_size,
+                          int bb_buf, size_t ext_stream_buf, size_t slc_bytes,
+                          size_t par_merge_thresh, int steal_factor,
+                          size_t rsort_thresh);
+
         void count_ham_paths_c(
             int n, const int *order, const int *pos, const int *last_s,
             const int *adj_off, const int *adj_dat,
@@ -3031,6 +3089,46 @@ def _get_lib():
             int verbose, uint64_t ram_bytes, int instrument);
     """)
     lib = ffi.dlopen(so_path)
+
+    # Read runtime parameters from machine.yaml (same candidates as _derive_build_constants)
+    import yaml as _yaml2, pathlib as _pl2
+    _here2 = _pl2.Path(__file__).parent
+    _cands2 = []
+    if _MACHINE_YAML_PATH is not None:
+        _cands2.append(_pl2.Path(_MACHINE_YAML_PATH))
+    _cands2.append(_here2 / "machine.yaml")
+    _cands2.append(_pl2.Path.cwd() / "machine.yaml")
+    _rt = {}
+    for _p2 in _cands2:
+        if _p2.exists():
+            try:
+                with open(_p2) as _f2: _rt = _yaml2.safe_load(_f2) or {}
+                if _rt: break
+            except Exception: pass
+
+    def _rv(key, default): return int(_rt.get(key, default))
+
+    # Detect hardware defaults for fallback (same logic as _derive_build_constants)
+    _ram2, _nt2 = _detect_ram_and_threads()
+    _l1_2, _l2_2, _l3_2, _ = _detect_cache_sizes()
+    _nthreads_def  = _nt2
+    _wcap_def      = max(8, min(128, ((_ram2-(4<<30)-(_ram2>>1))//(_nt2*2*24))//(1<<20))) * (1<<20)
+    _rbuf_def      = min(128, max(1, 1 << (max(0, (_l2_2//(256*24)).bit_length()-1))))
+    _bb_def        = min(4096, max(16, 1 << (max(0, (_l1_2//(_nt2*24)).bit_length()-1))))
+    _ext_def       = max(256, _l3_2//(100*24))
+
+    lib.sm_configure(
+        _rv("SM_NTHREADS",         _nthreads_def),
+        _rv("SM_WORKER_CAP",       _wcap_def),
+        _rv("SM_RBUF_SIZE",        _rbuf_def),
+        _rv("SM_BB_BUF",           _bb_def),
+        _rv("SM_EXT_STREAM_BUF",   _ext_def),
+        _rv("SM_SLC_BYTES",        _l3_2),
+        _rv("SM_PAR_MERGE_THRESH", 50_000_000),
+        _rv("SM_STEAL_FACTOR",     32),
+        _rv("RSORT_THRESH",        1 << 19),
+    )
+
     _LIB_CACHE[cache_key] = (lib, ffi)
     return lib, ffi
 
