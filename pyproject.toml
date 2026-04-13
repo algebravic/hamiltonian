@@ -12,12 +12,15 @@ dependencies = [
     "cffi>=2.0.0",
     "matplotlib>=3.10.8",
     "pyyaml>=6.0.3",
+    "scipy>=1.17.1",
+    "pandas>=3.0.2",
 ]
 
 [project.scripts]
 tours = "hamiltonian.run:run_tours"
 write = "hamiltonian.run:write_graph"
 count = "hamiltonian.claude.ham_count:main"
+analysis = "hamiltonian.claude.profile_analysis:main"
 
 [dependency-groups]
 dev = ["pytest>=5.2"]
