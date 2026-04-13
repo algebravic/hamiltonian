@@ -16,8 +16,11 @@ best_order(adj, n, method="bfs+sa") -> list[int]
 """
 
 from math import isqrt
+import math
 import random
 import copy
+
+from .sa_cost import sa_cost
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +287,6 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
 
     Returns None if fw > pw_bound and spike_penalty == 0.
     """
-    import math
-
     BELL_PRE = [1,1,2,5,15,52,203,877,4140,21147,115975,678570,
                 4213597,27644437,190899322,1382958545]
     def bell_n(k):
@@ -309,10 +310,12 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
         # u leaves the frontier after step last_step[u] (its last neighbour's step),
         # so it should be absent from step last_step[u]+1 onward — i.e. remove
         # when last_step[u] <= current step.
+        fw_prev = len(frontier)
         frontier.add(v)
         frontier -= {u for u in list(frontier) if last_step[u] <= step}
 
         fw = len(frontier)
+        delta_fs = fw - fw_prev
 
         if fw > pw_bound:
             if spike_penalty == 0.0:
@@ -359,12 +362,16 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
         # placed vertices means even graph-isolated components can be linked)
         n_back = sum(1 for w in adj[v] if pos[w] < step and w in frontier)
 
-        # Density amplifier
         e_bag = sum(1 for u in frontier for w in adj[u]
                     if w in frontier and pos[u] < pos[w])
-        density_amp = (1.0 + density_alpha * (e_bag / fw)) if fw > 0 else 1.0
 
-        expand  = (expand_base ** n_back) * fw_weight * density_amp
+        # Fitted model replaces the old c^n_back proxy.
+        # sa_cost(fs, delta_fs, n_back, e_bag) predicts log(so/si); exp() converts
+        # to a multiplicative expansion factor.
+        # density_amp is dropped: e_bag is now a direct model feature.
+        # fw_weight is retained for its spike_penalty and Bell comp_correction terms,
+        # which are structural constraints not captured by the regression.
+        expand  = math.exp(sa_cost(fw, delta_fs, n_back, e_bag)) * fw_weight
         n_elim  = sum(1 for u in order[:step + 1] if last_step[u] == step)
         compress = max(0.5 ** n_elim, 0.01)
 
