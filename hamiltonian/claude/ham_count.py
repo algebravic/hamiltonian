@@ -35,6 +35,10 @@ Options
   --bound K        Pathwidth upper bound hint for the MaxSAT solver.
   --stratified     Use RC2Stratified (sometimes faster for large n).
   --solver NAME    SAT solver backend for RC2 (default: cd195).
+  --ord-verbose L  RC2 verbosity level during ordering (default: 0). Use 10
+                   to see cost improvements as the MaxSAT solver progresses —
+                   essential for diagnosing whether a long ordering phase is
+                   converging or stuck.
   --checkpoint P   Path for checkpoint file.
   --checkpoint-interval SECS  Checkpoint interval (default: 300s).
   -v / --verbose   Print per-step frontier DP progress to stderr.
@@ -147,6 +151,7 @@ def get_pathwidth_order(
     solver: str = "cd195",
     minimize_profile: bool = False,
     profile_time_limit: float = 120.0,
+    verbose: int = 0,
 ) -> tuple:
     """
     Compute the exact pathwidth and an optimal vertex ordering for G
@@ -177,6 +182,7 @@ def get_pathwidth_order(
         bound=bound,
         solver=solver,
         stratified=stratified,
+        verbose=verbose,
     )
 
     # Phase 2 (optional): re-solve to minimise profile at fixed pw
@@ -189,7 +195,8 @@ def get_pathwidth_order(
         def _solve():
             try:
                 r = pathwidth_order(G, bound=pw, minimize_profile=True,
-                                    solver=solver, stratified=stratified)
+                                    solver=solver, stratified=stratified,
+                                    verbose=verbose)
                 result_holder[0] = r
             except Exception as e:
                 result_holder[0] = e
@@ -279,6 +286,11 @@ def parse_args():
                         "kept. Set higher for large n where phase 2 may need more time.")
     p.add_argument("--solver", default="cd195", metavar="NAME",
                    help="SAT solver for RC2 (default: cd195).")
+    p.add_argument("--ord-verbose", type=int, default=0, metavar="LEVEL",
+                   help="Verbosity level passed to RC2/pathwidth_order during the "
+                        "MaxSAT ordering phase (default: 0 = silent). "
+                        "Use 10 to see RC2 progress (cost improvements, iteration "
+                        "counts) — useful for diagnosing slow or stuck ordering runs.")
 
     # --- DP options ---
     p.add_argument("--sort-merge", action="store_true",
@@ -342,6 +354,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
                 solver=args.solver,
                 minimize_profile=getattr(args, 'minimize_profile', False),
                 profile_time_limit=getattr(args, 'profile_time_limit', 120.0),
+                verbose=getattr(args, 'ord_verbose', 0),
             )
         except ImportError as e:
             print(f"  WARNING: {e}\n  Falling back to BFS.", flush=True)
