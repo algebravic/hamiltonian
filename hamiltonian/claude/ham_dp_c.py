@@ -506,7 +506,7 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
-            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth > 15). "
+            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16). "
             "The packed uint64 state encoding is limited to 15 frontier slots."
         )
     return (hi << 64) | lo
@@ -572,7 +572,7 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
-            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth > 15)."
+            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16)."
         )
     return (hi << 64) | lo
 
@@ -633,7 +633,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
-            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth > 15)."
+            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16)."
         )
     return (hi << 64) | lo
 

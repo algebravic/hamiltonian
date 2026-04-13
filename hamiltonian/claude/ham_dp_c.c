@@ -105,7 +105,19 @@ static inline u64 canon(u64 key, int fs)
     for (int i = 0; i < fs; i++) {
         uint8_t n = (uint8_t)((key >> (4*i)) & 0xFu);
         if (dec_v(n) > 0) {
-            if (!map[n]) map[n] = nxt++;
+            if (!map[n]) {
+                /* enc_v(13)=15 is the max 4-bit label; enc_v(14)=16 overflows.
+                   With fs<=15 and max-degree-4 graphs this should never fire. */
+                if (nxt > 15u) {
+                    fprintf(stderr,
+                        "FATAL: canon() label overflow at fs=%d — "
+                        "more than 14 distinct path segments in frontier. "
+                        "State encoding cannot represent this. "
+                        "File a bug.\n", fs);
+                    abort();
+                }
+                map[n] = nxt++;
+            }
             n = map[n];
         }
         result |= (u64)n << (4*i);
@@ -834,7 +846,7 @@ void count_ham_paths_c(
     for (int step = start_step; step < n; step++) {
         int v = order[step];
 
-        if (fs >= MAX_FS_FAST) {
+        if (fs > MAX_FS_FAST) {
             *res_lo = *res_hi = UINT64_MAX;
             goto cleanup;
         }
@@ -2578,7 +2590,7 @@ void count_ham_paths_sm(
 
     for (int step = 0; step < n; step++) {
         int v = order[step];
-        if (fs >= MAX_FS_FAST) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
+        if (fs > MAX_FS_FAST) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
 
         /* A. Introduce: copy curr→nxt with key transformation, then
            radix-sort nxt using curr->data as scratch (curr is done
