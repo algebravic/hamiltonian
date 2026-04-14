@@ -582,19 +582,21 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 instrument: bool = False,
                                 checkpoint_path: str = "",
                                 checkpoint_secs: float = 300.0,
+                                mem_reserve_gb: float = 0.0,
                                 **kwargs) -> int:
     """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
 
     Parameters
     ----------
-    n           : graph size
-    order       : vertex ordering (1-indexed), length n.
-    adj         : adjacency dict {v: iterable_of_neighbours} (1-indexed).
-    verbose     : print per-step frontier DP progress to stderr.
-    instrument  : print per-step phase timing breakdown to stderr, showing
-                  compute / flush / merge_runs / parallel-merge times per
-                  worker and imbalance metrics.  Implies verbose output is
-                  also useful but is independent.
+    n              : graph size
+    order          : vertex ordering (1-indexed), length n.
+    adj            : adjacency dict {v: iterable_of_neighbours} (1-indexed).
+    verbose        : print per-step frontier DP progress to stderr.
+    instrument     : print per-step phase timing breakdown to stderr.
+    mem_reserve_gb : pretend the machine has this many fewer GB of RAM, causing
+                     the backend to spill to disk (global_ext merge) sooner.
+                     Useful to avoid OOM at peak steps on large graphs.
+                     E.g. mem_reserve_gb=300 on a 768 GB machine plans for 468 GB.
     """
     import sys
     if checkpoint_path:
@@ -602,6 +604,12 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
               "checkpoint_path ignored.", file=sys.stderr)
     lib, ffi = _get_lib()
     ram, _ = _detect_ram_and_threads()
+    if mem_reserve_gb > 0:
+        reserve = int(mem_reserve_gb * (1 << 30))
+        ram = max(int(4 << 30), ram - reserve)  # never go below 4 GB
+        print(f"# mem_reserve_gb={mem_reserve_gb:.1f}: "
+              f"effective RAM for spill decisions = {ram / (1<<30):.0f} GB",
+              file=sys.stderr)
 
     pos = [0] * (n + 1)
     for i, v in enumerate(order): pos[v] = i
@@ -710,7 +718,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):

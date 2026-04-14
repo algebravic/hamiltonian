@@ -301,6 +301,15 @@ def parse_args():
                    help="(sort-merge only) Print per-step phase timing breakdown: "
                         "compute / flush / merge_runs / parallel-merge times per "
                         "worker, imbalance metrics, and dedup ratios.")
+    p.add_argument("--mem-reserve-gb", type=float, default=0.0, metavar="GB",
+                   help="(sort-merge only) Subtract this many GB from detected "
+                        "physical RAM before the sort-merge backend decides whether "
+                        "to spill intermediate data to disk (global_ext merge). "
+                        "Use this to avoid OOM on large pw=15 graphs: the backend "
+                        "will trigger disk spillover earlier, trading time for "
+                        "memory safety.  E.g. --mem-reserve-gb 300 on a 768 GB "
+                        "machine makes the backend plan for 468 GB available. "
+                        "Default: 0 (use all detected RAM).")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Print per-step frontier DP progress.")
     p.add_argument("--profile", action="store_true",
@@ -431,6 +440,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
             instrument=args.instrument,
             checkpoint_path=ckpt_path,
             checkpoint_secs=args.checkpoint_interval,
+            mem_reserve_gb=getattr(args, 'mem_reserve_gb', 0.0),
         )
     else:
         count = count_hamiltonian_paths_c(
