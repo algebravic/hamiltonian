@@ -12,7 +12,7 @@ objective.
 
 USAGE
 -----
-  # Analyse a directory of profile files:
+  # Analyse a directory of profile files (writes sa_cost_params.json by default):
   python profile_analysis.py --dir /path/to/profiles
 
   # Analyse specific files:
@@ -600,14 +600,162 @@ def fitted_sa_cost(ordering, adj, n):
 # 8.  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ---------------------------------------------------------------------------
+# MLP training (pure numpy — no sklearn/torch required)
+# ---------------------------------------------------------------------------
+
+def _relu(x):
+    return (x > 0) * x
+
+def _relu_grad(x):
+    return (x > 0).astype(float)
+
+def train_mlp(df, hidden=(32, 16), epochs=2000, lr=3e-3, l2=1e-4,
+              dropout=0.15, seed=0):
+    """
+    Train a small 2-hidden-layer ReLU MLP on the profile data.
+
+    Features (same 9 as Model B): delta_fs, fs, n_back, e_bag,
+      fs_nb, nb_eb, eb_sq, nb_sq, fs_eb
+    Target: log_ratio = log(states_out / states_in)
+
+    Returns a dict compatible with sa_cost.py MLP backend.
+    """
+    import numpy as np
+
+    feat_cols = ['delta_fs', 'fs', 'n_back', 'e_bag',
+                 'fs_nb', 'nb_eb', 'eb_sq', 'nb_sq', 'fs_eb']
+
+    sub = df.copy()
+    for f in feat_cols:
+        if f not in sub.columns:
+            sub[f] = 0.0
+    sub = sub.dropna(subset=feat_cols + ['log_ratio'])
+
+    X = sub[feat_cols].values.astype(float)
+    y = sub['log_ratio'].values.astype(float).reshape(-1, 1)
+    N, F = X.shape
+
+    # Standardise inputs
+    mu    = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma[sigma < 1e-9] = 1.0
+    Xn = (X - mu) / sigma
+
+    rng = np.random.default_rng(seed)
+
+    # Initialise weights (He init for ReLU)
+    dims = [F] + list(hidden) + [1]
+    Ws, bs = [], []
+    for i in range(len(dims) - 1):
+        scale = np.sqrt(2.0 / dims[i])
+        Ws.append(rng.standard_normal((dims[i+1], dims[i])) * scale)
+        bs.append(np.zeros((dims[i+1], 1)))
+
+    # Adam optimiser state
+    m_W = [np.zeros_like(w) for w in Ws]
+    v_W = [np.zeros_like(w) for w in Ws]
+    m_b = [np.zeros_like(b) for b in bs]
+    v_b = [np.zeros_like(b) for b in bs]
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+
+    best_loss = float('inf')
+    best_params = None
+
+    for epoch in range(1, epochs + 1):
+        # Dropout mask (training only, applied to hidden layers)
+        mask = rng.random((N, hidden[0])) > dropout
+
+        # Forward pass
+        acts = [Xn.T]  # each col is a sample
+        for i, (W, b) in enumerate(zip(Ws, bs)):
+            z = W @ acts[-1] + b
+            if i < len(Ws) - 1:
+                a = _relu(z)
+                if i == 0:
+                    a = a * mask.T / (1.0 - dropout)
+            else:
+                a = z  # output: linear
+            acts.append(a)
+
+        pred = acts[-1].T  # (N, 1)
+        loss = float(np.mean((pred - y) ** 2))
+
+        # L2 regularisation
+        l2_loss = sum(np.sum(W ** 2) for W in Ws)
+        loss += 0.5 * l2 * l2_loss / N
+
+        if loss < best_loss:
+            best_loss = loss
+            best_params = ([W.copy() for W in Ws], [b.copy() for b in bs])
+
+        # Backward pass
+        dz = (pred - y) / N  # (N, 1)
+        for i in range(len(Ws) - 1, -1, -1):
+            dW = dz.T @ acts[i].T + l2 / N * Ws[i]
+            db = dz.T.sum(axis=1, keepdims=True)
+            if i > 0:
+                da = Ws[i].T @ dz.T
+                if i == 1:
+                    da = da * mask.T / (1.0 - dropout)
+                dz = (da * _relu_grad(Ws[i-1] @ acts[i-1] + bs[i-1])).T
+            # Adam update
+            t = epoch
+            m_W[i] = beta1 * m_W[i] + (1 - beta1) * dW
+            v_W[i] = beta2 * v_W[i] + (1 - beta2) * dW ** 2
+            m_b[i] = beta1 * m_b[i] + (1 - beta1) * db
+            v_b[i] = beta2 * v_b[i] + (1 - beta2) * db ** 2
+            mW_c = m_W[i] / (1 - beta1 ** t)
+            vW_c = v_W[i] / (1 - beta2 ** t)
+            mb_c = m_b[i] / (1 - beta1 ** t)
+            vb_c = v_b[i] / (1 - beta2 ** t)
+            lr_t = lr
+            Ws[i] -= lr_t * mW_c / (np.sqrt(vW_c) + eps)
+            bs[i] -= lr_t * mb_c / (np.sqrt(vb_c) + eps)
+
+    # Evaluate best model
+    Ws_b, bs_b = best_params
+    acts = [Xn.T]
+    for i, (W, b) in enumerate(zip(Ws_b, bs_b)):
+        z = W @ acts[-1] + b
+        a = _relu(z) if i < len(Ws_b) - 1 else z
+        acts.append(a)
+    pred_best = acts[-1].T
+    ss_res = float(np.sum((pred_best - y) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    rmse = float(np.sqrt(np.mean((pred_best - y) ** 2)))
+
+    # Build layers list for sa_cost.py inference
+    layers = []
+    for i, (W, b) in enumerate(zip(Ws_b, bs_b)):
+        layers.append({
+            "W":          W.tolist(),
+            "b":          b.ravel().tolist(),
+            "activation": "relu" if i < len(Ws_b) - 1 else "linear",
+        })
+
+    return {
+        "name":       f"MLP ({len(hidden)} hidden layers {hidden})",
+        "features":   feat_cols,
+        "input_mean": mu.tolist(),
+        "input_std":  sigma.tolist(),
+        "layers":     layers,
+        "r2":         r2,
+        "rmse":       rmse,
+        "n_obs":      N,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('files', nargs='*', help='Profile .txt files to analyse')
     ap.add_argument('--dir', metavar='DIR',
                     help='Directory of profile .txt files (uses the "best" file per n)')
-    ap.add_argument('--save-model', metavar='JSON',
-                    help='Save fitted model coefficients to JSON file')
+    ap.add_argument('--save-model', metavar='JSON', default='sa_cost_params.json',
+                    help='Save fitted model coefficients to JSON file '
+                         '(default: sa_cost_params.json, ready for sa_cost.py)')
     ap.add_argument('--save-cost-fn', metavar='PY',
                     help='Save generated SA cost function to .py file')
     ap.add_argument('--c', type=float, default=1.55,
@@ -701,12 +849,40 @@ def main():
     compare_with_heuristic(df, model_a, c=args.c, alpha=args.alpha)
 
     # ── Save outputs ─────────────────────────────────────────────────────────
-    best_model = model_b if model_b else model_a
+    best_linear = model_b if model_b else model_a
+
+    # Train MLP on same data
+    mlp_model = None
+    if best_linear:
+        print(f"\n{'─'*70}")
+        print("Training MLP...")
+        try:
+            mlp_model = train_mlp(df, hidden=(32, 16), epochs=2000, lr=3e-3, l2=1e-4)
+            print(f"  MLP R²={mlp_model['r2']:.4f}  RMSE={mlp_model['rmse']:.4f}"
+                  f"  N={mlp_model['n_obs']}")
+            linear_r2 = best_linear['r2']
+            if mlp_model['r2'] > linear_r2:
+                print(f"  MLP outperforms linear (ΔR²={mlp_model['r2']-linear_r2:+.4f})"
+                      f"  → saving MLP")
+                best_model = mlp_model
+            else:
+                print(f"  Linear model competitive (ΔR²={mlp_model['r2']-linear_r2:+.4f})"
+                      f"  → saving MLP anyway (richer model)")
+                best_model = mlp_model
+        except Exception as e:
+            print(f"  MLP training failed ({e}), falling back to linear")
+            best_model = best_linear
+    else:
+        best_model = best_linear
+
     if best_model:
-        if args.save_model:
-            with open(args.save_model, 'w') as f:
-                json.dump(best_model, f, indent=2)
-            print(f"\nModel saved to {args.save_model}")
+        # Always save — default path is sa_cost_params.json next to this script
+        out_path = args.save_model
+        with open(out_path, 'w') as f:
+            json.dump(best_model, f, indent=2)
+        src = best_model.get('name', 'unknown')
+        print(f"\nModel saved to {out_path}  [{src}]")
+        print(f"  Drop sa_cost_params.json next to sa_cost.py to activate.")
 
         if args.save_cost_fn:
             code = generate_sa_cost_function(model_a)

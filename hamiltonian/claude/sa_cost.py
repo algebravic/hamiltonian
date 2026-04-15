@@ -1,116 +1,198 @@
 """
-sa_cost.py
-----------
-Secondary cost function for the Simulated Annealing Hamiltonian-path search.
+sa_cost.py — Predict log(states_out / states_in) per DP step.
 
-Predicts log(so/si) — the log ratio of output to input states after a DP step.
-Lower values are better (fewer states = cheaper DP).
+Supports two backends, loaded from sa_cost_params.json:
+  - "linear" : OLS regression (Model B), fast, interpretable
+  - "mlp"    : small 2-layer ReLU MLP trained on profile data
 
-Parameters are loaded from sa_cost_params.json, which is written by
-profile_analysis.py.  The JSON format is a feature-vector model:
+Usage (sa_cost.py next to ham_ordering.py):
+    from sa_cost import sa_cost_fn
+    cost = sa_cost_fn(ordering, adj, n)   # log(total states), lower is better
 
-    {
-      "name":     "<model name>",
-      "features": ["const", "fs", "delta_fs", "n_back", "e_bag",
-                   "fs_nb", "fs_eb", "nb_eb", "nb_sq", "eb_sq"],
-      "coef":     [ ... ],
-      "r2":       ...,
-      "rmse":     ...,
-      "n_obs":    ...
-    }
-
-Supported feature names
------------------------
-  const    — intercept (always 1)
-  fs       — frontier size after this step
-  delta_fs — change in frontier size (fs_after - fs_before)
-  n_back   — back-edges from the newly placed vertex into the frontier
-  e_bag    — edges inside the frontier (bag edges)
-  fs_nb    — fs * n_back
-  fs_eb    — fs * e_bag
-  nb_eb    — n_back * e_bag
-  nb_sq    — n_back²
-  eb_sq    — e_bag²
-  fs_sq    — fs²
-
-To update the model: re-run profile_analysis.py (it overwrites sa_cost_params.json)
-then call sa_cost.reload() or restart the process.
+The JSON is written by profile_analysis.py --save-model <path>.
+If no JSON is found a simple fallback proxy is used.
 """
 
-import json
-import pathlib
+from __future__ import annotations
+import json, math, os
+from typing import Optional
 
-_PARAMS_FILE = pathlib.Path(__file__).parent / "sa_cost_params.json"
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
+_MODEL: Optional[dict] = None
+_SEARCH_NAMES = ["sa_cost_params.json"]
 
-class _Model:
-    __slots__ = ("features", "coef", "name", "r2", "rmse", "n_obs")
-    def __init__(self, d):
-        self.features = d["features"]
-        self.coef     = d["coef"]
-        self.name     = d.get("name", "")
-        self.r2       = d.get("r2", float("nan"))
-        self.rmse     = d.get("rmse", float("nan"))
-        self.n_obs    = d.get("n_obs", 0)
+def _find_json() -> Optional[str]:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in _SEARCH_NAMES:
+        for d in [here, os.getcwd()]:
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+    return None
 
+def reload() -> bool:
+    """Reload model from disk.  Returns True if a model was found."""
+    global _MODEL
+    path = _find_json()
+    if path is None:
+        _MODEL = None
+        return False
+    with open(path) as f:
+        _MODEL = json.load(f)
+    return True
 
-def _load() -> _Model:
-    with open(_PARAMS_FILE) as f:
-        return _Model(json.load(f))
+def model_info() -> str:
+    if _MODEL is None:
+        reload()
+    if _MODEL is None:
+        return "fallback (c^n_back heuristic)"
+    kind = _MODEL.get("name", "unknown")
+    r2   = _MODEL.get("r2", float("nan"))
+    return f"{kind}  R²={r2:.4f}"
 
+# ---------------------------------------------------------------------------
+# Feature extraction (same for both backends)
+# ---------------------------------------------------------------------------
 
-_M: _Model = _load()
+def _step_features(adj: dict, order: list) -> list[dict]:
+    """Return per-step feature dicts for a full ordering."""
+    n = len(order)
+    pos = {v: i for i, v in enumerate(order)}
+    last_step = {v: max((pos[w] for w in adj.get(v, set())), default=pos[v])
+                 for v in range(1, n + 1)}
 
+    features = []
+    frontier: set = set()
+    for step, v in enumerate(order):
+        old_fs = len(frontier)
+        frontier.add(v)
+        frontier -= {u for u in list(frontier) if last_step[u] <= step}
+        new_fs = len(frontier)
 
-def _eval(m: _Model, fs: float, delta_fs: float, n_back: int, e_bag: int) -> float:
-    """Evaluate the linear model for the given raw features."""
-    feat_map = {
-        "const":    1.0,
-        "fs":       fs,
-        "delta_fs": delta_fs,
-        "n_back":   n_back,
-        "e_bag":    e_bag,
-        "fs_nb":    fs * n_back,
-        "fs_eb":    fs * e_bag,
-        "nb_eb":    n_back * e_bag,
-        "nb_sq":    n_back ** 2,
-        "eb_sq":    e_bag ** 2,
-        "fs_sq":    fs ** 2,
-    }
-    return sum(c * feat_map[f] for c, f in zip(m.coef, m.features))
+        n_back = sum(1 for w in adj.get(v, set()) if w in frontier and pos[w] < step)
+        e_bag  = sum(1 for u in frontier for w in adj.get(u, set())
+                     if w in frontier and pos[u] < pos[w])
 
+        features.append({
+            "fs":       new_fs,
+            "delta_fs": new_fs - old_fs,
+            "n_back":   n_back,
+            "e_bag":    e_bag,
+            "fs_nb":    new_fs * n_back,
+            "nb_eb":    n_back * e_bag,
+            "eb_sq":    e_bag  * e_bag,
+            "nb_sq":    n_back * n_back,
+            "fs_eb":    new_fs * e_bag,
+        })
+    return features
 
-def sa_cost(fs: float, delta_fs: float, n_back: int, e_bag: int) -> float:
+# ---------------------------------------------------------------------------
+# Linear backend
+# ---------------------------------------------------------------------------
+
+def _linear_predict(feat: dict, params: dict) -> float:
+    features = params["features"]
+    coefs    = params["coefs"]
+    total    = coefs[0]  # const / intercept
+    for i, fname in enumerate(features[1:], 1):
+        total += coefs[i] * feat.get(fname, 0.0)
+    return total
+
+# ---------------------------------------------------------------------------
+# MLP backend — pure numpy inference
+# ---------------------------------------------------------------------------
+
+import struct as _struct
+
+def _relu(x: list[float]) -> list[float]:
+    return [max(0.0, v) for v in x]
+
+def _linear_layer(x: list[float], W: list[list[float]], b: list[float]) -> list[float]:
+    """Dense layer: out[j] = sum_i x[i]*W[j][i] + b[j]"""
+    return [b[j] + sum(x[i] * W[j][i] for i in range(len(x)))
+            for j in range(len(b))]
+
+def _mlp_predict(feat: dict, params: dict) -> float:
+    feat_names = params["features"]
+    x = [feat.get(f, 0.0) for f in feat_names]
+
+    # Standardise inputs
+    mu    = params["input_mean"]
+    sigma = params["input_std"]
+    x = [(x[i] - mu[i]) / (sigma[i] if sigma[i] > 1e-9 else 1.0)
+         for i in range(len(x))]
+
+    for layer in params["layers"]:
+        x = _linear_layer(x, layer["W"], layer["b"])
+        if layer.get("activation") == "relu":
+            x = _relu(x)
+
+    return x[0]
+
+# ---------------------------------------------------------------------------
+# Cost aggregation (log-sum-exp over steps)
+# ---------------------------------------------------------------------------
+
+_WARMUP_STEPS = 3   # skip trivial initial steps
+
+def _aggregate(step_feats: list[dict], predict_fn) -> float:
+    """Sum predicted log-ratios into a total log-cost (log-sum-exp)."""
+    log_so = 0.0
+    log_total = None
+    for i, feat in enumerate(step_feats):
+        if i < _WARMUP_STEPS or feat["fs"] <= 1:
+            continue
+        log_ratio = predict_fn(feat)
+        log_so += log_ratio
+        if log_total is None:
+            log_total = log_so
+        else:
+            m = max(log_total, log_so)
+            log_total = m + math.log(math.exp(log_total - m) + math.exp(log_so - m))
+    return log_total if log_total is not None else 0.0
+
+# ---------------------------------------------------------------------------
+# Fallback: c^n_back proxy (old heuristic)
+# ---------------------------------------------------------------------------
+
+def _fallback(step_feats: list[dict]) -> float:
+    C = 1.55
+    proxy = 1.0; cost = 0.0
+    for feat in step_feats:
+        expand = C ** feat["n_back"]
+        cost += proxy * expand
+        proxy = max(proxy * expand, 1.0)
+    return math.log(cost + 1.0)
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def sa_cost_fn(ordering: list, adj: dict, n: int) -> float:
     """
-    Predict log(so/si) for a DP step characterised by:
+    Predict total DP cost (lower is better) for the given vertex ordering.
 
-        fs       -- frontier size after placing this vertex
-        delta_fs -- change in frontier size (fs_after - fs_before)
-        n_back   -- back-edges from the newly placed vertex into the frontier
-        e_bag    -- edges entirely within the frontier (bag edges)
-
-    Returns a float.  Use math.exp(sa_cost(...)) to get the multiplicative
-    expansion factor for the SA proxy.
-
-    Parameters are read from sa_cost_params.json; call reload() after
-    updating that file without restarting the process.
+    Returns log(total_predicted_states).  Warmup steps (i < 3, fs <= 1)
+    are excluded from the prediction.
     """
-    return _eval(_M, fs, delta_fs, n_back, e_bag)
+    global _MODEL
+    if _MODEL is None:
+        reload()
+
+    feats = _step_features(adj, ordering)
+
+    if _MODEL is None:
+        return _fallback(feats)
+
+    kind = _MODEL.get("name", "")
+    if "mlp" in kind.lower():
+        return _aggregate(feats, lambda f: _mlp_predict(f, _MODEL))
+    else:
+        return _aggregate(feats, lambda f: _linear_predict(f, _MODEL))
 
 
-def reload() -> None:
-    """Hot-reload parameters from sa_cost_params.json."""
-    global _M
-    _M = _load()
-
-
-def model_info() -> dict:
-    """Return a summary of the currently loaded model."""
-    return {
-        "name":     _M.name,
-        "features": _M.features,
-        "coef":     _M.coef,
-        "r2":       _M.r2,
-        "rmse":     _M.rmse,
-        "n_obs":    _M.n_obs,
-    }
+# Auto-load on import
+reload()

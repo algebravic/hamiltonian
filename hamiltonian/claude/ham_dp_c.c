@@ -1138,7 +1138,7 @@ void count_ham_paths_peh(
 
 #include <pthread.h>
 
-typedef struct { u64 key; u128 val; } SMEntry;
+typedef struct { u64 key; u64 val;  } SMEntry;  /* val: u64 safe for n<=~110 */
 
 /* Fatal OOM handler — prints location and aborts cleanly.
    On macOS, malloc returns NULL under pressure rather than killing the
@@ -1989,7 +1989,7 @@ static void *sm_worker_runs(void *arg) {
 
     for (size_t i = w->lo; i < w->hi; i++) {
         u64  base = w->in[i].key;
-        u128 cnt  = w->in[i].val;
+        u64  cnt  = w->in[i].val;
         for (int S = 0; S < n_subsets; S++) {
             u64 nk = base; int valid = 1; int nc_inc = 0;
             for (int j = 0; j < w->n_back && valid; j++) {
@@ -2579,7 +2579,7 @@ void count_ham_paths_sm(
     u128 total = (u128)0;
 
     curr->data[0].key = KEY_MARKER;
-    curr->data[0].val = (u128)1;
+    curr->data[0].val = (u64)1;
     curr->cnt = 1;
 
     double t_start = now_ms(), t_prev = t_start;
