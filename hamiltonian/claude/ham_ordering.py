@@ -16,11 +16,14 @@ best_order(adj, n, method="bfs+sa") -> list[int]
 """
 
 from math import isqrt
-import math
 import random
 import copy
 
-from .sa_cost import sa_cost
+# Optional: MLP/linear model from sa_cost.py (drop sa_cost_params.json alongside)
+try:
+    from sa_cost import sa_cost_fn as _sa_cost_fn
+except ImportError:
+    _sa_cost_fn = None
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +262,21 @@ def best_order(adj: dict, n: int, method: str = "bfs+sa",
 # Secondary optimisation: refine a pathwidth-optimal ordering
 # ---------------------------------------------------------------------------
 
+def _max_fw_ok(adj: dict, order: list, pw_bound: int) -> bool:
+    """Return True iff no step exceeds pw_bound frontier vertices."""
+    n = len(order)
+    pos       = {v: i for i, v in enumerate(order)}
+    last_step = {v: max((pos[w] for w in adj[v]), default=pos[v])
+                 for v in range(1, n + 1)}
+    frontier: set = set()
+    for step, v in enumerate(order):
+        frontier.add(v)
+        frontier -= {u for u in list(frontier) if last_step[u] <= step}
+        if len(frontier) > pw_bound:
+            return False
+    return True
+
+
 def _dp_cost(adj: dict, order: list, pw_bound: int,
              expand_base: float = 1.55,
              density_alpha: float = 0.25,
@@ -287,6 +305,8 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
 
     Returns None if fw > pw_bound and spike_penalty == 0.
     """
+    import math
+
     BELL_PRE = [1,1,2,5,15,52,203,877,4140,21147,115975,678570,
                 4213597,27644437,190899322,1382958545]
     def bell_n(k):
@@ -310,12 +330,10 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
         # u leaves the frontier after step last_step[u] (its last neighbour's step),
         # so it should be absent from step last_step[u]+1 onward — i.e. remove
         # when last_step[u] <= current step.
-        fw_prev = len(frontier)
         frontier.add(v)
         frontier -= {u for u in list(frontier) if last_step[u] <= step}
 
         fw = len(frontier)
-        delta_fs = fw - fw_prev
 
         if fw > pw_bound:
             if spike_penalty == 0.0:
@@ -362,16 +380,12 @@ def _dp_cost(adj: dict, order: list, pw_bound: int,
         # placed vertices means even graph-isolated components can be linked)
         n_back = sum(1 for w in adj[v] if pos[w] < step and w in frontier)
 
+        # Density amplifier
         e_bag = sum(1 for u in frontier for w in adj[u]
                     if w in frontier and pos[u] < pos[w])
+        density_amp = (1.0 + density_alpha * (e_bag / fw)) if fw > 0 else 1.0
 
-        # Fitted model replaces the old c^n_back proxy.
-        # sa_cost(fs, delta_fs, n_back, e_bag) predicts log(so/si); exp() converts
-        # to a multiplicative expansion factor.
-        # density_amp is dropped: e_bag is now a direct model feature.
-        # fw_weight is retained for its spike_penalty and Bell comp_correction terms,
-        # which are structural constraints not captured by the regression.
-        expand  = math.exp(sa_cost(fw, delta_fs, n_back, e_bag)) * fw_weight
+        expand  = (expand_base ** n_back) * fw_weight * density_amp
         n_elim  = sum(1 for u in order[:step + 1] if last_step[u] == step)
         compress = max(0.5 ** n_elim, 0.01)
 
@@ -413,8 +427,22 @@ def sa_refine_order(
 
     rng = random.Random(seed)
     order = list(init_order)
-    cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base,
-                    density_alpha=density_alpha, spike_penalty=spike_penalty)
+
+    # Choose cost function: fitted model (MLP/linear) if available, else proxy.
+    # The model predicts log(total_states); we wrap it to enforce the pw_bound
+    # hard constraint by returning None for orderings that exceed it.
+    if _sa_cost_fn is not None:
+        def _cost(o):
+            if spike_penalty == 0.0 and not _max_fw_ok(adj, o, pw_bound):
+                return None
+            return _sa_cost_fn(o, adj, n)
+    else:
+        def _cost(o):
+            return _dp_cost(adj, o, pw_bound, expand_base=expand_base,
+                            density_alpha=density_alpha,
+                            spike_penalty=spike_penalty)
+
+    cost = _cost(order)
     if cost is None:
         raise ValueError("init_order already exceeds pw_bound")
 
@@ -430,9 +458,7 @@ def sa_refine_order(
         i, j = sorted(rng.sample(range(n), 2))
         order[i], order[j] = order[j], order[i]
 
-        new_cost = _dp_cost(adj, order, pw_bound, expand_base=expand_base,
-                            density_alpha=density_alpha,
-                            spike_penalty=spike_penalty)
+        new_cost = _cost(order)
         if new_cost is None:
             order[i], order[j] = order[j], order[i]
             T *= decay
@@ -599,7 +625,7 @@ def validate_multistart_orders(
     -------
     List of (partial_ms, sa_cost, order) sorted by partial_ms ascending.
     """
-    from .ham_dp_c import partial_dp_time_c
+    from ham_dp_c import partial_dp_time_c
 
     if verbose:
         print(f"  Validating {len(candidates)} candidates: "
