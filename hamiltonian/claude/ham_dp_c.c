@@ -1548,29 +1548,57 @@ static void smtab_ensure(SMTab *t, size_t needed) {
 }
 
 /* ── SM introduce ───────────────────────────────────────────────────── */
-/* After copying src→dst, src->data is no longer read and can serve as
-   the radix-sort scratch buffer, eliminating the separate intro_tmp
-   allocation (which was si × 24B = up to 13 GB for n=61 step 39).
+/* Parallel copy: each of P threads transforms N/P entries.
+   The sort that was here originally is no longer needed — sm_fused_sweep
+   workers accept unsorted input correctly, because each worker independently
+   radix-sorts its own output.  Removing the O(N log N) sequential sort and
+   replacing it with an O(N/P) parallel copy eliminates ~40% of total runtime
+   at large n on many-core machines.
 
-   NOTE: a parallel radix sort was tried here and reverted.  The scatter
-   phase is memory-bandwidth-bound, not CPU-bound; adding P threads
-   multiplies memory-controller write pressure by P without increasing
-   bandwidth.  The 4 simultaneous scatter streams saturate the write
-   queues, evict buf/tmp from SLC, and slow subsequent worker flushes
-   by 9× (measured: n=59 step 30 flush 1.1s → 10.6s).  Sequential
-   rbuf_pass with its 196KB RadixBuf fits in one P-core's L2 and issues
-   orderly 768-byte write-combining flushes.  For large si (e.g. 163M
-   at n=61 step 36) the 25s sequential sort is still the best option on
-   this hardware.                                                        */
+   Memory note: src->data is no longer used as sort scratch, so the caller
+   must free it after this call (as before — it freed it right after anyway). */
+
+typedef struct {
+    const SMEntry *src;
+    SMEntry       *dst;
+    size_t         lo, hi;
+    int            fs;
+} SMIntroJob;
+
+static void *sm_intro_thread(void *arg) {
+    SMIntroJob *j = (SMIntroJob *)arg;
+    for (size_t i = j->lo; i < j->hi; i++) {
+        j->dst[i].key = introduce(j->src[i].key, j->fs);
+        j->dst[i].val = j->src[i].val;
+    }
+    return NULL;
+}
+
 static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
     smtab_ensure(dst, src->cnt);
-    for (size_t i = 0; i < src->cnt; i++) {
-        dst->data[i].key = introduce(src->data[i].key, fs);
-        dst->data[i].val = src->data[i].val;
-    }
     dst->cnt = src->cnt;
-    /* src->data is fully read; cast away const to reuse as sort scratch. */
-    sm_radix_sort(dst->data, (SMEntry *)src->data, dst->cnt);
+    int P = sm_cfg.nthreads;
+    if (P <= 1 || src->cnt < 65536) {
+        /* Small or single-threaded: serial copy. */
+        for (size_t i = 0; i < src->cnt; i++) {
+            dst->data[i].key = introduce(src->data[i].key, fs);
+            dst->data[i].val = src->data[i].val;
+        }
+        return;
+    }
+    SMIntroJob *jobs   = (SMIntroJob *)malloc((size_t)P * sizeof(SMIntroJob));
+    pthread_t  *thds   = (pthread_t  *)malloc((size_t)P * sizeof(pthread_t));
+    SM_ALLOC_CHECK(jobs, (size_t)P * sizeof(SMIntroJob));
+    SM_ALLOC_CHECK(thds, (size_t)P * sizeof(pthread_t));
+    size_t chunk = (src->cnt + (size_t)P - 1) / (size_t)P;
+    for (int i = 0; i < P; i++) {
+        size_t lo = (size_t)i * chunk;
+        size_t hi = lo + chunk < src->cnt ? lo + chunk : src->cnt;
+        jobs[i] = (SMIntroJob){ src->data, dst->data, lo, hi, fs };
+        pthread_create(&thds[i], NULL, sm_intro_thread, &jobs[i]);
+    }
+    for (int i = 0; i < P; i++) pthread_join(thds[i], NULL);
+    free(jobs); free(thds);
 }
 
 /* ── SM worker (capped buffer + run accumulation) ───────────────────── */
@@ -2139,6 +2167,320 @@ static void sm_pairwise_merge_into(SMEntry **arrs, size_t *lens, int P,
 }
 
 
+/* Forward declaration — defined below. */
+static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
+                                   SMTab *nxt, size_t raw_total,
+                                   double *t_merge_ms_out);
+
+/* ── sm_global_ext_merge_par helpers ─────────────────────────────────────
+   Binary search within one ext stream for the first entry whose
+   eh_hash(key) >= target_hash.  Uses random access into the mmap region
+   (or pread for file-backed stores).  O(log run_len) random reads, each
+   fetching sizeof(SMEntry)=16 bytes; since MAP_ANON data is RAM-resident
+   the latency is L3-cache-miss level, not disk I/O.                     */
+static size_t sm_ext_stream_lower_bound(
+    int fd, void *map, size_t run_off_bytes, size_t run_len_entries,
+    u64 target_hash)
+{
+    size_t lo = 0, hi = run_len_entries;
+    while (lo < hi) {
+        size_t mid = (lo + hi) >> 1;
+        SMEntry e;
+        size_t off = run_off_bytes + mid * sizeof(SMEntry);
+        if (map)
+            memcpy(&e, (const char *)map + off, sizeof(SMEntry));
+        else
+            pread(fd, &e, sizeof(SMEntry), (off_t)off);
+        if (eh_hash(e.key) < target_hash) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+/* Per-thread job for sm_global_ext_merge_par.                           */
+typedef struct {
+    SMExtStream *streams;    /* K pre-initialised streams for this range */
+    int          K;          /* number of streams (= total_streams)       */
+    size_t       dyn_buf;    /* per-stream read-ahead buffer (entries)    */
+    SMEntry     *out;        /* output slice (pre-allocated by caller)    */
+    size_t       out_cap;    /* capacity of out[] in entries              */
+    size_t       out_cnt;    /* actual entries written (set by thread)    */
+} SMExtParJob;
+
+static void *sm_ext_par_merge_thread(void *arg) {
+    SMExtParJob *j   = (SMExtParJob *)arg;
+    int          K   = j->K;
+    SMExtStream *S   = j->streams;
+    size_t  dyn_buf  = j->dyn_buf;
+    SMEntry    *out  = j->out;
+    size_t   out_cap = j->out_cap;
+
+    /* Build initial min-heap over non-empty sub-streams. */
+    SMHEntry *h = (SMHEntry *)malloc((size_t)K * sizeof(SMHEntry));
+    int hs = 0;
+    for (int i = 0; i < K; i++)
+        if (S[i].buf_len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
+    for (int i = hs/2-1; i >= 0; i--) sm_heap_sift(h, hs, i);
+
+    size_t op = 0;
+
+/* Helper macros for refilling a stream inside the heap loop. */
+#define EXT_REFILL(sidx_)                                                   \
+    do {                                                                     \
+        SMExtStream *_s = &S[sidx_];                                         \
+        if (_s->run_pos < _s->run_len) {                                     \
+            size_t _rem = _s->run_len - _s->run_pos;                         \
+            size_t _n   = _rem < dyn_buf ? _rem : dyn_buf;                   \
+            size_t _off = _s->run_off + _s->run_pos * sizeof(SMEntry);       \
+            if (_s->map) memcpy(_s->buf,(const char*)_s->map+_off,           \
+                                _n*sizeof(SMEntry));                          \
+            else pread(_s->fd, _s->buf, _n*sizeof(SMEntry), (off_t)_off);    \
+            _s->buf_pos = 0; _s->buf_len = _n; _s->run_pos += _n;           \
+            h[0].key = _s->buf[0].key;                                       \
+            sm_heap_sift(h, hs, 0);                                          \
+        } else {                                                              \
+            h[0] = h[--hs];                                                  \
+            if (hs > 0) sm_heap_sift(h, hs, 0);                              \
+        }                                                                    \
+    } while(0)
+
+    while (hs > 0) {
+        int     s_idx = h[0].s;
+        SMEntry cur   = S[s_idx].buf[S[s_idx].buf_pos++];
+
+        if (S[s_idx].buf_pos < S[s_idx].buf_len) {
+            h[0].key = S[s_idx].buf[S[s_idx].buf_pos].key;
+            sm_heap_sift(h, hs, 0);
+        } else { EXT_REFILL(s_idx); }
+
+        /* Dedup: accumulate all streams sharing the same key. */
+        while (hs > 0 && h[0].key == cur.key) {
+            int s2 = h[0].s;
+            cur.val += S[s2].buf[S[s2].buf_pos++].val;
+            if (S[s2].buf_pos < S[s2].buf_len) {
+                h[0].key = S[s2].buf[S[s2].buf_pos].key;
+                sm_heap_sift(h, hs, 0);
+            } else { EXT_REFILL(s2); }
+        }
+#undef EXT_REFILL
+
+        /* Write output — out_cap is an upper bound; no realloc needed. */
+        if (op < out_cap) out[op] = cur;
+        op++;
+    }
+
+    j->out_cnt = op;
+    free(h);
+    return NULL;
+}
+
+/* ── sm_global_ext_merge_par ─────────────────────────────────────────────
+   Parallel K-way merge of all P workers' ext runs into nxt.
+
+   Algorithm (replaces single-threaded sm_global_ext_merge):
+     1. Sample SM_SAMPLES_PER_STREAM hash values from each of the K streams
+        via random access into their mmap regions.
+     2. Sort samples → pick T-1 splitters that divide the hash space evenly.
+     3. Binary-search each stream to find per-splitter entry boundaries.
+     4. Pre-allocate nxt->data using per-range entry counts as upper bounds.
+     5. Launch T merge threads; each thread runs a K-way heap merge over its
+        hash-range sub-streams, writing into a disjoint output slice.
+     6. Compact: memmove to close dedup gaps, shrink allocation.
+
+   Each thread reads its sub-streams via the existing buffered refill logic,
+   so memory access remains largely sequential per thread.                   */
+static size_t sm_global_ext_merge_par(SMWorkerState *WS, int P,
+                                      SMTab *nxt, size_t raw_total,
+                                      double *t_merge_ms_out) {
+    /* Count total streams. */
+    int total_streams = 0;
+    for (int i = 0; i < P; i++) total_streams += WS[i].n_runs;
+
+    if (total_streams == 0) {
+        smtab_ensure(nxt, 1);
+        nxt->cnt = 0;
+        *t_merge_ms_out = 0;
+        return 0;
+    }
+
+    /* Fall back to serial if too few streams to benefit from parallelism. */
+    int T = sm_cfg.nthreads;           /* merge threads */
+    if (T > total_streams) T = total_streams;
+    if (T < 2) {
+        /* Let the serial function handle it — call it via a compatible shim. */
+        return sm_global_ext_merge(WS, P, nxt, raw_total, t_merge_ms_out);
+    }
+
+    /* Dynamic per-stream buffer: share SLC across all stream buffers. */
+    size_t dyn_buf = (size_t)sm_cfg.slc_bytes
+                     / ((size_t)total_streams * sizeof(SMEntry));
+    if (dyn_buf < (size_t)sm_cfg.ext_stream_buf) dyn_buf = (size_t)sm_cfg.ext_stream_buf;
+    if (dyn_buf > (size_t)(1 << 20))             dyn_buf = (size_t)(1 << 20);
+
+    /* Build flat array of (fd, map, run_off, run_len) descriptors. */
+    typedef struct { int fd; void *map; size_t run_off; size_t run_len; } StreamDesc;
+    StreamDesc *SD = (StreamDesc *)malloc((size_t)total_streams * sizeof(StreamDesc));
+    SM_ALLOC_CHECK(SD, (size_t)total_streams * sizeof(StreamDesc));
+    {
+        int si = 0;
+        for (int w = 0; w < P; w++) {
+            size_t file_off = 0;
+            for (int r = 0; r < WS[w].n_runs; r++) {
+                SD[si].fd      = WS[w].run_fd;
+                SD[si].map     = WS[w].run_map;
+                SD[si].run_off = file_off;
+                SD[si].run_len = WS[w].run_lens[r];
+                file_off += WS[w].run_lens[r] * sizeof(SMEntry);
+                si++;
+            }
+        }
+    }
+
+    /* ── Phase 1: sample hash values from all streams ─────────────────── */
+    int sps  = SM_SAMPLES_PER_STREAM;   /* samples per stream */
+    int ns   = 0;
+    u64 *samples = (u64 *)malloc((size_t)total_streams * sps * sizeof(u64));
+    SM_ALLOC_CHECK(samples, (size_t)total_streams * sps * sizeof(u64));
+    for (int k = 0; k < total_streams; k++) {
+        size_t len = SD[k].run_len;
+        if (len == 0) continue;
+        for (int s = 0; s < sps; s++) {
+            size_t idx = (size_t)s * (len > 1 ? len - 1 : 0) / (sps > 1 ? sps - 1 : 1);
+            SMEntry e;
+            size_t off = SD[k].run_off + idx * sizeof(SMEntry);
+            if (SD[k].map) memcpy(&e, (const char*)SD[k].map + off, sizeof(SMEntry));
+            else           pread(SD[k].fd, &e, sizeof(SMEntry), (off_t)off);
+            samples[ns++] = eh_hash(e.key);
+        }
+    }
+    /* Insertion sort (tiny: total_streams × sps ≤ 64×64 = 4096 values). */
+    for (int i = 1; i < ns; i++) {
+        u64 v = samples[i]; int j = i - 1;
+        while (j >= 0 && samples[j] > v) { samples[j+1] = samples[j]; j--; }
+        samples[j+1] = v;
+    }
+    /* Pick T-1 splitters at evenly spaced quantiles. */
+    u64 *splitters = (u64 *)malloc((size_t)(T - 1) * sizeof(u64));
+    SM_ALLOC_CHECK(splitters, (size_t)(T - 1) * sizeof(u64));
+    for (int j = 0; j < T - 1; j++) {
+        int idx = (int)((size_t)(j + 1) * ns / T);
+        if (idx >= ns) idx = ns - 1;
+        splitters[j] = samples[idx];
+    }
+    free(samples);
+    /* Ensure strictly increasing. */
+    for (int j = 1; j < T - 1; j++)
+        if (splitters[j] <= splitters[j-1]) splitters[j] = splitters[j-1] + 1;
+
+    /* ── Phase 2: binary-search boundaries per (stream, splitter) ─────── */
+    /* bounds[k*(T+1) + t] = first entry index in stream k where hash >= splitter[t-1]
+       (with splitter[-1] = 0 → bounds[k][0] = 0, splitter[T-1] = MAX → bounds[k][T] = len) */
+    size_t *bounds = (size_t *)malloc((size_t)total_streams * (T + 1) * sizeof(size_t));
+    SM_ALLOC_CHECK(bounds, (size_t)total_streams * (T + 1) * sizeof(size_t));
+#define BND(k,t) bounds[(size_t)(k)*(T+1)+(t)]
+    for (int k = 0; k < total_streams; k++) {
+        BND(k,0) = 0;
+        for (int t = 0; t < T - 1; t++)
+            BND(k, t+1) = sm_ext_stream_lower_bound(
+                SD[k].fd, SD[k].map, SD[k].run_off, SD[k].run_len, splitters[t]);
+        BND(k, T) = SD[k].run_len;
+    }
+    free(splitters);
+
+    /* ── Phase 3: compute per-range upper-bound entry counts & offsets ── */
+    size_t *range_cap = (size_t *)malloc((size_t)T * sizeof(size_t));
+    size_t *offsets   = (size_t *)malloc((size_t)(T + 1) * sizeof(size_t));
+    SM_ALLOC_CHECK(range_cap, (size_t)T * sizeof(size_t));
+    SM_ALLOC_CHECK(offsets,   (size_t)(T + 1) * sizeof(size_t));
+    offsets[0] = 0;
+    for (int t = 0; t < T; t++) {
+        size_t cap = 0;
+        for (int k = 0; k < total_streams; k++)
+            cap += BND(k, t+1) - BND(k, t);
+        range_cap[t] = cap;
+        offsets[t+1] = offsets[t] + cap;
+    }
+    size_t total_upper = offsets[T];
+
+    /* Allocate output (upper bound before dedup). */
+    if (total_upper == 0) total_upper = 1;
+    smtab_ensure(nxt, total_upper);
+
+    /* ── Phase 4: build per-thread stream arrays and launch threads ───── */
+    SMExtParJob *jobs  = (SMExtParJob *)malloc((size_t)T * sizeof(SMExtParJob));
+    pthread_t   *thds  = (pthread_t   *)malloc((size_t)T * sizeof(pthread_t));
+    SM_ALLOC_CHECK(jobs, (size_t)T * sizeof(SMExtParJob));
+    SM_ALLOC_CHECK(thds, (size_t)T * sizeof(pthread_t));
+
+    /* Each thread gets its own array of K SMExtStream descriptors. */
+    SMExtStream *all_streams = (SMExtStream *)malloc(
+        (size_t)T * total_streams * sizeof(SMExtStream));
+    SM_ALLOC_CHECK(all_streams, (size_t)T * total_streams * sizeof(SMExtStream));
+
+    double t0 = now_ms();
+
+    for (int t = 0; t < T; t++) {
+        SMExtStream *ts = &all_streams[(size_t)t * total_streams];
+        for (int k = 0; k < total_streams; k++) {
+            size_t lo  = BND(k, t);
+            size_t hi  = BND(k, t+1);
+            size_t len = hi - lo;
+            ts[k].fd      = SD[k].fd;
+            ts[k].map     = SD[k].map;
+            ts[k].run_off = SD[k].run_off + lo * sizeof(SMEntry);
+            ts[k].run_len = len;
+            ts[k].run_pos = 0;
+            ts[k].buf_pos = 0;
+            ts[k].buf_len = 0;
+            ts[k].buf     = (SMEntry *)malloc(dyn_buf * sizeof(SMEntry));
+            SM_ALLOC_CHECK(ts[k].buf, dyn_buf * sizeof(SMEntry));
+            /* Pre-fill first buffer block. */
+            if (len > 0) {
+                size_t n   = len < dyn_buf ? len : dyn_buf;
+                size_t off = ts[k].run_off;
+                if (ts[k].map) memcpy(ts[k].buf,(const char*)ts[k].map+off,n*sizeof(SMEntry));
+                else           pread(ts[k].fd, ts[k].buf, n*sizeof(SMEntry), (off_t)off);
+                ts[k].buf_len = n;
+                ts[k].run_pos = n;
+            }
+        }
+        jobs[t].streams  = ts;
+        jobs[t].K        = total_streams;
+        jobs[t].dyn_buf  = dyn_buf;
+        jobs[t].out      = nxt->data + offsets[t];
+        jobs[t].out_cap  = range_cap[t];
+        jobs[t].out_cnt  = 0;
+        pthread_create(&thds[t], NULL, sm_ext_par_merge_thread, &jobs[t]);
+    }
+    for (int t = 0; t < T; t++) pthread_join(thds[t], NULL);
+
+    /* ── Phase 5: compact dedup gaps ─────────────────────────────────── */
+    size_t actual = 0;
+    for (int t = 0; t < T; t++) {
+        size_t cnt = jobs[t].out_cnt;
+        if (cnt > 0 && offsets[t] != actual)
+            memmove(nxt->data + actual, nxt->data + offsets[t], cnt * sizeof(SMEntry));
+        actual += cnt;
+    }
+    nxt->cnt = actual;
+
+    /* Shrink allocation to actual size. */
+    if (actual < total_upper) {
+        SMEntry *p = (SMEntry *)realloc(nxt->data, (actual > 0 ? actual : 1) * sizeof(SMEntry));
+        if (p) { nxt->data = p; nxt->cap = (actual > 0 ? actual : 1); }
+    }
+
+    *t_merge_ms_out = now_ms() - t0;
+
+    /* Cleanup. */
+    for (int t = 0; t < T; t++)
+        for (int k = 0; k < total_streams; k++)
+            free(all_streams[(size_t)t * total_streams + k].buf);
+    free(all_streams); free(jobs); free(thds);
+    free(bounds); free(range_cap); free(offsets); free(SD);
+#undef BND
+    return actual;
+}
+
 /* ── sm_global_ext_merge ────────────────────────────────────────────────────
    Single-pass K-way merge directly from all P workers' ext (SSD) runs into
    nxt, bypassing the intermediate W[i].out RAM arrays entirely.
@@ -2452,10 +2794,10 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             free(WS[i].buf); WS[i].buf = NULL;
             free(WS[i].tmp); WS[i].tmp = NULL;
         }
-        merge_path = "global_ext";
+        merge_path = "global_ext_par";
         double t_gm = 0;
         t_par0 = now_ms();
-        sm_global_ext_merge(WS, P, nxt, raw_total, &t_gm);
+        sm_global_ext_merge_par(WS, P, nxt, raw_total, &t_gm);
         t_par_merge = now_ms() - t_par0;
 
         /* Release all ext backing stores now that merge is complete.    */
@@ -2614,28 +2956,21 @@ void count_ham_paths_sm(
         int v = order[step];
         if (fs > MAX_FS_FAST) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
 
-        /* A. Introduce: copy curr→nxt with key transformation, then
-           radix-sort nxt using curr->data as scratch (curr is done
-           being read).  After this, curr->data holds garbage but its
-           allocation is still live; we free it before launching workers
-           so it doesn't contribute to peak memory during the sweep.    */
-        /* Free nxt->data before growing it to avoid a realloc peak of
-           curr + old_nxt + new_nxt simultaneously.  At step 39 (n=61):
-             curr=15.1GB  old_nxt=12.4GB  new_nxt=15.1GB  → 46.6GB → swap
-           After this free, smtab_ensure does a fresh malloc (not realloc):
-             curr=15.1GB  new_nxt=15.1GB  → 34.2GB → fits in 36GB.
-           smtab_ensure handles data==NULL by calling malloc instead of
-           realloc, so the free here is always safe.                        */
+        /* A. Introduce: parallel copy curr→nxt with key transformation.
+           P threads each transform N/P entries; no sort is needed because
+           sm_fused_sweep workers independently radix-sort their own output.
+           Free nxt->data before growing to avoid the peak:
+             curr + old_nxt + new_nxt simultaneously (e.g. 46.6 GB at n=61).
+           smtab_ensure on NULL data does a fresh malloc, not realloc.     */
         free(nxt->data); nxt->data = NULL; nxt->cap = 0;
-        smtab_ensure(nxt, curr->cnt);
         double t_intro0 = now_ms();
         sm_introduce(curr, nxt, fs);
         double t_intro_ms = now_ms() - t_intro0;
         if (instrument)
             fprintf(stderr, "  [inst] introduce: si=%zuM  %.0fms\n",
                     curr->cnt / 1000000, t_intro_ms);
-        /* Free curr->data now — it held the previous step's states and
-           was just used as sort scratch.  Workers don't need it.        */
+        /* Free curr->data now — it held the previous step's states.
+           Workers don't need it (no longer used as sort scratch).       */
         free(curr->data); curr->data = NULL; curr->cap = 0; curr->cnt = 0;
         { SMTab *t = curr; curr = nxt; nxt = t; }
         frontier[fs] = v; fidx[v] = fs; fs++;
