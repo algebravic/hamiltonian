@@ -2405,8 +2405,13 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
 
+    /* Sum raw output counts (before any dedup) from each worker. */
+    size_t raw_out_total = 0;
+    for (int i = 0; i < P; i++) raw_out_total += W[i].raw_out;
+
     /* Compute raw_total for pre-allocation and instrumentation. */
     size_t raw_total = 0;
+    size_t after_run_dedup_total = 0;  /* filled below per path */
 
     /* ── Merge strategy ─────────────────────────────────────────────────
        ext_runs path (large steps): sm_global_ext_merge
@@ -2431,6 +2436,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             for (int r = 0; r < WS[i].n_runs; r++)
                 raw_total += WS[i].run_lens[r];
         }
+        after_run_dedup_total = raw_total;  /* ext: run_lens are already intra-run deduped */
         /* Free curr->data now: workers have finished reading it and
            global_ext_merge reads from WS[i] ext files, not curr.
            Freeing curr (up to 15 GB at n=61 step 39) ensures the
@@ -2461,6 +2467,11 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
 
     } else {
         /* RAM path: per-worker merge_runs then final P-way merge. */
+        /* Stage 1: compute total after intra-run sort+dedup (before worker merge). */
+        size_t after_run_dedup_total = 0;
+        for (int i = 0; i < P; i++)
+            for (int r = 0; r < WS[i].n_runs; r++)
+                after_run_dedup_total += WS[i].runs[r].len;
         for (int i = 0; i < P; i++) {
             double tm0 = now_ms();
             W[i].out = sm_merge_runs(&WS[i], &W[i].out_len);
@@ -2528,6 +2539,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             "  [inst]   merge_runs(seq): total=%.0fms max=%.0fms  "
             "par_merge: %.0fms\n"
             "  [inst]   raw_out=%zuM  deduped=%zuM  dedup=%.1fx\n"
+            "  [inst]   dedup_stages: raw=%zuM  after_run=%zuM(%.2fx)  "
+            "after_wmerge=%zuM(%.2fx)  final=%zuM(%.2fx)\n"
             "  [inst]   worker details (compute / flush / merge_runs / n_runs / out):\n",
             step, n_back, ext_runs,
             ext_runs ? (int)(raw_total / (sm_cfg.worker_cap/2)) : WS[0].n_runs,
@@ -2535,7 +2548,16 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             t_flush_max,   t_wall_flush/P,
             t_merge_runs_total, t_merge_max,
             t_par_merge,
-            raw_total/1000000, nxt->cnt/1000000, dedup_ratio);
+            raw_total/1000000, nxt->cnt/1000000, dedup_ratio,
+            /* dedup_stages */
+            raw_out_total/1000000,
+            after_run_dedup_total/1000000,
+            after_run_dedup_total>0 ? (double)raw_out_total/after_run_dedup_total : 1.0,
+            /* after worker merge = raw_total for RAM path, same as after_run for ext */
+            raw_total/1000000,
+            raw_total>0 ? (double)after_run_dedup_total/raw_total : 1.0,
+            nxt->cnt/1000000,
+            raw_total>0 ? (double)raw_total/nxt->cnt : 1.0);
         for (int i = 0; i < P; i++) {
             fprintf(stderr,
                 "  [inst]     w%-2d  %6.0fms / %6.0fms / %6.0fms / %2d / %zuK\n",
