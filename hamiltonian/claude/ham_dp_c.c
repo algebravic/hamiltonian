@@ -2467,8 +2467,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
 
     } else {
         /* RAM path: per-worker merge_runs then final P-way merge. */
-        /* Stage 1: compute total after intra-run sort+dedup (before worker merge). */
-        size_t after_run_dedup_total = 0;
+        /* Stage 1: sum run lengths = entries after intra-run sort+dedup.
+           Assigns to the outer after_run_dedup_total (not a new variable). */
         for (int i = 0; i < P; i++)
             for (int r = 0; r < WS[i].n_runs; r++)
                 after_run_dedup_total += WS[i].runs[r].len;
