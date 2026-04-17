@@ -2797,7 +2797,14 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         }
 
     } else {
-        /* RAM path: per-worker merge_runs then final P-way merge. */
+        /* RAM path: per-worker merge_runs then final P-way merge.
+           Free curr->data now: all workers have finished reading it.
+           This saves curr_gb (up to 140 GB at n=75 step 44) during
+           the sm_merge_runs + parallel-merge phase, which itself
+           needs up to raw_out×24B of run data simultaneously.
+           curr->data = NULL makes the outer free() a no-op.          */
+        free(curr->data); curr->data = NULL; curr->cap = 0;
+
         /* Stage 1: sum run lengths = entries after intra-run sort+dedup.
            Assigns to the outer after_run_dedup_total (not a new variable). */
         for (int i = 0; i < P; i++)
