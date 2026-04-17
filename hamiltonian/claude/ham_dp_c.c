@@ -2655,16 +2655,20 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
 
 /* ── SM fused sweep ─────────────────────────────────────────────────── */
 /* Predict whether run data will exceed available RAM.
-   Conservative dedup estimate of 2× (actual is typically 3-6×) ensures
-   we switch to ext earlier than strictly necessary — safe but not wasteful
-   since the threshold only triggers on genuinely large steps.            */
+   Uses full CAP as the per-run size estimate (conservative).  The old
+   CAP/2 estimate assumed 2× intra-run dedup, which holds for low-nb
+   steps but badly underestimates for nb=3/4 steps where keys are nearly
+   unique (bpt >> state count) and runs are nearly full-sized.  Using CAP
+   triggers ext mode earlier on genuinely large steps, trading time for
+   memory safety.  The threshold only fires when run_bytes > avail, so
+   small steps (low si or low nb) stay in RAM mode as before.            */
 static int sm_should_use_ext(size_t si, int nb, size_t ram_bytes) {
     size_t P   = sm_cfg.nthreads;
     size_t CAP = sm_cfg.worker_cap;
     size_t chunk   = (si + P - 1) / P;
     size_t bpt     = chunk * ((size_t)1 << nb);
     size_t n_runs  = bpt > CAP ? (bpt + CAP - 1) / CAP : 1;
-    size_t run_bytes  = n_runs * (CAP / 2) * P * sizeof(SMEntry);
+    size_t run_bytes  = n_runs * CAP * P * sizeof(SMEntry);  /* conservative: full CAP per run */
     size_t os_head    = (size_t)4 << 30;
     size_t curr_bytes = si * sizeof(SMEntry);
     size_t bufs_bytes = P * 2 * CAP * sizeof(SMEntry);
