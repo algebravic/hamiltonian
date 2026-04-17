@@ -2987,6 +2987,10 @@ void count_ham_paths_sm(
 
         sm_fused_sweep(curr, nxt, fs, v_idx, widxs, n_back,
                        elim_desc, n_elim, step, n, &total, ram, instrument);
+        /* Free curr->data (the in-place-introduced table workers just read).
+           The ext path already frees it inside sm_fused_sweep (sets to NULL);
+           the RAM path does not, so this handles both: free(NULL) is a no-op. */
+        free(curr->data); curr->data = NULL; curr->cap = 0; curr->cnt = 0;
         { SMTab *t = curr; curr = nxt; nxt = t; }
 
         /* Update frontier */
