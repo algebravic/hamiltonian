@@ -258,6 +258,16 @@ def build_dataframe(profiles):
     df.loc[mask, 'nb_eb']   = df.loc[mask, 'n_back'] * df.loc[mask, 'e_bag']
     df.loc[mask, 'eb_sq']   = df.loc[mask, 'e_bag'] ** 2
 
+    # Sequence-aware features (high correlation with log_ratio)
+    df['step_frac']   = df['step'] / df['n'].clip(lower=1)       # position in ordering
+    df['nb_fs_ratio'] = df['n_back'] / df['fs'].clip(lower=1)    # connectivity density
+
+    # Autoregressive context: previous step's log-ratio (within same profile)
+    df = df.sort_values(['n', 'step'])
+    df['prev_log_ratio'] = (df.groupby('n')['log_ratio']
+                              .shift(1)
+                              .fillna(0.0))
+
     return df
 
 
@@ -610,143 +620,374 @@ def _relu(x):
 def _relu_grad(x):
     return (x > 0).astype(float)
 
-def train_mlp(df, hidden=(32, 16), epochs=2000, lr=3e-3, l2=1e-4,
-              dropout=0.15, seed=0):
+def _mlp_forward_col(Xn, Ws, bs, dropout_mask=None, dropout_rate=0.0):
+    """Column-format MLP forward. Xn: [N,F] row. Returns (acts_col, pred_Nx1)."""
+    acts = [Xn.T]   # [F, N]
+    for i, (W, b) in enumerate(zip(Ws, bs)):
+        z = W @ acts[-1] + b[:, None]
+        if i < len(Ws) - 1:
+            a = _relu(z)
+            if dropout_mask is not None and i == 0 and dropout_rate > 0:
+                a = a * dropout_mask.T / (1.0 - dropout_rate)
+        else:
+            a = z
+        acts.append(a)
+    return acts, acts[-1].T   # pred: [N,1]
+
+def _mlp_backward_col(resid, acts, Ws, bs, N_total, l2,
+                       dropout_mask=None, dropout_rate=0.0):
+    """Column-format MLP backward. resid: [N,1]. Returns (dWs, dbs, d_input [N,F])."""
+    dz = resid.T / N_total   # [1, N]  — column format
+    dWs = [None] * len(Ws)
+    dbs_out = [None] * len(bs)
+    da = None
+    for i in range(len(Ws) - 1, -1, -1):
+        dW  = dz @ acts[i].T + l2 / N_total * Ws[i]   # [dim_out, dim_in]
+        db  = dz.sum(axis=1)                            # [dim_out]
+        dWs[i] = dW
+        dbs_out[i] = db
+        da = Ws[i].T @ dz                              # [dim_in, N]
+        if i > 0:
+            gate = (acts[i] > 0).astype(float)
+            if dropout_mask is not None and i == 1 and dropout_rate > 0:
+                gate = gate * dropout_mask.T / (1.0 - dropout_rate)
+            dz = da * gate
+        # i=0: da = gradient w.r.t. input (column format [dim_in, N])
+    return dWs, dbs_out, da.T  # d_input: [N, dim_in]
+
+
+def train_mlp(df, hidden=(64, 32), epochs=4000, lr=2e-3, l2=1e-4,
+              dropout=0.1, seed=0):
     """
-    Train a small 2-hidden-layer ReLU MLP on the profile data.
+    Train a ReLU MLP on the profile data.
 
-    Features (same 9 as Model B): delta_fs, fs, n_back, e_bag,
-      fs_nb, nb_eb, eb_sq, nb_sq, fs_eb
-    Target: log_ratio = log(states_out / states_in)
+    Features (11):
+      9 base: delta_fs, fs, n_back, e_bag, fs_nb, nb_eb, eb_sq, nb_sq, fs_eb
+      2 new:  log_si  (= log(states_in), critical: tells model how loaded the DP is)
+              prev_log_ratio (= log-ratio of previous step — captures momentum)
 
-    Returns a dict compatible with sa_cost.py MLP backend.
+    log_si is autoregressive: during SA inference, sa_cost.py substitutes
+    the running predicted log(states) so the model "sees" how much state has
+    accumulated even without running the actual DP.
+
+    Returns a dict compatible with sa_cost.py.
     """
     import numpy as np
 
     feat_cols = ['delta_fs', 'fs', 'n_back', 'e_bag',
-                 'fs_nb', 'nb_eb', 'eb_sq', 'nb_sq', 'fs_eb']
+                 'fs_nb', 'nb_eb', 'eb_sq', 'nb_sq', 'fs_eb',
+                 'log_si', 'prev_log_ratio']
 
     sub = df.copy()
+    sub['log_si'] = sub.get('log_states_in',
+                             pd.Series(0.0, index=sub.index)).fillna(0.0)
     for f in feat_cols:
         if f not in sub.columns:
             sub[f] = 0.0
     sub = sub.dropna(subset=feat_cols + ['log_ratio'])
 
-    X = sub[feat_cols].values.astype(float)
-    y = sub['log_ratio'].values.astype(float).reshape(-1, 1)
-    N, F = X.shape
+    X      = sub[feat_cols].values.astype(float)
+    y      = sub['log_ratio'].values.astype(float).reshape(-1, 1)
+    n_vals = sub['n'].values
+    N, F   = X.shape
 
-    # Standardise inputs
     mu    = X.mean(axis=0)
-    sigma = X.std(axis=0)
-    sigma[sigma < 1e-9] = 1.0
-    Xn = (X - mu) / sigma
+    sigma = X.std(axis=0); sigma[sigma < 1e-9] = 1.0
+    Xn    = (X - mu) / sigma
 
     rng = np.random.default_rng(seed)
 
-    # Initialise weights (He init for ReLU)
+    # ── Leave-one-n-out cross-validation ─────────────────────────────────
+    unique_ns  = sorted(set(n_vals))
+    loo_preds  = np.full(N, np.nan)
+    loo_epochs = max(200, epochs // 6)
+
+    for hold_n in unique_ns:
+        test_mask  = (n_vals == hold_n)
+        train_mask = ~test_mask
+        if train_mask.sum() < 20:
+            continue
+        Xt, yt = Xn[train_mask], y[train_mask]
+        Nt = len(yt)
+        dims = [F] + list(hidden) + [1]
+        _rng = np.random.default_rng(seed + hold_n)
+        _Ws = [_rng.standard_normal((dims[i+1], dims[i])) * np.sqrt(2.0/dims[i])
+               for i in range(len(dims)-1)]
+        _bs = [np.zeros(dims[i+1]) for i in range(len(dims)-1)]
+        _mW = [np.zeros_like(W) for W in _Ws]
+        _vW = [np.zeros_like(W) for W in _Ws]
+        _mb = [np.zeros_like(b) for b in _bs]
+        _vb = [np.zeros_like(b) for b in _bs]
+        b1, b2, eps_a = 0.9, 0.999, 1e-8
+        for ep in range(1, loo_epochs + 1):
+            dm = _rng.random((Nt, hidden[0])) > dropout
+            acts_, pred_ = _mlp_forward_col(Xt, _Ws, _bs, dm, dropout)
+            resid_ = pred_ - yt
+            dWs_, dbs_, _ = _mlp_backward_col(resid_, acts_, _Ws, _bs, Nt, l2, dm, dropout)
+            for i in range(len(_Ws)):
+                _mW[i] = b1*_mW[i] + (1-b1)*dWs_[i]
+                _vW[i] = b2*_vW[i] + (1-b2)*dWs_[i]**2
+                _mb[i] = b1*_mb[i] + (1-b1)*dbs_[i]
+                _vb[i] = b2*_vb[i] + (1-b2)*dbs_[i]**2
+                _Ws[i] -= (0.5*lr if ep < loo_epochs//2 else lr) *                           (_mW[i]/(1-b1**ep)) / (np.sqrt(_vW[i]/(1-b2**ep)) + eps_a)
+                _bs[i] -= (0.5*lr if ep < loo_epochs//2 else lr) *                           (_mb[i]/(1-b1**ep)) / (np.sqrt(_vb[i]/(1-b2**ep)) + eps_a)
+        _, pf = _mlp_forward_col(Xn[test_mask], _Ws, _bs)
+        loo_preds[test_mask] = pf.ravel()
+
+    valid = ~np.isnan(loo_preds)
+    loo_r2, loo_rmse = float('nan'), float('nan')
+    if valid.sum() > 0:
+        yv, pv = y[valid].ravel(), loo_preds[valid]
+        ss_res = float(np.sum((pv - yv)**2))
+        ss_tot = float(np.sum((yv - yv.mean())**2))
+        loo_r2   = 1.0 - ss_res/ss_tot if ss_tot > 0 else float('nan')
+        loo_rmse = float(np.sqrt(ss_res/len(yv)))
+        print(f"  LOO-CV  R²={loo_r2:.4f}  RMSE={loo_rmse:.4f}  (n_folds={len(unique_ns)})")
+
+    # ── Full training ─────────────────────────────────────────────────────
     dims = [F] + list(hidden) + [1]
-    Ws, bs = [], []
-    for i in range(len(dims) - 1):
-        scale = np.sqrt(2.0 / dims[i])
-        Ws.append(rng.standard_normal((dims[i+1], dims[i])) * scale)
-        bs.append(np.zeros((dims[i+1], 1)))
-
-    # Adam optimiser state
-    m_W = [np.zeros_like(w) for w in Ws]
-    v_W = [np.zeros_like(w) for w in Ws]
-    m_b = [np.zeros_like(b) for b in bs]
-    v_b = [np.zeros_like(b) for b in bs]
-    beta1, beta2, eps = 0.9, 0.999, 1e-8
-
-    best_loss = float('inf')
-    best_params = None
+    Ws = [rng.standard_normal((dims[i+1], dims[i])) * np.sqrt(2.0/dims[i])
+          for i in range(len(dims)-1)]
+    bs = [np.zeros(dims[i+1]) for i in range(len(dims)-1)]
+    mW = [np.zeros_like(W) for W in Ws]
+    vW = [np.zeros_like(W) for W in Ws]
+    mb = [np.zeros_like(b) for b in bs]
+    vb = [np.zeros_like(b) for b in bs]
+    b1, b2, eps_a = 0.9, 0.999, 1e-8
+    best_loss, best_params = float('inf'), None
 
     for epoch in range(1, epochs + 1):
-        # Dropout mask (training only, applied to hidden layers)
-        mask = rng.random((N, hidden[0])) > dropout
-
-        # Forward pass
-        acts = [Xn.T]  # each col is a sample
-        for i, (W, b) in enumerate(zip(Ws, bs)):
-            z = W @ acts[-1] + b
-            if i < len(Ws) - 1:
-                a = _relu(z)
-                if i == 0:
-                    a = a * mask.T / (1.0 - dropout)
-            else:
-                a = z  # output: linear
-            acts.append(a)
-
-        pred = acts[-1].T  # (N, 1)
-        loss = float(np.mean((pred - y) ** 2))
-
-        # L2 regularisation
-        l2_loss = sum(np.sum(W ** 2) for W in Ws)
-        loss += 0.5 * l2 * l2_loss / N
-
+        dm = rng.random((N, hidden[0])) > dropout
+        acts, pred = _mlp_forward_col(Xn, Ws, bs, dm, dropout)
+        resid = pred - y
+        loss  = float(np.mean(resid**2)) + 0.5*l2*sum(float(np.sum(W**2)) for W in Ws)/N
         if loss < best_loss:
-            best_loss = loss
+            best_loss   = loss
             best_params = ([W.copy() for W in Ws], [b.copy() for b in bs])
+        dWs, dbs, _ = _mlp_backward_col(resid, acts, Ws, bs, N, l2, dm, dropout)
+        for i in range(len(Ws)):
+            mW[i] = b1*mW[i] + (1-b1)*dWs[i]
+            vW[i] = b2*vW[i] + (1-b2)*dWs[i]**2
+            mb[i] = b1*mb[i] + (1-b1)*dbs[i]
+            vb[i] = b2*vb[i] + (1-b2)*dbs[i]**2
+            Ws[i] -= lr * (mW[i]/(1-b1**epoch)) / (np.sqrt(vW[i]/(1-b2**epoch)) + eps_a)
+            bs[i] -= lr * (mb[i]/(1-b1**epoch)) / (np.sqrt(vb[i]/(1-b2**epoch)) + eps_a)
 
-        # Backward pass
-        dz = (pred - y) / N  # (N, 1)
-        for i in range(len(Ws) - 1, -1, -1):
-            dW = dz.T @ acts[i].T + l2 / N * Ws[i]
-            db = dz.T.sum(axis=1, keepdims=True)
-            if i > 0:
-                da = Ws[i].T @ dz.T
-                if i == 1:
-                    da = da * mask.T / (1.0 - dropout)
-                dz = (da * _relu_grad(Ws[i-1] @ acts[i-1] + bs[i-1])).T
-            # Adam update
-            t = epoch
-            m_W[i] = beta1 * m_W[i] + (1 - beta1) * dW
-            v_W[i] = beta2 * v_W[i] + (1 - beta2) * dW ** 2
-            m_b[i] = beta1 * m_b[i] + (1 - beta1) * db
-            v_b[i] = beta2 * v_b[i] + (1 - beta2) * db ** 2
-            mW_c = m_W[i] / (1 - beta1 ** t)
-            vW_c = v_W[i] / (1 - beta2 ** t)
-            mb_c = m_b[i] / (1 - beta1 ** t)
-            vb_c = v_b[i] / (1 - beta2 ** t)
-            lr_t = lr
-            Ws[i] -= lr_t * mW_c / (np.sqrt(vW_c) + eps)
-            bs[i] -= lr_t * mb_c / (np.sqrt(vb_c) + eps)
-
-    # Evaluate best model
     Ws_b, bs_b = best_params
-    acts = [Xn.T]
-    for i, (W, b) in enumerate(zip(Ws_b, bs_b)):
-        z = W @ acts[-1] + b
-        a = _relu(z) if i < len(Ws_b) - 1 else z
-        acts.append(a)
-    pred_best = acts[-1].T
-    ss_res = float(np.sum((pred_best - y) ** 2))
-    ss_tot = float(np.sum((y - y.mean()) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    rmse = float(np.sqrt(np.mean((pred_best - y) ** 2)))
+    _, pred_train = _mlp_forward_col(Xn, Ws_b, bs_b)
+    ss_res = float(np.sum((pred_train - y)**2))
+    ss_tot = float(np.sum((y - y.mean())**2))
+    r2   = 1.0 - ss_res/ss_tot if ss_tot > 0 else 0.0
+    rmse = float(np.sqrt(np.mean((pred_train - y)**2)))
 
-    # Build layers list for sa_cost.py inference
-    layers = []
-    for i, (W, b) in enumerate(zip(Ws_b, bs_b)):
-        layers.append({
-            "W":          W.tolist(),
-            "b":          b.ravel().tolist(),
-            "activation": "relu" if i < len(Ws_b) - 1 else "linear",
-        })
+    layers = [{"W": W.tolist(), "b": b.ravel().tolist(),
+               "activation": "relu" if i < len(Ws_b)-1 else "linear"}
+              for i, (W, b) in enumerate(zip(Ws_b, bs_b))]
 
     return {
-        "name":       f"MLP ({len(hidden)} hidden layers {hidden})",
+        "name":       f"MLP ({len(hidden)} hidden {hidden}, log_si+prev_lr)",
         "features":   feat_cols,
         "input_mean": mu.tolist(),
         "input_std":  sigma.tolist(),
         "layers":     layers,
         "r2":         r2,
         "rmse":       rmse,
+        "loo_r2":     loo_r2,
         "n_obs":      N,
     }
 
 
+def train_conv_mlp(df, kernel_size=5, n_filters=16, hidden=(64, 32),
+                   epochs=5000, lr=2e-3, l2=1e-4, dropout=0.1, seed=0):
+    """
+    Train a 1D ConvMLP on the profile step sequences.
+
+    Architecture
+    ------------
+    Input features (13):
+      9 base: delta_fs, fs, n_back, e_bag, fs_nb, nb_eb, eb_sq, nb_sq, fs_eb
+      4 new:  step_frac, nb_fs_ratio, log_si, prev_log_ratio
+
+    Conv1D layer: kernel_size K, n_filters C.  For each step t the conv reads
+      a zero-padded window of K consecutive normalised feature vectors and
+      produces a C-dim context (patterns like "3 expansions → collapse likely").
+
+    MLP: input = [F features || C conv activations], hidden layers, linear out.
+
+    Backward pass uses consistent column format [dim, N] throughout.
+    """
+    import numpy as np
+
+    feat_cols = ['delta_fs', 'fs', 'n_back', 'e_bag',
+                 'fs_nb', 'nb_eb', 'eb_sq', 'nb_sq', 'fs_eb',
+                 'step_frac', 'nb_fs_ratio', 'log_si', 'prev_log_ratio']
+    F = len(feat_cols)
+
+    sub = df.copy()
+    sub['log_si'] = sub.get('log_states_in',
+                             pd.Series(0.0, index=sub.index)).fillna(0.0)
+    for col in feat_cols:
+        if col not in sub.columns:
+            sub[col] = 0.0
+    sub = sub.dropna(subset=feat_cols + ['log_ratio', 'n'])
+
+    X_all = sub[feat_cols].values.astype(float)
+    mu    = X_all.mean(axis=0)
+    sigma = X_all.std(axis=0); sigma[sigma < 1e-9] = 1.0
+
+    sequences = []
+    for n_val, grp in sub.groupby('n'):
+        grp = grp.sort_values('step')
+        Xn = (grp[feat_cols].values.astype(float) - mu) / sigma
+        y  = grp['log_ratio'].values.astype(float)
+        sequences.append((Xn, y))
+
+    N_total = sum(len(y) for _, y in sequences)
+
+    pad = kernel_size // 2
+    def make_windows(Xn):
+        N, F_ = Xn.shape
+        Xp = np.pad(Xn, ((pad, pad), (0, 0)))
+        W  = np.zeros((N, kernel_size * F_))
+        for k in range(kernel_size):
+            W[:, k*F_:(k+1)*F_] = Xp[k:k+N]
+        return W   # [N, K*F]
+
+    rng = np.random.default_rng(seed)
+    KF = kernel_size * F
+    W_conv = rng.standard_normal((n_filters, KF)) * np.sqrt(2.0 / KF)
+    b_conv = np.zeros(n_filters)
+
+    mlp_in_dim = F + n_filters
+    dims = [mlp_in_dim] + list(hidden) + [1]
+    Ws = [rng.standard_normal((dims[i+1], dims[i])) * np.sqrt(2.0/dims[i])
+          for i in range(len(dims)-1)]
+    bs = [np.zeros(dims[i+1]) for i in range(len(dims)-1)]
+
+    def _adam_state(p): return np.zeros_like(p), np.zeros_like(p)
+    m_Wc, v_Wc = _adam_state(W_conv)
+    m_bc, v_bc = _adam_state(b_conv)
+    m_Ws = [_adam_state(W) for W in Ws]
+    m_bs = [_adam_state(b) for b in bs]
+    b1, b2, eps_a = 0.9, 0.999, 1e-8
+
+    best_loss, best_params = float('inf'), None
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        dW_conv_acc = np.zeros_like(W_conv)
+        db_conv_acc = np.zeros_like(b_conv)
+        dWs_acc = [np.zeros_like(W) for W in Ws]
+        dbs_acc = [np.zeros_like(b) for b in bs]
+
+        for Xn, y in sequences:
+            N_seq = len(y)
+            if N_seq == 0:
+                continue
+
+            # ── Forward ──────────────────────────────────────────────────
+            Win    = make_windows(Xn)               # [N, K*F]
+            conv_z = Win @ W_conv.T + b_conv        # [N, C]
+            conv_a = np.maximum(0, conv_z)          # [N, C]
+            dmask  = (rng.random(conv_a.shape) > dropout) / (1.0 - dropout)
+            conv_ad = conv_a * dmask                # [N, C]
+
+            mlp_in = np.concatenate([Xn, conv_ad], axis=1)  # [N, F+C]
+
+            # MLP forward in column format
+            acts = [mlp_in.T]                       # [F+C, N]
+            for i, (W, b) in enumerate(zip(Ws, bs)):
+                z = W @ acts[-1] + b[:, None]
+                acts.append(np.maximum(0, z) if i < len(Ws)-1 else z)
+
+            pred  = acts[-1].T                      # [N, 1]
+            resid = pred - y[:, None]               # [N, 1]
+            loss  = float(np.mean(resid**2)) / 2
+            l2pen = 0.5*l2*(float(np.sum(W_conv**2)) +
+                            sum(float(np.sum(W**2)) for W in Ws)) / N_total
+            total_loss += loss + l2pen
+
+            # ── Backward (all column format [dim, N]) ─────────────────────
+            dz = resid.T / N_total                  # [1, N]
+
+            da = None
+            for i in range(len(Ws)-1, -1, -1):
+                dW = dz @ acts[i].T + l2/N_total * Ws[i]    # [dim_out, dim_in]
+                db = dz.sum(axis=1)                          # [dim_out]
+                dWs_acc[i] += dW
+                dbs_acc[i] += db
+                da = Ws[i].T @ dz                            # [dim_in, N]
+                if i > 0:
+                    dz = da * (acts[i] > 0)                  # ReLU backward
+
+            # da = gradient w.r.t. mlp_in.T = [F+C, N]
+            d_mlp_in = da.T                                  # [N, F+C]
+            d_conv_ad = d_mlp_in[:, F:]                      # [N, C]
+            d_conv_z  = d_conv_ad * dmask * (conv_z > 0)    # [N, C]
+
+            db_conv_acc += d_conv_z.sum(axis=0)              # [C]
+            dW_conv_acc += d_conv_z.T @ Win + l2/N_total * W_conv  # [C, K*F]
+
+        # ── Adam update ───────────────────────────────────────────────────
+        def adam(p, g, m, v):
+            m[:] = b1*m + (1-b1)*g
+            v[:] = b2*v + (1-b2)*g**2
+            p -= lr * (m/(1-b1**epoch)) / (np.sqrt(v/(1-b2**epoch)) + eps_a)
+
+        adam(W_conv, dW_conv_acc, m_Wc, v_Wc)
+        adam(b_conv, db_conv_acc, m_bc, v_bc)
+        for i in range(len(Ws)):
+            adam(Ws[i], dWs_acc[i], m_Ws[i][0], m_Ws[i][1])
+            adam(bs[i], dbs_acc[i], m_bs[i][0], m_bs[i][1])
+
+        if total_loss < best_loss:
+            best_loss   = total_loss
+            best_params = (W_conv.copy(), b_conv.copy(),
+                           [W.copy() for W in Ws], [b.copy() for b in bs])
+
+        if epoch % 500 == 0:
+            print(f"    epoch {epoch:>5}/{epochs}  loss={total_loss:.5f}", flush=True)
+
+    # ── Evaluate ──────────────────────────────────────────────────────────
+    W_cb, b_cb, Ws_b, bs_b = best_params
+    all_pred, all_y = [], []
+    for Xn, y in sequences:
+        Win  = make_windows(Xn)
+        ca   = np.maximum(0, Win @ W_cb.T + b_cb)       # [N, C]
+        inp  = np.concatenate([Xn, ca], axis=1).T       # [F+C, N]
+        for i, (W, b) in enumerate(zip(Ws_b, bs_b)):
+            inp = W @ inp + b[:, None]
+            if i < len(Ws_b)-1:
+                inp = np.maximum(0, inp)
+        all_pred.append(inp.ravel())    # inp is [1,N] → ravel gives [N]
+        all_y.append(y)
+
+    all_pred = np.concatenate(all_pred)
+    all_y    = np.concatenate(all_y)
+    ss_res = float(np.sum((all_pred - all_y)**2))
+    ss_tot = float(np.sum((all_y - all_y.mean())**2))
+    r2   = 1.0 - ss_res/ss_tot if ss_tot > 0 else 0.0
+    rmse = float(np.sqrt(np.mean((all_pred - all_y)**2)))
+
+    layers = [{"W": W.tolist(), "b": b.ravel().tolist(),
+               "activation": "relu" if i < len(Ws_b)-1 else "linear"}
+              for i, (W, b) in enumerate(zip(Ws_b, bs_b))]
+
+    return {
+        "name":             f"ConvMLP (k={kernel_size}, c={n_filters}, {list(hidden)}, log_si)",
+        "model_type":       "conv_mlp",
+        "features":         feat_cols,
+        "input_mean":       mu.tolist(),
+        "input_std":        sigma.tolist(),
+        "conv_kernel":      W_cb.tolist(),
+        "conv_bias":        b_cb.tolist(),
+        "conv_kernel_size": kernel_size,
+        "conv_n_filters":   n_filters,
+        "layers":           layers,
+        "r2":               r2,
+        "rmse":             rmse,
+        "n_obs":            int(N_total),
+    }
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -855,23 +1096,50 @@ def main():
     mlp_model = None
     if best_linear:
         print(f"\n{'─'*70}")
-        print("Training MLP...")
+        print("Training MLP (64,32) with log_si + prev_log_ratio features...")
         try:
-            mlp_model = train_mlp(df, hidden=(32, 16), epochs=2000, lr=3e-3, l2=1e-4)
-            print(f"  MLP R²={mlp_model['r2']:.4f}  RMSE={mlp_model['rmse']:.4f}"
-                  f"  N={mlp_model['n_obs']}")
-            linear_r2 = best_linear['r2']
-            if mlp_model['r2'] > linear_r2:
-                print(f"  MLP outperforms linear (ΔR²={mlp_model['r2']-linear_r2:+.4f})"
-                      f"  → saving MLP")
-                best_model = mlp_model
-            else:
-                print(f"  Linear model competitive (ΔR²={mlp_model['r2']-linear_r2:+.4f})"
-                      f"  → saving MLP anyway (richer model)")
-                best_model = mlp_model
+            mlp_model = train_mlp(df, hidden=(64, 32), epochs=4000, lr=2e-3, l2=1e-4)
+            loo = mlp_model.get('loo_r2', float('nan'))
+            print(f"  MLP train-R²={mlp_model['r2']:.4f}  LOO-R²={loo:.4f}"
+                  f"  RMSE={mlp_model['rmse']:.4f}  N={mlp_model['n_obs']}")
         except Exception as e:
+            import traceback; traceback.print_exc()
             print(f"  MLP training failed ({e}), falling back to linear")
-            best_model = best_linear
+
+    # Train ConvMLP (1D conv + MLP, captures sequential patterns)
+    conv_model = None
+    print(f"\n{'─'*70}")
+    print("Training ConvMLP (k=5, c=16, (64,32)) with log_si + sequence context...")
+    try:
+        conv_model = train_conv_mlp(df, kernel_size=5, n_filters=16,
+                                    hidden=(64, 32), epochs=5000, lr=2e-3, l2=1e-4)
+        print(f"  ConvMLP R²={conv_model['r2']:.4f}  RMSE={conv_model['rmse']:.4f}"
+              f"  N={conv_model['n_obs']}")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"  ConvMLP training failed ({e})")
+
+    # Choose best model — prefer LOO-CV R² (honest) over training R² (can overfit)
+    def _model_score(m):
+        if m is None:
+            return -float('inf')
+        loo = m.get('loo_r2', float('nan'))
+        train = m.get('r2', 0.0)
+        # If LOO-CV available, use it; otherwise penalise by 0.15 to discourage
+        # models that only have training R² (likely overfitting to sequences)
+        return loo if not math.isnan(loo) else train - 0.15
+
+    candidates = [m for m in [mlp_model, conv_model, best_linear] if m]
+    if candidates:
+        best_model = max(candidates, key=_model_score)
+        print(f"\n  Model comparison (LOO-R² preferred for selection):")
+        for m in [best_linear, mlp_model, conv_model]:
+            if m:
+                loo  = m.get('loo_r2', float('nan'))
+                tr   = m.get('r2', float('nan'))
+                loo_s = f"  LOO={loo:.4f}" if not math.isnan(loo) else "  LOO=n/a"
+                marker = " <- selected" if m is best_model else ""
+                print(f"    {m.get('name','?'):<55} train={tr:.4f}{loo_s}{marker}")
     else:
         best_model = best_linear
 

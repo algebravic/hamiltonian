@@ -77,15 +77,18 @@ def _step_features(adj: dict, order: list) -> list[dict]:
                      if w in frontier and pos[u] < pos[w])
 
         features.append({
-            "fs":       new_fs,
-            "delta_fs": new_fs - old_fs,
-            "n_back":   n_back,
-            "e_bag":    e_bag,
-            "fs_nb":    new_fs * n_back,
-            "nb_eb":    n_back * e_bag,
-            "eb_sq":    e_bag  * e_bag,
-            "nb_sq":    n_back * n_back,
-            "fs_eb":    new_fs * e_bag,
+            "fs":           new_fs,
+            "delta_fs":     new_fs - old_fs,
+            "n_back":       n_back,
+            "e_bag":        e_bag,
+            "fs_nb":        new_fs * n_back,
+            "nb_eb":        n_back * e_bag,
+            "eb_sq":        e_bag  * e_bag,
+            "nb_sq":        n_back * n_back,
+            "fs_eb":        new_fs * e_bag,
+            # Sequence-aware features (high correlation, used by ConvMLP)
+            "step_frac":    step / max(n - 1, 1),
+            "nb_fs_ratio":  n_back / max(new_fs, 1),
         })
     return features
 
@@ -133,8 +136,140 @@ def _mlp_predict(feat: dict, params: dict) -> float:
     return x[0]
 
 # ---------------------------------------------------------------------------
-# Cost aggregation (log-sum-exp over steps)
+# ConvMLP backend — 1D conv over step sequence + MLP per step
 # ---------------------------------------------------------------------------
+
+def _conv_mlp_infer(feats: list[dict], params: dict) -> list[float]:
+    """
+    Run ConvMLP inference on a full step sequence.
+
+    The conv layer sees a K-step context window around each step.
+    log_si and prev_log_ratio are injected autoregressively: log_si at
+    step t = running predicted log(states) accumulated from steps 0..t-1.
+    This matches how the model was trained (log_si = log(actual states_in)).
+    """
+    feat_names  = params["features"]
+    mu          = params["input_mean"]
+    sigma       = params["input_std"]
+    W_conv      = params["conv_kernel"]    # list [C, K*F]
+    b_conv      = params["conv_bias"]      # list [C]
+    k_size      = params["conv_kernel_size"]
+    n_filters   = params["conv_n_filters"]
+    layers      = params["layers"]
+
+    N = len(feats)
+    F = len(feat_names)
+    pad = k_size // 2
+
+    # Index of autoregressive features (if present in model)
+    log_si_idx      = feat_names.index("log_si")      if "log_si"      in feat_names else None
+    prev_lr_idx     = feat_names.index("prev_log_ratio") if "prev_log_ratio" in feat_names else None
+
+    # Build raw (un-normalised) feature matrix, leaving log_si/prev_lr as 0
+    # — we'll fill them in autoregressively below using predicted log_so.
+    X_raw = [[feat.get(f, 0.0) for f in feat_names] for feat in feats]
+
+    # First pass: inject log_si and prev_log_ratio using a sequential prediction loop.
+    # We need the conv context to predict, but the conv context needs log_si.
+    # Resolution: run two passes.
+    #   Pass 1 — log_si=0 everywhere → rough predictions → rough log_so series
+    #   Pass 2 — use pass-1 log_so as log_si → final predictions
+    # Two passes is sufficient because log_si varies slowly relative to other features.
+
+    def _run_pass(X_raw_pass):
+        # Normalise
+        X = [[(v - mu[fi]) / (sigma[fi] if sigma[fi] > 1e-9 else 1.0)
+               for fi, v in enumerate(row)]
+             for row in X_raw_pass]
+
+        # Padded window matrix [N, k*F]
+        X_pad = [[0.0]*F]*pad + X + [[0.0]*F]*pad
+        W_mat = []
+        for t in range(N):
+            row = []
+            for k in range(k_size):
+                row.extend(X_pad[t + k])
+            W_mat.append(row)
+
+        # Conv forward
+        conv_out = []
+        for t in range(N):
+            row = []
+            for c in range(n_filters):
+                val = b_conv[c] + sum(W_conv[c][kf] * W_mat[t][kf]
+                                      for kf in range(k_size * F))
+                row.append(max(0.0, val))
+            conv_out.append(row)
+
+        # MLP per step
+        preds = []
+        for t in range(N):
+            x = X[t] + conv_out[t]
+            for layer in layers:
+                W_l, b_l = layer["W"], layer["b"]
+                out = [b_l[j] + sum(x[i]*W_l[j][i] for i in range(len(x)))
+                       for j in range(len(b_l))]
+                x = [max(0.0, v) for v in out] if layer.get("activation")=="relu" else out
+            preds.append(x[0])
+        return preds
+
+    # Pass 1: no autoregressive features
+    preds1 = _run_pass(X_raw)
+
+    if log_si_idx is None and prev_lr_idx is None:
+        return preds1  # model doesn't use these features
+
+    # Build pass-2 input with log_si/prev_lr from pass-1 predictions
+    X_raw2  = [list(row) for row in X_raw]
+    log_so  = 0.0
+    prev_lr = 0.0
+    for t, feat in enumerate(feats):
+        if log_si_idx is not None:
+            X_raw2[t][log_si_idx]  = log_so
+        if prev_lr_idx is not None:
+            X_raw2[t][prev_lr_idx] = prev_lr
+        prev_lr = preds1[t]
+        log_so += preds1[t]
+
+    return _run_pass(X_raw2)
+
+
+def _aggregate_precomputed(step_feats: list[dict], log_ratios: list[float],
+                            ram_gb: float = 0.0) -> float:
+    """
+    Aggregate pre-computed per-step log_ratios (from ConvMLP) into a
+    total log-cost using log-sum-exp, with optional OOM penalty.
+    """
+    ENTRY = 24
+    if ram_gb > 0:
+        max_safe = (ram_gb * (1 << 30)) / 2 / ENTRY
+        log_safe = math.log(max_safe)
+        PENALTY  = 20.0
+    else:
+        log_safe = float('inf')
+        PENALTY  = 0.0
+
+    log_so    = 0.0
+    log_total = None
+    penalty   = 0.0
+
+    for i, (feat, lr) in enumerate(zip(step_feats, log_ratios)):
+        if i < _WARMUP_STEPS or feat["fs"] <= 1:
+            continue
+        log_so += lr
+        if log_so > log_safe:
+            excess  = log_so - log_safe
+            penalty += PENALTY * excess * excess
+        if log_total is None:
+            log_total = log_so
+        else:
+            m = max(log_total, log_so)
+            log_total = m + math.log(math.exp(log_total - m) + math.exp(log_so - m))
+
+    base = log_total if log_total is not None else 0.0
+    return base + penalty
+
+
 
 _WARMUP_STEPS = 3   # skip trivial initial steps
 
@@ -162,16 +297,27 @@ def _aggregate(step_feats: list[dict], predict_fn,
 
     log_so = 0.0
     log_total = None
+    prev_pred = 0.0    # prev_log_ratio for autoregressive feature
     penalty = 0.0
+
     for i, feat in enumerate(step_feats):
         if i < _WARMUP_STEPS or feat["fs"] <= 1:
             continue
-        log_ratio = predict_fn(feat)
-        log_so += log_ratio
+
+        # Inject autoregressive features: the model was trained with
+        # log_si = log(states_in) and prev_log_ratio = previous step's log-ratio.
+        # At inference time we substitute the running predicted log(states).
+        feat_aug = dict(feat)
+        feat_aug["log_si"]         = log_so    # running predicted log(states)
+        feat_aug["prev_log_ratio"] = prev_pred
+
+        log_ratio = predict_fn(feat_aug)
+        prev_pred = log_ratio
+        log_so   += log_ratio
 
         # Penalise if predicted state count after this step would OOM
         if log_so > log_safe:
-            excess = log_so - log_safe
+            excess   = log_so - log_safe
             penalty += PENALTY * excess * excess
 
         if log_total is None:
@@ -205,14 +351,11 @@ def sa_cost_fn(ordering: list, adj: dict, n: int,
     """
     Predict total DP cost (lower is better) for the given vertex ordering.
 
-    Returns log(total_predicted_states) + OOM penalty.
-    Warmup steps (i < 3, fs <= 1) are excluded from the prediction.
+    For ConvMLP models the full step sequence is evaluated at once (conv
+    requires global context); for plain MLP/linear the prediction is per-step.
 
-    ram_gb: if > 0, adds a quadratic penalty for any step where the
-            predicted state count would exceed ram_gb×GB / 2 / 24B
-            (the safe threshold for the two-buffer introduce phase).
-            Set to the machine's RAM in GB to prevent SA from choosing
-            orderings that would OOM.  Example: ram_gb=768.0.
+    ram_gb: if > 0, adds a quadratic OOM penalty for steps where the
+            predicted state count would exceed ram_gb×GB / 2 / 24B.
     """
     global _MODEL
     if _MODEL is None:
@@ -223,8 +366,12 @@ def sa_cost_fn(ordering: list, adj: dict, n: int,
     if _MODEL is None:
         return _fallback(feats)
 
-    kind = _MODEL.get("name", "")
-    if "mlp" in kind.lower():
+    model_type = _MODEL.get("model_type", _MODEL.get("name", ""))
+
+    if "conv" in model_type.lower():
+        log_ratios = _conv_mlp_infer(feats, _MODEL)
+        return _aggregate_precomputed(feats, log_ratios, ram_gb)
+    elif "mlp" in model_type.lower():
         return _aggregate(feats, lambda f: _mlp_predict(f, _MODEL), ram_gb)
     else:
         return _aggregate(feats, lambda f: _linear_predict(f, _MODEL), ram_gb)
@@ -250,16 +397,19 @@ def predict_steps(ordering: list, adj: dict, n: int) -> list[dict]:
         reload()
 
     feats = _step_features(adj, ordering)
+    model_type = _MODEL.get("model_type", _MODEL.get("name", "")) if _MODEL else ""
 
     if _MODEL is None:
-        predict_fn = lambda f: math.log(max(1.55 ** f["n_back"], 1.0 + 1e-10))
-    elif "mlp" in _MODEL.get("name", "").lower():
-        predict_fn = lambda f: _mlp_predict(f, _MODEL)
+        pred_log_ratios = [math.log(max(1.55 ** f["n_back"], 1.0 + 1e-10)) for f in feats]
+    elif "conv" in model_type.lower():
+        pred_log_ratios = _conv_mlp_infer(feats, _MODEL)
+    elif "mlp" in model_type.lower():
+        pred_log_ratios = [_mlp_predict(f, _MODEL) for f in feats]
     else:
-        predict_fn = lambda f: _linear_predict(f, _MODEL)
+        pred_log_ratios = [_linear_predict(f, _MODEL) for f in feats]
 
     results = []
-    for i, (v, feat) in enumerate(zip(ordering, feats)):
+    for i, (v, feat, plr) in enumerate(zip(ordering, feats, pred_log_ratios)):
         results.append({
             "step":           i,
             "vertex":         v,
@@ -267,7 +417,7 @@ def predict_steps(ordering: list, adj: dict, n: int) -> list[dict]:
             "n_back":         feat["n_back"],
             "e_bag":          feat["e_bag"],
             "delta_fs":       feat["delta_fs"],
-            "pred_log_ratio": predict_fn(feat),
+            "pred_log_ratio": plr,
         })
     return results
 
@@ -387,16 +537,27 @@ def compare_with_profile(profile_path: str, verbose: bool = True) -> dict:
         print("ERROR: could not parse profile.")
         return {}
 
+    model_type = _MODEL.get("model_type", _MODEL.get("name", "")) if _MODEL else ""
+
     if _MODEL is None:
         predict_fn = lambda f: math.log(max(1.55 ** f["n_back"], 1.0 + 1e-10))
-    elif "mlp" in _MODEL.get("name", "").lower():
+        use_conv = False
+    elif "conv" in model_type.lower():
+        use_conv = True
+        predict_fn = None  # handled via sequence inference below
+    elif "mlp" in model_type.lower():
+        use_conv = False
         predict_fn = lambda f: _mlp_predict(f, _MODEL)
     else:
+        use_conv = False
         predict_fn = lambda f: _linear_predict(f, _MODEL)
 
     # Build comparison rows — skip trivial warmup (si <= 1) and terminal (fs=0)
     _WARMUP_SI = 1
     rows = []
+    prev_actual_lr = 0.0
+    running_log_si = 0.0   # accumulated actual log(si) for autoregressive features
+
     for step in sorted(steps):
         s = steps[step]
         si, so = s["si"], s["so"]
@@ -404,9 +565,21 @@ def compare_with_profile(profile_path: str, verbose: bool = True) -> dict:
             continue
         if so == 0:
             continue
-        feat   = _features_from_profile_step(step, steps)
-        actual = math.log(so / si)
+        feat = _features_from_profile_step(step, steps)
+
+        # Inject autoregressive features using ACTUAL profile values.
+        # For model assessment, this gives the fairest comparison:
+        # log_si = log(actual states_in), prev_log_ratio = actual previous log-ratio.
+        import math as _math
+        feat["log_si"]         = _math.log(si) if si > 0 else 0.0
+        feat["prev_log_ratio"] = prev_actual_lr
+
+        actual = _math.log(so / si)
         pred   = predict_fn(feat)
+
+        prev_actual_lr  = actual
+        running_log_si += actual
+
         rows.append({
             "step":   step,
             "vertex": s["vertex"],
