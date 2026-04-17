@@ -196,3 +196,292 @@ def sa_cost_fn(ordering: list, adj: dict, n: int) -> float:
 
 # Auto-load on import
 reload()
+
+# ---------------------------------------------------------------------------
+# Per-step prediction (for model assessment)
+# ---------------------------------------------------------------------------
+
+def predict_steps(ordering: list, adj: dict, n: int) -> list[dict]:
+    """
+    Return per-step predictions for a given ordering.
+
+    Each dict has:
+      step, vertex, fs, n_back, e_bag, delta_fs,
+      pred_log_ratio   (model prediction of log(so/si))
+    """
+    global _MODEL
+    if _MODEL is None:
+        reload()
+
+    feats = _step_features(adj, ordering)
+
+    if _MODEL is None:
+        predict_fn = lambda f: math.log(max(1.55 ** f["n_back"], 1.0 + 1e-10))
+    elif "mlp" in _MODEL.get("name", "").lower():
+        predict_fn = lambda f: _mlp_predict(f, _MODEL)
+    else:
+        predict_fn = lambda f: _linear_predict(f, _MODEL)
+
+    results = []
+    for i, (v, feat) in enumerate(zip(ordering, feats)):
+        results.append({
+            "step":           i,
+            "vertex":         v,
+            "fs":             feat["fs"],
+            "n_back":         feat["n_back"],
+            "e_bag":          feat["e_bag"],
+            "delta_fs":       feat["delta_fs"],
+            "pred_log_ratio": predict_fn(feat),
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Profile comparison
+# ---------------------------------------------------------------------------
+
+def _build_adj(n: int) -> dict:
+    """Build square-sum adjacency dict for G_n."""
+    squares = set(i * i for i in range(2, 2 * n + 2))
+    adj: dict = {v: set() for v in range(1, n + 1)}
+    for u in range(1, n + 1):
+        for v in range(u + 1, n + 1):
+            if u + v in squares:
+                adj[u].add(v)
+                adj[v].add(u)
+    return adj
+
+
+def _parse_profile(text: str):
+    """
+    Parse a profile log.  Returns (n, steps_dict).
+
+    steps_dict maps step_index → {vertex, fs, n_back, e_bag, si, so}.
+    Handles both old (8-field, no e_bag) and new (9-field) formats.
+    """
+    import re
+
+    # n from summary line — look for the result summary specifically
+    m = re.search(r'n=\s*(\d+)\s+pw=\d+', text)
+    if not m:
+        m = re.search(r'n=\s*(\d+)', text)
+    n = int(m.group(1)) if m else None
+
+    steps: dict = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or not line[0].isdigit():
+            continue
+        # Skip [inst] lines (they start with a digit only after stripping)
+        if '[inst]' in raw:
+            continue
+        parts = line.split()
+        # Collect numeric fields before any '{' or '[' token
+        nums = []
+        for p in parts:
+            if p.startswith('{') or p.startswith('['):
+                break
+            nums.append(p)
+        try:
+            if len(nums) == 8:                   # old format: no e_bag
+                step   = int(nums[0]);  vertex = int(nums[1])
+                fs     = int(nums[2]);  n_back = int(nums[3])
+                e_bag  = None
+                si     = int(nums[4]);  so     = int(nums[5])
+            elif len(nums) == 9:                 # new format: has e_bag
+                step   = int(nums[0]);  vertex = int(nums[1])
+                fs     = int(nums[2]);  n_back = int(nums[3])
+                e_bag  = int(nums[4])
+                si     = int(nums[5]);  so     = int(nums[6])
+            else:
+                continue
+        except (ValueError, IndexError):
+            continue
+        steps[step] = {"vertex": vertex, "fs": fs, "n_back": n_back,
+                       "e_bag": e_bag, "si": si, "so": so}
+
+    return n, steps
+
+
+def _features_from_profile_step(step: int, steps: dict) -> dict:
+    """
+    Construct a feature dict for one step using values from the parsed profile.
+    This matches the feature set that _step_features produces, using the
+    profile's own fs/n_back/e_bag rather than recomputing from the ordering.
+    delta_fs is inferred from the preceding step.
+    """
+    s     = steps[step]
+    fs    = s["fs"]
+    nb    = s["n_back"]
+    eb    = s["e_bag"] if s["e_bag"] is not None else 0
+    prev  = steps.get(step - 1)
+    prev_fs = prev["fs"] if prev else 0
+    delta = fs - prev_fs
+    return {
+        "fs":       fs,
+        "delta_fs": delta,
+        "n_back":   nb,
+        "e_bag":    eb,
+        "fs_nb":    fs * nb,
+        "nb_eb":    nb * eb,
+        "eb_sq":    eb * eb,
+        "nb_sq":    nb * nb,
+        "fs_eb":    fs * eb,
+    }
+
+
+def compare_with_profile(profile_path: str, verbose: bool = True) -> dict:
+    """
+    Load a profile file and compare MLP predictions against actual log(so/si).
+
+    Features are built directly from the profile's per-step fs/n_back/e_bag,
+    matching how the model was trained in profile_analysis.py.
+
+    Returns a dict with aggregate stats (r2, rmse, mae).
+    """
+    global _MODEL
+    if _MODEL is None:
+        reload()
+
+    with open(profile_path) as f:
+        text = f.read()
+
+    n, steps = _parse_profile(text)
+    if n is None or not steps:
+        print("ERROR: could not parse profile.")
+        return {}
+
+    if _MODEL is None:
+        predict_fn = lambda f: math.log(max(1.55 ** f["n_back"], 1.0 + 1e-10))
+    elif "mlp" in _MODEL.get("name", "").lower():
+        predict_fn = lambda f: _mlp_predict(f, _MODEL)
+    else:
+        predict_fn = lambda f: _linear_predict(f, _MODEL)
+
+    # Build comparison rows — skip trivial warmup (si <= 1) and terminal (fs=0)
+    _WARMUP_SI = 1
+    rows = []
+    for step in sorted(steps):
+        s = steps[step]
+        si, so = s["si"], s["so"]
+        if si <= _WARMUP_SI:
+            continue
+        if so == 0:
+            continue
+        feat   = _features_from_profile_step(step, steps)
+        actual = math.log(so / si)
+        pred   = predict_fn(feat)
+        rows.append({
+            "step":   step,
+            "vertex": s["vertex"],
+            "fs":     s["fs"],
+            "n_back": s["n_back"],
+            "e_bag":  s["e_bag"],
+            "si":     si,
+            "so":     so,
+            "actual": actual,
+            "pred":   pred,
+            "error":  pred - actual,
+        })
+
+    if not rows:
+        print("No comparable steps found (all si <= 1 or so == 0).")
+        return {}
+
+    # Aggregate stats
+    actuals = [r["actual"] for r in rows]
+    errors  = [r["error"]  for r in rows]
+    n_rows  = len(rows)
+    mean_a  = sum(actuals) / n_rows
+    ss_tot  = sum((a - mean_a) ** 2 for a in actuals)
+    ss_res  = sum(e ** 2 for e in errors)
+    r2      = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    rmse    = math.sqrt(ss_res / n_rows)
+    mae     = sum(abs(e) for e in errors) / n_rows
+
+    if verbose:
+        import re
+        m = re.search(r'n=\s*(\d+).*?dp=([\d.]+)s', text)
+        if m:
+            print(f"Profile: n={m.group(1)}  dp={float(m.group(2)):.1f}s")
+        print(f"Model:   {model_info()}")
+        print(f"Steps compared: {n_rows}  (si > 1, so > 0)")
+        has_ebag = any(r["e_bag"] is not None for r in rows)
+        print()
+
+        # Per-step table
+        eb_hdr = "  eb  " if has_ebag else "      "
+        hdr = (f"{'step':>4}  {'vtx':>4}  {'fs':>3}  {'nb':>3}{eb_hdr}"
+               f"{'si(M)':>8}  {'so(M)':>8}  {'actual':>8}  {'pred':>8}  {'error':>7}")
+        print(hdr)
+        print("─" * len(hdr))
+        for r in rows:
+            eb_col = f"  {r['e_bag']:>3}" if has_ebag and r['e_bag'] is not None else "     "
+            print(f"{r['step']:>4}  {r['vertex']:>4}  {r['fs']:>3}  {r['n_back']:>3}{eb_col}"
+                  f"  {r['si']/1e6:>8.2f}  {r['so']/1e6:>8.2f}"
+                  f"  {r['actual']:>8.3f}  {r['pred']:>8.3f}  {r['error']:>+7.3f}")
+
+        print()
+        print(f"{'─'*52}")
+        print(f"  R²   = {r2:+.4f}   (1.0 = perfect; 0 = predicts mean)")
+        print(f"  RMSE = {rmse:.4f}   (in log(so/si) units)")
+        print(f"  MAE  = {mae:.4f}")
+        print()
+
+        # Worst-predicted steps
+        worst = sorted(rows, key=lambda r: abs(r["error"]), reverse=True)[:8]
+        print("  Largest prediction errors:")
+        print(f"  {'step':>4}  {'nb':>3}  {'fs':>3}  {'actual':>8}  {'pred':>8}  {'error':>7}")
+        for r in worst:
+            print(f"  {r['step']:>4}  {r['n_back']:>3}  {r['fs']:>3}"
+                  f"  {r['actual']:>8.3f}  {r['pred']:>8.3f}  {r['error']:>+7.3f}")
+        print()
+
+        # ASCII residual scatter: x=actual, y=error
+        print("  Residual plot  (x = actual log(so/si),  y = error = pred − actual):")
+        W, H = 60, 12
+        xa, xe = min(actuals), max(actuals)
+        ye = max(abs(e) for e in errors)
+        if ye < 0.01: ye = 0.5
+        grid = [[" "] * W for _ in range(H)]
+        for r in rows:
+            xi = int((r["actual"] - xa) / max(xe - xa, 1e-9) * (W - 1))
+            yi = int((r["error"] + ye) / (2 * ye) * (H - 1))
+            xi = max(0, min(W - 1, xi))
+            yi = max(0, min(H - 1, H - 1 - yi))
+            grid[yi][xi] = "·"
+        zero_y = H - 1 - int((0 + ye) / (2 * ye) * (H - 1))
+        zero_y = max(0, min(H - 1, zero_y))
+        for xi in range(W):
+            if grid[zero_y][xi] == " ":
+                grid[zero_y][xi] = "─"
+        for row_i, row in enumerate(grid):
+            lbl = ""
+            if row_i == 0:      lbl = f"{+ye:+.2f}"
+            elif row_i == H//2: lbl = f"{0.0:+.2f}"
+            elif row_i == H-1:  lbl = f"{-ye:+.2f}"
+            else:               lbl = "     "
+            print(f"  {lbl:>6} │{''.join(row)}│")
+        print(f"         {xa:.2f}" + " " * (W - 10) + f"{xe:.2f}")
+        print(f"         {'actual log(so/si)':^{W}}")
+
+    return {"r2": r2, "rmse": rmse, "mae": mae, "n_steps": n_rows}
+
+
+# ---------------------------------------------------------------------------
+# Command-line entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python sa_cost.py <profile.txt> [profile2.txt ...]")
+        print("  Compares MLP predictions against actual profile step data.")
+        sys.exit(0)
+    for path in sys.argv[1:]:
+        if len(sys.argv) > 2:
+            print(f"\n{'='*60}")
+            print(f"  {path}")
+            print(f"{'='*60}")
+        stats = compare_with_profile(path)
+
