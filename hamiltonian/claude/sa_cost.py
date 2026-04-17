@@ -138,21 +138,50 @@ def _mlp_predict(feat: dict, params: dict) -> float:
 
 _WARMUP_STEPS = 3   # skip trivial initial steps
 
-def _aggregate(step_feats: list[dict], predict_fn) -> float:
-    """Sum predicted log-ratios into a total log-cost (log-sum-exp)."""
+def _aggregate(step_feats: list[dict], predict_fn,
+               ram_gb: float = 0.0) -> float:
+    """
+    Sum predicted log-ratios into a total log-cost (log-sum-exp).
+
+    If ram_gb > 0, applies a quadratic penalty for any step where the
+    predicted state count would exceed the safe introduce threshold
+    (ram_gb × 1GB / 2 / 24B).  This prevents SA from choosing orderings
+    that would OOM during the two-buffer introduce phase.
+    The penalty is large enough to dominate the cost function so SA
+    strongly avoids such orderings, but still continuous so the SA
+    gradient is smooth.
+    """
+    ENTRY = 24
+    if ram_gb > 0:
+        max_safe = (ram_gb * (1 << 30)) / 2 / ENTRY
+        log_safe = math.log(max_safe)
+        PENALTY = 20.0   # multiplier on quadratic excess
+    else:
+        log_safe = float('inf')
+        PENALTY = 0.0
+
     log_so = 0.0
     log_total = None
+    penalty = 0.0
     for i, feat in enumerate(step_feats):
         if i < _WARMUP_STEPS or feat["fs"] <= 1:
             continue
         log_ratio = predict_fn(feat)
         log_so += log_ratio
+
+        # Penalise if predicted state count after this step would OOM
+        if log_so > log_safe:
+            excess = log_so - log_safe
+            penalty += PENALTY * excess * excess
+
         if log_total is None:
             log_total = log_so
         else:
             m = max(log_total, log_so)
             log_total = m + math.log(math.exp(log_total - m) + math.exp(log_so - m))
-    return log_total if log_total is not None else 0.0
+
+    base = log_total if log_total is not None else 0.0
+    return base + penalty
 
 # ---------------------------------------------------------------------------
 # Fallback: c^n_back proxy (old heuristic)
@@ -171,12 +200,19 @@ def _fallback(step_feats: list[dict]) -> float:
 # Public API
 # ---------------------------------------------------------------------------
 
-def sa_cost_fn(ordering: list, adj: dict, n: int) -> float:
+def sa_cost_fn(ordering: list, adj: dict, n: int,
+               ram_gb: float = 0.0) -> float:
     """
     Predict total DP cost (lower is better) for the given vertex ordering.
 
-    Returns log(total_predicted_states).  Warmup steps (i < 3, fs <= 1)
-    are excluded from the prediction.
+    Returns log(total_predicted_states) + OOM penalty.
+    Warmup steps (i < 3, fs <= 1) are excluded from the prediction.
+
+    ram_gb: if > 0, adds a quadratic penalty for any step where the
+            predicted state count would exceed ram_gb×GB / 2 / 24B
+            (the safe threshold for the two-buffer introduce phase).
+            Set to the machine's RAM in GB to prevent SA from choosing
+            orderings that would OOM.  Example: ram_gb=768.0.
     """
     global _MODEL
     if _MODEL is None:
@@ -189,9 +225,9 @@ def sa_cost_fn(ordering: list, adj: dict, n: int) -> float:
 
     kind = _MODEL.get("name", "")
     if "mlp" in kind.lower():
-        return _aggregate(feats, lambda f: _mlp_predict(f, _MODEL))
+        return _aggregate(feats, lambda f: _mlp_predict(f, _MODEL), ram_gb)
     else:
-        return _aggregate(feats, lambda f: _linear_predict(f, _MODEL))
+        return _aggregate(feats, lambda f: _linear_predict(f, _MODEL), ram_gb)
 
 
 # Auto-load on import

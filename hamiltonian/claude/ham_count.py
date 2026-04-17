@@ -310,6 +310,15 @@ def parse_args():
                         "memory safety.  E.g. --mem-reserve-gb 300 on a 768 GB "
                         "machine makes the backend plan for 468 GB available. "
                         "Default: 0 (use all detected RAM).")
+    p.add_argument("--ram-gb", type=float, default=0.0, metavar="GB",
+                   help="(SA ordering only) Physical RAM in GB.  When set, the SA "
+                        "cost function adds a quadratic OOM penalty for any "
+                        "ordering step whose predicted state count would exceed "
+                        "RAM/2/24B entries (the two-buffer introduce threshold). "
+                        "Prevents SA from choosing orderings that would OOM during "
+                        "the introduce phase.  Recommended: set to ~60%% of total "
+                        "RAM to leave headroom for worker buffers and OS, e.g. "
+                        "--ram-gb 460 on a 768 GB machine.  Default: 0 (disabled).")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Print per-step frontier DP progress.")
     p.add_argument("--profile", action="store_true",
@@ -404,12 +413,14 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
                 print(f"  validate: best by partial DP ({k} steps) "
                       f"has SA cost={ranked[0][1]:.3e}", flush=True)
         else:
+            _ram_gb = getattr(args, 'ram_gb', 0.0)
             order, best_iter, _ = sa_refine_order(
                                     adj, n_vertices, order, pw,
                                     n_iter=args.refine_iters,
                                     expand_base=eb,
                                     density_alpha=da,
-                                    spike_penalty=sp)
+                                    spike_penalty=sp,
+                                    ram_gb=_ram_gb)
             if getattr(args, 'verbose', False) or True:
                 pct = 100 * best_iter / args.refine_iters
                 print(f"  SA best found at iter {best_iter:,}/{args.refine_iters:,} "

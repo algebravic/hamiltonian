@@ -406,6 +406,7 @@ def sa_refine_order(
     expand_base: float = 1.55,
     density_alpha: float = 0.25,
     spike_penalty: float = 0.0,
+    ram_gb: float = 0.0,
 ) -> list:
     """
     Refine *init_order* using simulated annealing.
@@ -419,6 +420,11 @@ def sa_refine_order(
     early spikes (cheap, because the proxy state count is low) for a
     smoother overall profile.  spike_penalty=16 is a reasonable starting
     point: fw=pw+1 costs 16x the normal rate at that proxy level.
+
+    ram_gb: if > 0, adds a quadratic OOM penalty to the MLP cost function
+            for any step where the predicted state count would require more
+            than ram_gb×GB / 2 / 24B entries (the two-buffer introduce
+            threshold).  Set to the machine's RAM in GB, e.g. ram_gb=768.0.
 
     The returned ordering may have max_fw > pw_bound when spike_penalty > 0.
     Use frontier_stats() to check the actual max after refinement.
@@ -435,7 +441,7 @@ def sa_refine_order(
         def _cost(o):
             if spike_penalty == 0.0 and not _max_fw_ok(adj, o, pw_bound):
                 return None
-            return _sa_cost_fn(o, adj, n)
+            return _sa_cost_fn(o, adj, n, ram_gb=ram_gb)
     else:
         def _cost(o):
             return _dp_cost(adj, o, pw_bound, expand_base=expand_base,

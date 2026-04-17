@@ -1548,53 +1548,42 @@ static void smtab_ensure(SMTab *t, size_t needed) {
 }
 
 /* ── SM introduce ───────────────────────────────────────────────────── */
-/* Parallel copy: each of P threads transforms N/P entries.
-   The sort that was here originally is no longer needed — sm_fused_sweep
-   workers accept unsorted input correctly, because each worker independently
-   radix-sorts its own output.  Removing the O(N log N) sequential sort and
-   replacing it with an O(N/P) parallel copy eliminates ~40% of total runtime
-   at large n on many-core machines.
+/* In-place parallel introduce: transform tab->data[i].key in-place.
+   introduce(key, fs) = key | (enc_v(0) << (4*fs))
+   It only ORs in bits at position fs and never touches bits 0..fs-1,
+   so each entry can be updated independently without reading any other
+   entry.  In-place operation halves the peak memory vs a copy:
+     - Copy approach: curr(si) + nxt(si) = 2×si simultaneously
+     - In-place:      curr(si) only — nxt is allocated later in sm_fused_sweep
+   At n=75 step 57 (13.3B states = 303GB), this saves 303GB.            */
 
-   Memory note: src->data is no longer used as sort scratch, so the caller
-   must free it after this call (as before — it freed it right after anyway). */
-
-typedef struct {
-    const SMEntry *src;
-    SMEntry       *dst;
-    size_t         lo, hi;
-    int            fs;
-} SMIntroJob;
+typedef struct { SMEntry *data; size_t lo, hi; int fs; } SMIntroJob;
 
 static void *sm_intro_thread(void *arg) {
     SMIntroJob *j = (SMIntroJob *)arg;
-    for (size_t i = j->lo; i < j->hi; i++) {
-        j->dst[i].key = introduce(j->src[i].key, j->fs);
-        j->dst[i].val = j->src[i].val;
-    }
+    u64 mask = (u64)enc_v(0) << (4 * j->fs);
+    for (size_t i = j->lo; i < j->hi; i++)
+        j->data[i].key |= mask;
     return NULL;
 }
 
-static void sm_introduce(const SMTab *src, SMTab *dst, int fs) {
-    smtab_ensure(dst, src->cnt);
-    dst->cnt = src->cnt;
+static void sm_introduce(SMTab *tab, int fs) {
     int P = sm_cfg.nthreads;
-    if (P <= 1 || src->cnt < 65536) {
-        /* Small or single-threaded: serial copy. */
-        for (size_t i = 0; i < src->cnt; i++) {
-            dst->data[i].key = introduce(src->data[i].key, fs);
-            dst->data[i].val = src->data[i].val;
-        }
+    if (P <= 1 || tab->cnt < 65536) {
+        u64 mask = (u64)enc_v(0) << (4 * fs);
+        for (size_t i = 0; i < tab->cnt; i++)
+            tab->data[i].key |= mask;
         return;
     }
-    SMIntroJob *jobs   = (SMIntroJob *)malloc((size_t)P * sizeof(SMIntroJob));
-    pthread_t  *thds   = (pthread_t  *)malloc((size_t)P * sizeof(pthread_t));
+    SMIntroJob *jobs = (SMIntroJob *)malloc((size_t)P * sizeof(SMIntroJob));
+    pthread_t  *thds = (pthread_t  *)malloc((size_t)P * sizeof(pthread_t));
     SM_ALLOC_CHECK(jobs, (size_t)P * sizeof(SMIntroJob));
     SM_ALLOC_CHECK(thds, (size_t)P * sizeof(pthread_t));
-    size_t chunk = (src->cnt + (size_t)P - 1) / (size_t)P;
+    size_t chunk = (tab->cnt + (size_t)P - 1) / (size_t)P;
     for (int i = 0; i < P; i++) {
         size_t lo = (size_t)i * chunk;
-        size_t hi = lo + chunk < src->cnt ? lo + chunk : src->cnt;
-        jobs[i] = (SMIntroJob){ src->data, dst->data, lo, hi, fs };
+        size_t hi = lo + chunk < tab->cnt ? lo + chunk : tab->cnt;
+        jobs[i] = (SMIntroJob){ tab->data, lo, hi, fs };
         pthread_create(&thds[i], NULL, sm_intro_thread, &jobs[i]);
     }
     for (int i = 0; i < P; i++) pthread_join(thds[i], NULL);
@@ -2956,28 +2945,26 @@ void count_ham_paths_sm(
         int v = order[step];
         if (fs > MAX_FS_FAST) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
 
-        /* A. Introduce: parallel copy curr→nxt with key transformation.
-           P threads each transform N/P entries; no sort is needed because
-           sm_fused_sweep workers independently radix-sort their own output.
-           Free nxt->data before growing to avoid the peak:
-             curr + old_nxt + new_nxt simultaneously (e.g. 46.6 GB at n=61).
-           smtab_ensure on NULL data does a fresh malloc, not realloc.     */
-        free(nxt->data); nxt->data = NULL; nxt->cap = 0;
+        /* A. Introduce: transform curr->data in-place.
+           introduce(key, fs) ORs enc_v(0)<<(4*fs) into each key — it only
+           touches bits at position fs and is independent per entry, so P
+           threads can do N/P entries each with no synchronisation.
+           In-place avoids allocating a separate nxt here, halving peak RAM:
+             Old (copy): curr(si) + nxt(si) = 2×si simultaneously
+             New (in-place): curr(si) only — nxt allocated later in sweep
+           At n=75 step 57 (13.3B states = 303GB) this saves 303GB.      */
         double t_intro0 = now_ms();
-        sm_introduce(curr, nxt, fs);
+        sm_introduce(curr, fs);
         double t_intro_ms = now_ms() - t_intro0;
         if (instrument)
             fprintf(stderr, "  [inst] introduce: si=%zuM  %.0fms\n",
                     curr->cnt / 1000000, t_intro_ms);
-        /* Free curr->data now — it held the previous step's states.
-           Workers don't need it (no longer used as sort scratch).       */
-        free(curr->data); curr->data = NULL; curr->cap = 0; curr->cnt = 0;
-        { SMTab *t = curr; curr = nxt; nxt = t; }
+        /* curr->data now holds the introduced keys; pass directly to sweep.
+           No swap needed — curr IS the introduced table.                  */
         frontier[fs] = v; fidx[v] = fs; fs++;
 
-        /* nxt (the old curr shell, now empty) will be populated by the
-           sweep.  Freeing its data here (already NULL after the swap)
-           is a no-op; smtab_ensure in sm_fused_sweep will allocate.    */
+        /* nxt is still empty (data=NULL from previous step's free or initial
+           state).  sm_fused_sweep will allocate it via smtab_ensure.      */
 
         /* B+C. Fused sweep */
         int v_idx = fs - 1;
