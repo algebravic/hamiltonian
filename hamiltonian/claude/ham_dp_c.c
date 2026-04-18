@@ -2898,6 +2898,17 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             free(WS[i].run_lens); WS[i].run_lens = NULL;
         }
 
+        /* Shrink nxt to deduped size (same as RAM path).
+           sm_global_ext_merge_par pre-allocates nxt at raw_total
+           (e.g. 474 GB for step 60 raw_out=21189M) then fills only
+           nxt->cnt entries (e.g. 179 GB after 2.6× dedup).  Without
+           this shrink, curr->cap after the swap equals raw_total and
+           the next sweep OOMs: curr(474) + workers(192) = 666 GB.    */
+        if (nxt->cnt < nxt->cap) {
+            SMEntry *p = (SMEntry*)sm_realloc(nxt->data, nxt->cnt * sizeof(SMEntry));
+            if (p) { nxt->data = p; nxt->cap = nxt->cnt; }
+        }
+
     } else {
         /* RAM path: per-worker merge_runs then final P-way merge.
            Free curr->data now: all workers have finished reading it.
@@ -2956,31 +2967,16 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(pw_lens);
 
         /* Shrink nxt->data to deduped size.
-           smtab_ensure allocated at raw_total (e.g. 362 GB at n=75 step 56),
-           but nxt->cnt is the deduped count (e.g. 297 GB).  Without this
+           smtab_ensure allocated at raw_total (e.g. 474 GB for ext step 60),
+           but nxt->cnt is the deduped count (e.g. 179 GB).  Without this
            shrink, the next step's sweep sees curr->cap = raw_total and
-           peak = curr_raw(362) + workers(192) = 554 GB → OOM.
-           After shrink: peak = curr_ded(297) + workers(192) = 489 GB → fits.
-
-           Platform notes:
-           Linux: realloc to smaller size is a no-move inplace shrink via
-             mremap; it is fast and safe.
-           macOS 26+ (Tahoe): the new xzone allocator routes realloc-shrink
-             through mach_vm_reclaim, which has an assertion bug (status 133,
-             EXC_BREAKPOINT from xzone_segment.c:214).  We avoid realloc and
-             instead use madvise(MADV_FREE_REUSABLE) to release the tail pages
-             to the OS while keeping the pointer valid.  This achieves the same
-             physical memory saving without going through the xzone path.
-             MADV_FREE_REUSABLE is a macOS extension that marks pages as
-             reclaimable by the OS but does not change the virtual mapping.   */
+           peak = curr_raw + workers → OOM.  Applies to BOTH ext and RAM paths.
+           sm_realloc handles both platforms safely.                           */
         if (nxt->cnt < nxt->cap) {
-            /* Shrink nxt to deduped size: sm_realloc handles both platforms.
-               On macOS: mmap is adjusted in-place (no copy, no xzone).
-               On Linux: mremap shrinks inplace (effectively free).        */
             SMEntry *p = (SMEntry*)sm_realloc(nxt->data, nxt->cnt * sizeof(SMEntry));
             if (p) { nxt->data = p; nxt->cap = nxt->cnt; }
         }
-    }
+    }  /* end RAM path */
 
     if (instrument) {
         /* Print sm_merge_bb buffer parameters for reference. */
