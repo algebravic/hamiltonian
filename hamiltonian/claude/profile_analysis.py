@@ -198,9 +198,12 @@ def build_dataframe(profiles):
     Convert parsed profiles into a flat DataFrame, one row per DP step.
     Adds derived features: delta_fs, log_ratio, is_terminal, etc.
     Drops steps with states_in <= 1 (warm-up phase, all trivial).
+
+    Each profile gets a unique profile_id so that diverse orderings for
+    the same n can be kept separate in LOO-CV (held out by profile, not by n).
     """
     rows = []
-    for p in profiles:
+    for pid, p in enumerate(profiles):
         n   = p['n']
         pw  = p['pw']
         steps = p['steps']
@@ -223,6 +226,7 @@ def build_dataframe(profiles):
                 log_ratio = math.log(so / si)
 
             row = dict(
+                profile_id=pid,   # unique per profile, not per n
                 n=n,
                 pw=pw,
                 step=s['step'],
@@ -263,8 +267,9 @@ def build_dataframe(profiles):
     df['nb_fs_ratio'] = df['n_back'] / df['fs'].clip(lower=1)    # connectivity density
 
     # Autoregressive context: previous step's log-ratio (within same profile)
-    df = df.sort_values(['n', 'step'])
-    df['prev_log_ratio'] = (df.groupby('n')['log_ratio']
+    # Group by profile_id so diverse orderings of the same n stay separate
+    df = df.sort_values(['profile_id', 'step'])
+    df['prev_log_ratio'] = (df.groupby('profile_id')['log_ratio']
                               .shift(1)
                               .fillna(0.0))
 
@@ -688,7 +693,9 @@ def train_mlp(df, hidden=(64, 32), epochs=4000, lr=2e-3, l2=1e-4,
 
     X      = sub[feat_cols].values.astype(float)
     y      = sub['log_ratio'].values.astype(float).reshape(-1, 1)
-    n_vals = sub['n'].values
+    # Use profile_id for LOO-CV so each diverse ordering is a separate fold
+    grp_vals = (sub['profile_id'].values if 'profile_id' in sub.columns
+                else sub['n'].values)
     N, F   = X.shape
 
     mu    = X.mean(axis=0)
@@ -697,20 +704,20 @@ def train_mlp(df, hidden=(64, 32), epochs=4000, lr=2e-3, l2=1e-4,
 
     rng = np.random.default_rng(seed)
 
-    # ── Leave-one-n-out cross-validation ─────────────────────────────────
-    unique_ns  = sorted(set(n_vals))
-    loo_preds  = np.full(N, np.nan)
-    loo_epochs = max(200, epochs // 6)
+    # ── Leave-one-profile-out cross-validation ────────────────────────────
+    unique_grps = sorted(set(grp_vals))
+    loo_preds   = np.full(N, np.nan)
+    loo_epochs  = max(200, epochs // 6)
 
-    for hold_n in unique_ns:
-        test_mask  = (n_vals == hold_n)
+    for hold_g in unique_grps:
+        test_mask  = (grp_vals == hold_g)
         train_mask = ~test_mask
         if train_mask.sum() < 20:
             continue
         Xt, yt = Xn[train_mask], y[train_mask]
         Nt = len(yt)
         dims = [F] + list(hidden) + [1]
-        _rng = np.random.default_rng(seed + hold_n)
+        _rng = np.random.default_rng(seed + int(hold_g))
         _Ws = [_rng.standard_normal((dims[i+1], dims[i])) * np.sqrt(2.0/dims[i])
                for i in range(len(dims)-1)]
         _bs = [np.zeros(dims[i+1]) for i in range(len(dims)-1)]
@@ -742,7 +749,7 @@ def train_mlp(df, hidden=(64, 32), epochs=4000, lr=2e-3, l2=1e-4,
         ss_tot = float(np.sum((yv - yv.mean())**2))
         loo_r2   = 1.0 - ss_res/ss_tot if ss_tot > 0 else float('nan')
         loo_rmse = float(np.sqrt(ss_res/len(yv)))
-        print(f"  LOO-CV  R²={loo_r2:.4f}  RMSE={loo_rmse:.4f}  (n_folds={len(unique_ns)})")
+        print(f"  LOO-CV  R²={loo_r2:.4f}  RMSE={loo_rmse:.4f}  (n_folds={len(unique_grps)} profiles)")
 
     # ── Full training ─────────────────────────────────────────────────────
     dims = [F] + list(hidden) + [1]
@@ -1046,18 +1053,17 @@ def main():
         print("No valid profiles loaded.  Exiting.")
         sys.exit(1)
 
-    # Deduplicate by n (keep one per n — prefer more steps, newer format)
+    # Show profile counts per n — keep ALL profiles (diverse orderings are valuable)
     by_n = defaultdict(list)
     for p in profiles:
         by_n[p['n']].append(p)
-    deduped = []
-    for n in sorted(by_n):
-        candidates = by_n[n]
-        best = max(candidates,
-                   key=lambda p: (p['steps'][0]['e_bag'] is not None, len(p['steps'])))
-        deduped.append(best)
-    profiles = deduped
-    print(f"  → {len(profiles)} distinct n-values: {sorted(p['n'] for p in profiles)}")
+    n_counts = {n: len(ps) for n, ps in by_n.items()}
+    multi = {n: c for n, c in n_counts.items() if c > 1}
+    print(f"  → {len(profiles)} profiles across {len(by_n)} n-values: "
+          f"{sorted(by_n.keys())}")
+    if multi:
+        print(f"  → Multiple profiles per n (all kept for diversity): "
+              + ", ".join(f"n={n}×{c}" for n, c in sorted(multi.items())))
 
     # ── Build dataframe ──────────────────────────────────────────────────────
     df = build_dataframe(profiles)
