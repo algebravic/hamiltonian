@@ -2852,6 +2852,49 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         t_par_merge = now_ms() - t_par0;
         free(pw_arrs);
         free(pw_lens);
+
+        /* Shrink nxt->data to deduped size.
+           smtab_ensure allocated at raw_total (e.g. 362 GB at n=75 step 56),
+           but nxt->cnt is the deduped count (e.g. 297 GB).  Without this
+           shrink, the next step's sweep sees curr->cap = raw_total and
+           peak = curr_raw(362) + workers(192) = 554 GB → OOM.
+           After shrink: peak = curr_ded(297) + workers(192) = 489 GB → fits.
+
+           Platform notes:
+           Linux: realloc to smaller size is a no-move inplace shrink via
+             mremap; it is fast and safe.
+           macOS 26+ (Tahoe): the new xzone allocator routes realloc-shrink
+             through mach_vm_reclaim, which has an assertion bug (status 133,
+             EXC_BREAKPOINT from xzone_segment.c:214).  We avoid realloc and
+             instead use madvise(MADV_FREE_REUSABLE) to release the tail pages
+             to the OS while keeping the pointer valid.  This achieves the same
+             physical memory saving without going through the xzone path.
+             MADV_FREE_REUSABLE is a macOS extension that marks pages as
+             reclaimable by the OS but does not change the virtual mapping.   */
+        if (nxt->cnt < nxt->cap) {
+#if defined(__APPLE__)
+            /* macOS: release tail pages without realloc to avoid xzone bug.
+               MADV_FREE_REUSABLE marks pages after nxt->cnt as reclaimable.  */
+            size_t used_bytes = nxt->cnt * sizeof(SMEntry);
+            size_t page_size  = (size_t)4096;
+            size_t used_pages = (used_bytes + page_size - 1) / page_size * page_size;
+            size_t cap_bytes  = nxt->cap * sizeof(SMEntry);
+            if (cap_bytes > used_pages) {
+                char *tail = (char*)nxt->data + used_pages;
+                size_t tail_bytes = cap_bytes - used_pages;
+#  if defined(MADV_FREE_REUSABLE)
+                madvise(tail, tail_bytes, MADV_FREE_REUSABLE);
+#  elif defined(MADV_FREE)
+                madvise(tail, tail_bytes, MADV_FREE);
+#  endif
+            }
+            nxt->cap = nxt->cnt;  /* update logical cap so next smtab_ensure works */
+#else
+            /* Linux: realloc-shrink is inplace via mremap; safe and fast.    */
+            SMEntry *p = (SMEntry*)realloc(nxt->data, nxt->cnt * sizeof(SMEntry));
+            if (p) { nxt->data = p; nxt->cap = nxt->cnt; }
+#endif
+        }
     }
 
     if (instrument) {
