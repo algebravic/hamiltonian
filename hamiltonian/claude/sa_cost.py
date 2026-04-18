@@ -24,6 +24,13 @@ from typing import Optional
 _MODEL: Optional[dict] = None
 _SEARCH_NAMES = ["sa_cost_params.json"]
 
+# Machine parameters loaded from machine.yaml (used for ext-mode detection).
+# Defaults match a typical 4-core Mac; overridden by machine.yaml if present.
+_MACHINE: dict = {
+    "SM_NTHREADS":    4,
+    "SM_WORKER_CAP":  128 * (1 << 20),   # 128M entries
+}
+
 def _find_json() -> Optional[str]:
     here = os.path.dirname(os.path.abspath(__file__))
     for name in _SEARCH_NAMES:
@@ -32,6 +39,25 @@ def _find_json() -> Optional[str]:
             if os.path.isfile(p):
                 return p
     return None
+
+def _load_machine_yaml() -> None:
+    """Load SM_NTHREADS and SM_WORKER_CAP from machine.yaml if present."""
+    global _MACHINE
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in [here, os.getcwd()]:
+        p = os.path.join(d, "machine.yaml")
+        if os.path.isfile(p):
+            try:
+                import yaml
+                with open(p) as f:
+                    cfg = yaml.safe_load(f)
+                if "SM_NTHREADS" in cfg:
+                    _MACHINE["SM_NTHREADS"] = int(cfg["SM_NTHREADS"])
+                if "SM_WORKER_CAP" in cfg:
+                    _MACHINE["SM_WORKER_CAP"] = int(cfg["SM_WORKER_CAP"])
+                return
+            except Exception:
+                pass
 
 def reload() -> bool:
     """Reload model from disk.  Returns True if a model was found."""
@@ -42,6 +68,7 @@ def reload() -> bool:
         return False
     with open(path) as f:
         _MODEL = json.load(f)
+    _load_machine_yaml()
     return True
 
 def model_info() -> str:
@@ -236,10 +263,7 @@ def _conv_mlp_infer(feats: list[dict], params: dict) -> list[float]:
 
 def _aggregate_precomputed(step_feats: list[dict], log_ratios: list[float],
                             ram_gb: float = 0.0) -> float:
-    """
-    Aggregate pre-computed per-step log_ratios (from ConvMLP) using the
-    same log-sum-exp of compute work as _aggregate.
-    """
+    """Aggregate pre-computed per-step log_ratios (ConvMLP) with ext overhead."""
     ENTRY = 24
     if ram_gb > 0:
         max_safe = (ram_gb * (1 << 30)) / 2 / ENTRY
@@ -256,9 +280,11 @@ def _aggregate_precomputed(step_feats: list[dict], log_ratios: list[float],
     for i, (feat, lr) in enumerate(zip(step_feats, log_ratios)):
         if i < _WARMUP_STEPS or feat["fs"] <= 1:
             continue
-        nb         = feat["n_back"]
-        step_work  = log_so + nb * _LOG2   # log(si × 2^nb)
-        log_so    += lr
+        nb          = feat["n_back"]
+        log_si_here = log_so
+        log_so     += lr
+        ext_adj   = _ext_log_overhead(log_si_here, nb, ram_gb)
+        step_work = log_si_here + nb * _LOG2 + ext_adj
         if log_total is None:
             log_total = step_work
         else:
@@ -275,31 +301,72 @@ def _aggregate_precomputed(step_feats: list[dict], log_ratios: list[float],
 
 _WARMUP_STEPS = 3   # skip trivial initial steps
 _LOG2 = math.log(2.0)
+_LOG_EXT_FACTOR = math.log(2.5)   # ext-mode overhead multiplier (in log units)
+
+
+def _ext_log_overhead(log_si: float, nb: int, ram_gb: float) -> float:
+    """
+    Return log(ext_factor) if this step would use ext mode, else 0.
+
+    Replicates the sm_should_use_ext() logic from ham_dp_c.c using machine
+    parameters from machine.yaml (SM_NTHREADS, SM_WORKER_CAP).
+
+    Ext mode streams run data to disk and merges from disk, incurring ~2.5×
+    overhead compared to the RAM path.  Steps that would trigger ext mode
+    should be penalised in the SA cost function so the SA avoids them.
+
+    Returns 0.0 when ram_gb == 0 (ext detection disabled) or when the step
+    would stay in RAM mode.
+    """
+    if ram_gb <= 0:
+        return 0.0
+
+    ENTRY    = 24
+    P        = _MACHINE["SM_NTHREADS"]
+    CAP      = _MACHINE["SM_WORKER_CAP"]   # entries
+    ram_bytes = ram_gb * (1 << 30)
+    os_head  = 4 << 30
+
+    predicted_si = math.exp(log_si) if log_si > -100 else 0.0
+    if predicted_si < 1:
+        return 0.0
+
+    chunk     = (predicted_si + P - 1) / P
+    bpt       = chunk * (1 << nb)
+    n_runs    = max(1.0, math.ceil(bpt / CAP))
+    run_bytes = n_runs * CAP * P * ENTRY
+    curr_bytes = predicted_si * ENTRY
+    bufs_bytes = P * 2 * CAP * ENTRY
+
+    if ram_bytes <= os_head + curr_bytes + bufs_bytes:
+        return _LOG_EXT_FACTOR   # curr+workers alone exceed RAM → definitely ext
+
+    avail = ram_bytes - os_head - curr_bytes - bufs_bytes
+    if run_bytes > avail:
+        return _LOG_EXT_FACTOR   # run data won't fit → ext
+
+    return 0.0
+
 
 def _aggregate(step_feats: list[dict], predict_fn,
                ram_gb: float = 0.0) -> float:
     """
     Compute total predicted DP cost for an ordering (lower is better).
 
-    Cost = log-sum-exp over steps of  log(si × 2^nb)
-         = log( Σ_steps  si × 2^nb )
+    Cost = log-sum-exp over steps of  log(si × 2^nb × ext_factor)
 
-    This is log(total compute work): each step processes si input states
-    and tries 2^nb transitions per state, so si × 2^nb bounds the work.
-    log-sum-exp is dominated by the most expensive step, correctly
-    reflecting that runtime is set by the worst step, not the average.
+    where ext_factor = 2.5 for steps predicted to use ext mode (streaming runs
+    to disk), 1.0 otherwise.  Ext mode has ~2.5× overhead vs RAM mode due to
+    disk I/O during the merge phase.  Without this penalty the SA chose
+    orderings with expensive ext steps because bare log(si × 2^nb) treats
+    ext and RAM steps identically.
 
-    A linear sum of log(si × 2^nb) fails because cheaper steps cancel
-    expensive ones arithmetically, but actual runtime does not average.
-    Example: two orderings with identical linear sums can differ 2× in
-    actual runtime if one concentrates work in a single peak step.
+    The per-step cost log(si × 2^nb × ext_factor) is computed from the
+    predicted running log_si (autoregressive from the MLP) and nb (structural).
+    log-sum-exp gives a smooth approximation of log(total compute work),
+    dominated by the most expensive step.
 
-    The per-step cost log(si × 2^nb) = log_si + nb × log2, where log_si
-    is the RUNNING predicted log(states) from the model's autoregressive
-    accumulation — not the structural log_si feature fed to the model.
-
-    OOM penalty: if the running log_si exceeds ram_gb/2/24B, a quadratic
-    penalty is added to prevent orderings that would OOM at introduce time.
+    OOM penalty: quadratic penalty when predicted states exceed ram_gb/2/24B.
     """
     ENTRY = 24
     if ram_gb > 0:
@@ -328,14 +395,15 @@ def _aggregate(step_feats: list[dict], predict_fn,
         log_ratio  = predict_fn(feat_aug)
         prev_pred  = log_ratio
 
-        # Compute work at this step: log(si × 2^nb)
-        # log_so is log(states_in) before applying this ratio
+        # log(si) at this step = log_so before adding this ratio
         log_si_here = log_so
-        step_work   = log_si_here + nb * _LOG2
+        log_so     += log_ratio
 
-        log_so += log_ratio
+        # Step cost: log(si × 2^nb) + ext overhead if this step uses ext mode
+        ext_adj   = _ext_log_overhead(log_si_here, nb, ram_gb)
+        step_work = log_si_here + nb * _LOG2 + ext_adj
 
-        # OOM penalty on predicted states_out
+        # OOM penalty
         if log_so > log_safe:
             excess   = log_so - log_safe
             penalty += PENALTY * excess * excess
