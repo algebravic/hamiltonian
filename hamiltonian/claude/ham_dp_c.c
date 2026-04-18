@@ -18,19 +18,26 @@
      "BUG IN LIBMALLOC: malloc assertion err == VM_RECLAIM_SUCCESS failed"
 
    Fix: bypass malloc/free for large allocations on macOS by using
-   mmap/munmap directly.  A 16-byte aligned header is stored before the
-   returned pointer so sm_free can always find the original base and size
-   without requiring callers to track sizes.  On Linux everything is
-   plain malloc/free — no overhead.
+   mmap/munmap directly.  We store the mmap'd size in a 16-byte header
+   immediately before the returned pointer so sm_free can find it.
+
+   To distinguish mmap'd from malloc'd pointers in sm_free we use
+   malloc_size(p): it returns the usable malloc size for malloc'd pointers
+   and 0 for anything else (including mmap).  This is robust against
+   the false-positive risk of a magic-sentinel approach where malloc's own
+   metadata bytes could accidentally equal the sentinel value.
 
    sm_alloc(n)          — allocate n bytes
-   sm_free(p)           — free any sm_alloc'd pointer (size auto-detected)
+   sm_free(p)           — free any sm_alloc'd pointer
    sm_calloc(n)         — allocate n zero-filled bytes
-   sm_realloc(p, new_n) — resize; copies and frees old block            */
+   sm_realloc(p, new_n) — resize                                          */
+
+#ifdef __APPLE__
+#include <malloc/malloc.h>   /* malloc_size() — macOS only */
+#endif
 
 #define SM_LARGE_THRESHOLD ((size_t)(1 << 20))   /* 1 MB */
-#define SM_HDR_MAGIC       ((size_t)0x534D4D415053495A)  /* "SMAPSIZ\0" */
-#define SM_HEADER_SIZE     16   /* two size_t fields, 16-byte aligned    */
+#define SM_HEADER_SIZE     16    /* one size_t (stored size) + 8 bytes pad  */
 
 #ifdef __APPLE__
 
@@ -41,62 +48,66 @@ static inline void *sm_alloc(size_t n) {
     void *raw = mmap(NULL, total, PROT_READ|PROT_WRITE,
                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) return NULL;
-    size_t *hdr = (size_t *)raw;
-    hdr[0] = total;        /* total mmap'd bytes */
-    hdr[1] = SM_HDR_MAGIC; /* sentinel so sm_free can detect mmap path */
+    ((size_t *)raw)[0] = total;   /* store total mmap'd bytes in header */
     return (char *)raw + SM_HEADER_SIZE;
 }
 
 static inline void sm_free(void *p) {
     if (!p) return;
-    size_t *hdr = (size_t *)((char *)p - SM_HEADER_SIZE);
-    if (hdr[1] == SM_HDR_MAGIC) {
-        munmap(hdr, hdr[0]);
+    /* malloc_size returns 0 for non-malloc pointers (mmap, stack, etc.).
+       This is the canonical macOS way to distinguish malloc from mmap.   */
+    if (malloc_size(p) > 0) {
+        free(p);
     } else {
-        free(p);   /* small allocation: was malloc'd, no header */
+        size_t *hdr = (size_t *)((char *)p - SM_HEADER_SIZE);
+        munmap(hdr, hdr[0]);   /* hdr[0] = total bytes including header  */
     }
 }
 
 static inline void *sm_calloc(size_t n) {
-    /* mmap returns zero-initialised pages, so sm_alloc is already zero-filled
-       for large allocations.  For small ones, fall through to calloc.       */
     if (n == 0) return NULL;
     if (n < SM_LARGE_THRESHOLD) return calloc(1, n);
-    return sm_alloc(n);   /* mmap'd memory is always zero */
+    return sm_alloc(n);   /* mmap is always zero-initialised */
 }
 
 static inline void *sm_realloc(void *p, size_t new_n) {
     if (!p) return sm_alloc(new_n);
     if (new_n == 0) { sm_free(p); return NULL; }
-    size_t *hdr = (size_t *)((char *)p - SM_HEADER_SIZE);
-    if (hdr[1] == SM_HDR_MAGIC) {
-        /* Was mmap'd. */
-        size_t old_total  = hdr[0];                   /* total incl. header */
-        size_t old_usable = old_total - SM_HEADER_SIZE;
-        if (new_n <= old_usable) {
-            /* Shrink: update stored total; keep mapping intact. */
+    if (malloc_size(p) > 0) {
+        /* malloc'd block */
+        if (new_n < SM_LARGE_THRESHOLD) return realloc(p, new_n);
+        /* Growing past threshold: migrate to mmap */
+        size_t old_n = malloc_size(p);
+        void *np = sm_alloc(new_n);
+        if (!np) return NULL;
+        memcpy(np, p, old_n < new_n ? old_n : new_n);
+        free(p);
+        return np;
+    } else {
+        /* mmap'd block */
+        size_t *hdr      = (size_t *)((char *)p - SM_HEADER_SIZE);
+        size_t old_total = hdr[0];
+        size_t old_n     = old_total - SM_HEADER_SIZE;
+        if (new_n <= old_n) {
+            /* Shrink: update stored size, keep mapping */
             hdr[0] = new_n + SM_HEADER_SIZE;
             return p;
         }
-        /* Grow mmap → larger mmap: alloc new, copy old data, unmap old. */
+        /* Grow: allocate new, copy, unmap old */
         void *np = sm_alloc(new_n);
         if (!np) return NULL;
-        memcpy(np, p, old_usable);          /* copy only valid old bytes   */
-        munmap(hdr, old_total);             /* unmap original total, NOT +SM_HEADER_SIZE */
+        memcpy(np, p, old_n);
+        munmap(hdr, old_total);
         return np;
-    } else {
-        /* Was malloc'd (small block).  Growing into mmap territory is handled
-           by callers that know the old size (e.g. smtab_ensure).  Here we
-           only handle same-zone growth/shrink via realloc.                  */
-        return realloc(p, new_n);
     }
 }
 
-#else   /* Linux: thin wrappers, zero overhead */
+#else   /* Linux: plain wrappers, zero overhead */
 
-static inline void *sm_alloc(size_t n)          { return n ? malloc(n)    : NULL; }
+#define SM_HEADER_SIZE 0
+static inline void *sm_alloc(size_t n)          { return n ? malloc(n)   : NULL; }
 static inline void  sm_free(void *p)             { free(p); }
-static inline void *sm_calloc(size_t n)          { return n ? calloc(1,n) : NULL; }
+static inline void *sm_calloc(size_t n)          { return n ? calloc(1,n): NULL; }
 static inline void *sm_realloc(void *p, size_t n){ return realloc(p, n); }
 
 #endif  /* __APPLE__ */
@@ -2914,8 +2925,14 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
            this shrink, curr->cap after the swap equals raw_total and
            the next sweep OOMs: curr(474) + workers(192) = 666 GB.    */
         if (nxt->cnt < nxt->cap) {
-            SMEntry *p = (SMEntry*)sm_realloc(nxt->data, nxt->cnt * sizeof(SMEntry));
-            if (p) { nxt->data = p; nxt->cap = nxt->cnt; }
+            if (nxt->cnt == 0) {
+                /* All states eliminated: free data now so smtab_free
+                   sees data=NULL and does not double-free.             */
+                sm_free(nxt->data); nxt->data = NULL; nxt->cap = 0;
+            } else {
+                SMEntry *p = (SMEntry*)sm_realloc(nxt->data, nxt->cnt * sizeof(SMEntry));
+                if (p) { nxt->data = p; nxt->cap = nxt->cnt; }
+            }
         }
 
     } else {
@@ -2982,8 +2999,14 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
            peak = curr_raw + workers → OOM.  Applies to BOTH ext and RAM paths.
            sm_realloc handles both platforms safely.                           */
         if (nxt->cnt < nxt->cap) {
-            SMEntry *p = (SMEntry*)sm_realloc(nxt->data, nxt->cnt * sizeof(SMEntry));
-            if (p) { nxt->data = p; nxt->cap = nxt->cnt; }
+            if (nxt->cnt == 0) {
+                /* All states eliminated: free data now so smtab_free
+                   sees data=NULL and does not double-free.             */
+                sm_free(nxt->data); nxt->data = NULL; nxt->cap = 0;
+            } else {
+                SMEntry *p = (SMEntry*)sm_realloc(nxt->data, nxt->cnt * sizeof(SMEntry));
+                if (p) { nxt->data = p; nxt->cap = nxt->cnt; }
+            }
         }
     }  /* end RAM path */
 
