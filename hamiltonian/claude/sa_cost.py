@@ -238,7 +238,7 @@ def _aggregate_precomputed(step_feats: list[dict], log_ratios: list[float],
                             ram_gb: float = 0.0) -> float:
     """
     Aggregate pre-computed per-step log_ratios (from ConvMLP) using the
-    same compute-work cost as _aggregate: sum of log(si × 2^nb) per step.
+    same log-sum-exp of compute work as _aggregate.
     """
     ENTRY = 24
     if ram_gb > 0:
@@ -249,23 +249,27 @@ def _aggregate_precomputed(step_feats: list[dict], log_ratios: list[float],
         log_safe = float('inf')
         PENALTY  = 0.0
 
-    log_so  = 0.0
-    total   = 0.0
-    penalty = 0.0
+    log_so    = 0.0
+    log_total = None
+    penalty   = 0.0
 
     for i, (feat, lr) in enumerate(zip(step_feats, log_ratios)):
         if i < _WARMUP_STEPS or feat["fs"] <= 1:
             continue
-        nb          = feat["n_back"]
-        log_si_here = log_so            # log(states_in) before this step
-        log_so     += lr
-        step_cost   = log_si_here + nb * _LOG2
-        total      += step_cost
+        nb         = feat["n_back"]
+        step_work  = log_so + nb * _LOG2   # log(si × 2^nb)
+        log_so    += lr
+        if log_total is None:
+            log_total = step_work
+        else:
+            m = max(log_total, step_work)
+            log_total = m + math.log(math.exp(log_total - m) + math.exp(step_work - m))
         if log_so > log_safe:
             excess   = log_so - log_safe
             penalty += PENALTY * excess * excess
 
-    return total + penalty
+    base = log_total if log_total is not None else 0.0
+    return base + penalty
 
 
 
@@ -277,22 +281,25 @@ def _aggregate(step_feats: list[dict], predict_fn,
     """
     Compute total predicted DP cost for an ordering (lower is better).
 
-    Cost = sum over steps of  log(si × 2^nb)
-         = sum of  (log_si + nb × log2)
+    Cost = log-sum-exp over steps of  log(si × 2^nb)
+         = log( Σ_steps  si × 2^nb )
 
-    where log_si is the running predicted log(states_in) and nb is the number
-    of back-edges at that step.  This directly measures compute work: each
-    step processes si states, each generating 2^nb candidate sub-states.
-    Summing in log space avoids overflow and gives a smooth cost landscape.
+    This is log(total compute work): each step processes si input states
+    and tries 2^nb transitions per state, so si × 2^nb bounds the work.
+    log-sum-exp is dominated by the most expensive step, correctly
+    reflecting that runtime is set by the worst step, not the average.
 
-    This replaces the previous log-sum-exp of log(so/si), which ignored
-    compute cost and could favour orderings where a large state table is
-    processed with high nb (expensive) but collapses well (cheap output).
-    E.g. si=120M, nb=5 → 3.8B sub-states looks good (so=5M) but costs 22×
-    more compute than si=20M, nb=3 → 160M sub-states producing the same so.
+    A linear sum of log(si × 2^nb) fails because cheaper steps cancel
+    expensive ones arithmetically, but actual runtime does not average.
+    Example: two orderings with identical linear sums can differ 2× in
+    actual runtime if one concentrates work in a single peak step.
 
-    OOM penalty: if the running log_si would exceed ram_gb/2/24B at any step,
-    a quadratic penalty is added (same as before).
+    The per-step cost log(si × 2^nb) = log_si + nb × log2, where log_si
+    is the RUNNING predicted log(states) from the model's autoregressive
+    accumulation — not the structural log_si feature fed to the model.
+
+    OOM penalty: if the running log_si exceeds ram_gb/2/24B, a quadratic
+    penalty is added to prevent orderings that would OOM at introduce time.
     """
     ENTRY = 24
     if ram_gb > 0:
@@ -303,9 +310,9 @@ def _aggregate(step_feats: list[dict], predict_fn,
         log_safe = float('inf')
         PENALTY  = 0.0
 
-    log_so    = 0.0   # running predicted log(states) — autoregressive feature
-    prev_pred = 0.0   # prev step's predicted log_ratio
-    total     = 0.0   # accumulated cost
+    log_so    = 0.0   # running predicted log(states) — autoregressive
+    prev_pred = 0.0
+    log_total = None  # log-sum-exp accumulator
     penalty   = 0.0
 
     for i, feat in enumerate(step_feats):
@@ -314,27 +321,34 @@ def _aggregate(step_feats: list[dict], predict_fn,
 
         nb = feat["n_back"]
 
-        # Inject autoregressive features for the model prediction
         feat_aug = dict(feat)
         feat_aug["log_si"]         = log_so
         feat_aug["prev_log_ratio"] = prev_pred
 
         log_ratio  = predict_fn(feat_aug)
         prev_pred  = log_ratio
-        log_so    += log_ratio
 
-        # Compute work at this step: log(si × 2^nb) = log_si + nb × log2
-        # log_so is currently log(states_in for this step) = log_si_here
-        log_si_here = log_so - log_ratio   # = log_so before adding this ratio
-        step_cost   = log_si_here + nb * _LOG2
-        total      += step_cost
+        # Compute work at this step: log(si × 2^nb)
+        # log_so is log(states_in) before applying this ratio
+        log_si_here = log_so
+        step_work   = log_si_here + nb * _LOG2
+
+        log_so += log_ratio
 
         # OOM penalty on predicted states_out
         if log_so > log_safe:
             excess   = log_so - log_safe
             penalty += PENALTY * excess * excess
 
-    return total + penalty
+        # log-sum-exp accumulation
+        if log_total is None:
+            log_total = step_work
+        else:
+            m = max(log_total, step_work)
+            log_total = m + math.log(math.exp(log_total - m) + math.exp(step_work - m))
+
+    base = log_total if log_total is not None else 0.0
+    return base + penalty
 
 # ---------------------------------------------------------------------------
 # Fallback: c^n_back proxy (old heuristic)
