@@ -70,29 +70,25 @@ static inline void *sm_realloc(void *p, size_t new_n) {
     if (new_n == 0) { sm_free(p); return NULL; }
     size_t *hdr = (size_t *)((char *)p - SM_HEADER_SIZE);
     if (hdr[1] == SM_HDR_MAGIC) {
-        /* Was mmap'd.  If shrinking: update header, keep mapping (fast). */
-        size_t old_usable = hdr[0] - SM_HEADER_SIZE;
+        /* Was mmap'd. */
+        size_t old_total  = hdr[0];                   /* total incl. header */
+        size_t old_usable = old_total - SM_HEADER_SIZE;
         if (new_n <= old_usable) {
+            /* Shrink: update stored total; keep mapping intact. */
             hdr[0] = new_n + SM_HEADER_SIZE;
-            return p;   /* same pointer, logical size updated */
+            return p;
         }
-        /* Growing: allocate new, copy, unmap old. */
+        /* Grow mmap → larger mmap: alloc new, copy old data, unmap old. */
         void *np = sm_alloc(new_n);
         if (!np) return NULL;
-        memcpy(np, p, old_usable);
-        munmap(hdr, hdr[0] + SM_HEADER_SIZE); /* use OLD total */
+        memcpy(np, p, old_usable);          /* copy only valid old bytes   */
+        munmap(hdr, old_total);             /* unmap original total, NOT +SM_HEADER_SIZE */
         return np;
     } else {
-        /* Was malloc'd. */
-        if (new_n < SM_LARGE_THRESHOLD) return realloc(p, new_n);
-        /* Growing beyond threshold: migrate to mmap. */
-        void *np = sm_alloc(new_n);
-        if (!np) return NULL;
-        /* We don't know old size exactly; copy conservatively.
-           Caller is responsible for not reading beyond new_n.  */
-        memcpy(np, p, new_n);
-        free(p);
-        return np;
+        /* Was malloc'd (small block).  Growing into mmap territory is handled
+           by callers that know the old size (e.g. smtab_ensure).  Here we
+           only handle same-zone growth/shrink via realloc.                  */
+        return realloc(p, new_n);
     }
 }
 
@@ -1636,9 +1632,22 @@ static SMTab *smtab_alloc(size_t cap) {
 static void smtab_free(SMTab *t) { sm_free(t->data); free(t); }
 static void smtab_ensure(SMTab *t, size_t needed) {
     if (needed <= t->cap) return;
+    size_t old_cap   = t->cap;
+    size_t old_bytes = old_cap * sizeof(SMEntry);
     if (t->cap == 0) t->cap = 1024;
     while (t->cap < needed) t->cap *= 2;
-    t->data = (SMEntry*)sm_realloc(t->data, t->cap * sizeof(SMEntry));
+    size_t new_bytes = t->cap * sizeof(SMEntry);
+    /* sm_realloc only handles same-zone growth (both small or both large).
+       When crossing the SM_LARGE_THRESHOLD (e.g. malloc 768KB → mmap 1.5MB),
+       we must do the copy explicitly because sm_realloc doesn't know the old
+       malloc size and cannot memcpy safely.  sm_alloc + memcpy + sm_free is
+       always correct and is inplace on Linux (mremap) for large→large.      */
+    SMEntry *np = (SMEntry *)sm_alloc(new_bytes);
+    SM_ALLOC_CHECK(np, new_bytes);
+    if (t->data && old_bytes > 0)
+        memcpy(np, t->data, old_bytes);
+    sm_free(t->data);
+    t->data = np;
 }
 
 /* ── SM introduce ───────────────────────────────────────────────────── */
