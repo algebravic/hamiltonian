@@ -2772,27 +2772,28 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
 }
 
 /* ── SM fused sweep ─────────────────────────────────────────────────── */
-/* Predict whether run data will exceed available RAM.
-   Uses full CAP as the per-run size estimate (conservative).  The old
-   CAP/2 estimate assumed 2× intra-run dedup, which holds for low-nb
-   steps but badly underestimates for nb=3/4 steps where keys are nearly
-   unique (bpt >> state count) and runs are nearly full-sized.  Using CAP
-   triggers ext mode earlier on genuinely large steps, trading time for
-   memory safety.  The threshold only fires when run_bytes > avail, so
-   small steps (low si or low nb) stay in RAM mode as before.            */
+/* Predict whether a step should use ext (disk-spill) mode.
+   RAM path peak memory occurs during parallel merge: W_all + nxt are both
+   live simultaneously, each sized at raw_total entries.  So the true RAM
+   requirement is 2 × raw_total, not just the run data alone.  We estimate
+   raw_total conservatively as n_runs × CAP × P (full runs, no dedup).
+   Using 2× raw_total as the threshold catches the W_all+nxt peak that was
+   causing OOM on large steps (e.g. n=75 step 51: W_all+nxt ≈ 535 GB).   */
 static int sm_should_use_ext(size_t si, int nb, size_t ram_bytes) {
     size_t P   = sm_cfg.nthreads;
     size_t CAP = sm_cfg.worker_cap;
-    size_t chunk   = (si + P - 1) / P;
-    size_t bpt     = chunk * ((size_t)1 << nb);
-    size_t n_runs  = bpt > CAP ? (bpt + CAP - 1) / CAP : 1;
-    size_t run_bytes  = n_runs * CAP * P * sizeof(SMEntry);  /* conservative: full CAP per run */
+    size_t chunk      = (si + P - 1) / P;
+    size_t bpt        = chunk * ((size_t)1 << nb);
+    size_t n_runs     = bpt > CAP ? (bpt + CAP - 1) / CAP : 1;
+    size_t raw_est    = n_runs * CAP * P * sizeof(SMEntry);
+    /* RAM-path parallel merge needs W_all + nxt ≈ 2 × raw_est simultaneously */
+    size_t merge_peak = 2 * raw_est;
     size_t os_head    = (size_t)4 << 30;
     size_t curr_bytes = si * sizeof(SMEntry);
     size_t bufs_bytes = P * 2 * CAP * sizeof(SMEntry);
     if (ram_bytes <= os_head + curr_bytes + bufs_bytes) return 1;
     size_t avail = ram_bytes - os_head - curr_bytes - bufs_bytes;
-    return run_bytes > avail;
+    return merge_peak > avail;
 }
 
 static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
