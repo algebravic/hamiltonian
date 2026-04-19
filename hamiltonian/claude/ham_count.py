@@ -229,6 +229,15 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+
+    # --- Config file -------------------------------------------------------
+    p.add_argument("--config", metavar="FILE",
+                   help="YAML file whose keys match long option names (dashes → "
+                        "underscores, leading dashes dropped).  Values are loaded "
+                        "as defaults before CLI args are applied, so any flag "
+                        "given on the command line overrides the file.  "
+                        "Example: refine_iters: 500000  spike_penalty: 16")
+
     # --- Input source (mutually exclusive) ---
     src = p.add_mutually_exclusive_group()
     src.add_argument("--graph", metavar="FILE",
@@ -357,6 +366,42 @@ def parse_args():
                         "search: (1) machine.yaml next to ham_dp_c.py, "
                         "(2) machine.yaml in the current directory. "
                         "The C library recompiles automatically if constants change.")
+
+    # ── Two-pass parse so --config sets defaults before CLI args apply ──────
+    # Pass 1: extract --config (ignore everything else, including unknowns).
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", metavar="FILE")
+    pre_args, _ = pre.parse_known_args()
+
+    if pre_args.config:
+        import yaml, sys
+        try:
+            with open(pre_args.config) as fh:
+                cfg = yaml.safe_load(fh) or {}
+        except FileNotFoundError:
+            p.error(f"--config: file not found: {pre_args.config!r}")
+        except yaml.YAMLError as e:
+            p.error(f"--config: YAML parse error in {pre_args.config!r}: {e}")
+
+        if not isinstance(cfg, dict):
+            p.error(f"--config: top-level value must be a YAML mapping, got {type(cfg).__name__}")
+
+        # Normalise keys: "refine-iters" and "refine_iters" both work.
+        # Boolean flags (store_true) written as  verbose: true  in YAML.
+        defaults = {}
+        for raw_key, val in cfg.items():
+            key = str(raw_key).lstrip("-").replace("-", "_")
+            defaults[key] = val
+
+        # Validate keys against known destinations so typos surface early.
+        known = {a.dest for a in p._actions}
+        for k in defaults:
+            if k not in known:
+                print(f"WARNING: --config: unknown key {k!r} (ignored)", file=sys.stderr)
+
+        p.set_defaults(**defaults)
+
+    # Pass 2: full parse — CLI values override config-file defaults.
     return p.parse_args()
 
 
