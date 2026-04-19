@@ -21,7 +21,7 @@ import copy
 
 # Optional: MLP/linear model from sa_cost.py (drop sa_cost_params.json alongside)
 try:
-    from sa_cost import sa_cost_fn as _sa_cost_fn
+    from .sa_cost import sa_cost_fn as _sa_cost_fn
 except ImportError:
     _sa_cost_fn = None
 
@@ -407,6 +407,12 @@ def sa_refine_order(
     density_alpha: float = 0.25,
     spike_penalty: float = 0.0,
     ram_gb: float = 0.0,
+    # ── Temperature schedule ──────────────────────────────────────────────
+    t_start: float = 0.0,
+    t_end: float = 0.0,
+    schedule: str = "geometric",
+    n_restarts: int = 0,
+    restart_t_factor: float = 0.5,
 ) -> list:
     """
     Refine *init_order* using simulated annealing.
@@ -414,29 +420,46 @@ def sa_refine_order(
     By default (spike_penalty=0.0) the exact pathwidth is preserved: any
     swap that raises max_fw above pw_bound is rejected.
 
-    With spike_penalty > 0, the constraint is relaxed to a soft penalty:
-    over-budget steps are penalised by spike_penalty^overage in the cost
-    function but not hard-rejected.  This lets SA trade a small number of
-    early spikes (cheap, because the proxy state count is low) for a
-    smoother overall profile.  spike_penalty=16 is a reasonable starting
-    point: fw=pw+1 costs 16x the normal rate at that proxy level.
+    With spike_penalty > 0, the constraint is relaxed to a soft penalty.
+    spike_penalty=16 is a reasonable starting point.
 
-    ram_gb: if > 0, adds a quadratic OOM penalty to the MLP cost function
-            for any step where the predicted state count would require more
-            than ram_gb×GB / 2 / 24B entries (the two-buffer introduce
-            threshold).  Set to the machine's RAM in GB, e.g. ram_gb=768.0.
+    Temperature schedule parameters
+    --------------------------------
+    t_start : float
+        Initial temperature.  Default 0 → cost × 0.05.
+        Larger values accept more uphill moves early on — useful when
+        spike_penalty opens up a rough landscape.
+    t_end : float
+        Final temperature.  Default 0 → cost × 1e-4.
+    schedule : str
+        "geometric" (default) — T multiplied by fixed decay each step.
+        "linear"    — T decreases linearly from t_start to t_end.
+        "cosine"    — half-cosine decay (slow-fast-slow).
+        "log"       — T = t0/(1 + a*log(1+t)), numerically stable form
+                      of logarithmic cooling, near-optimal per Stander &
+                      Silverman (Statistics and Computing, 1994).  Works
+                      best with explicit --sa-t-end (e.g. cost×1e-3) so
+                      the t0/t1 ratio stays moderate (10–100×).
+    n_restarts : int
+        Reheat after the schedule completes this many times.  Each restart
+        resets T to t_start × restart_t_factor^k and resumes from the
+        best-known ordering.  Useful when spike_penalty makes the landscape
+        rough and the SA gets stuck in an early bad basin.  Default: 0.
+    restart_t_factor : float
+        Temperature multiplier at each restart (default 0.5 → each restart
+        starts at half the previous initial temperature).
 
-    The returned ordering may have max_fw > pw_bound when spike_penalty > 0.
-    Use frontier_stats() to check the actual max after refinement.
+    ram_gb : float
+        If > 0, adds a quadratic OOM penalty for orderings that would
+        exceed ram_gb×GB / 2 / 24B at any step.
+
+    Returns (best_order, best_iter, best_cost).
     """
     import math
 
     rng = random.Random(seed)
     order = list(init_order)
 
-    # Choose cost function: fitted model (MLP/linear) if available, else proxy.
-    # The model predicts log(total_states); we wrap it to enforce the pw_bound
-    # hard constraint by returning None for orderings that exceed it.
     if _sa_cost_fn is not None:
         def _cost(o):
             if spike_penalty == 0.0 and not _max_fw_ok(adj, o, pw_bound):
@@ -453,34 +476,75 @@ def sa_refine_order(
         raise ValueError("init_order already exceeds pw_bound")
 
     best_order = order[:]
-    best_cost = cost
-    best_iter = 0
-    T = cost * 0.05
-    if T == 0:
-        return best_order
-    decay = (cost * 1e-4 / T) ** (1.0 / n_iter)
+    best_cost  = cost
+    best_iter  = 0
 
-    for it in range(1, n_iter + 1):
-        i, j = sorted(rng.sample(range(n), 2))
-        order[i], order[j] = order[j], order[i]
+    _t_start = t_start if t_start > 0 else cost * 0.05
+    _t_end   = t_end   if t_end   > 0 else cost * 1e-4
+    if _t_start == 0:
+        return best_order, 0, best_cost
 
-        new_cost = _cost(order)
-        if new_cost is None:
+    def _T_fn(local_it, n_steps, t0, t1, sched):
+        """Temperature at iteration local_it within a round of n_steps."""
+        if sched == "linear":
+            frac = local_it / max(n_steps - 1, 1)
+            return max(t1, t0 + (t1 - t0) * frac)
+        elif sched == "cosine":
+            frac = local_it / max(n_steps - 1, 1)
+            return t1 + 0.5 * (t0 - t1) * (1 + math.cos(math.pi * frac))
+        elif sched == "log":
+            # T(t) = t0 / (1 + a*log(1+t)), with a chosen so T(n_steps-1) = t1.
+            # Solving: t0 / (1 + a*log(N)) = t1  →  a = (t0/t1 - 1) / log(1+N).
+            # Numerically stable for any t0/t1 ratio (no exp needed).
+            # Stays warmer than geometric, matching the Stander & Silverman (1994)
+            # finding that logarithmic cooling is near-optimal.
+            # Best used with an explicit --sa-t-end so t0/t1 stays moderate
+            # (10–100×); very large ratios cause near-immediate initial drop
+            # followed by a long plateau at t1, which is unhelpful.
+            if local_it == 0:
+                return t0
+            N = max(n_steps - 1, 1)
+            a = (t0 / t1 - 1.0) / math.log(1.0 + N)
+            return t0 / (1.0 + a * math.log(1.0 + local_it))
+        else:  # geometric
+            if t0 <= 0 or t1 <= 0:
+                return t0
+            ratio = (t1 / t0) ** (1.0 / max(n_steps - 1, 1))
+            return t0 * (ratio ** local_it)
+
+    total_rounds    = 1 + n_restarts
+    iters_per_round = max(1, n_iter // total_rounds)
+
+    for restart in range(total_rounds):
+        round_t0 = _t_start * (restart_t_factor ** restart)
+        round_t1 = _t_end   * (restart_t_factor ** restart)
+
+        if restart > 0:          # resume from best known ordering
+            order = best_order[:]
+            cost  = best_cost
+
+        base_iter = restart * iters_per_round
+
+        for local_it in range(iters_per_round):
+            T = _T_fn(local_it, iters_per_round, round_t0, round_t1, schedule)
+
+            i, j = sorted(rng.sample(range(n), 2))
             order[i], order[j] = order[j], order[i]
-            T *= decay
-            continue
 
-        delta = new_cost - cost
-        if delta < 0 or rng.random() < math.exp(-delta / T):
-            cost = new_cost
-            if new_cost < best_cost:
-                best_cost = new_cost
-                best_order = order[:]
-                best_iter = it
-        else:
-            order[i], order[j] = order[j], order[i]
+            new_cost = _cost(order)
+            if new_cost is None:
+                order[i], order[j] = order[j], order[i]
+                continue
 
-        T *= decay
+            delta = new_cost - cost
+            if delta < 0 or rng.random() < math.exp(-delta / T):
+                cost = new_cost
+                if new_cost < best_cost:
+                    best_cost  = new_cost
+                    best_order = order[:]
+                    best_iter  = base_iter + local_it + 1
+            else:
+                order[i], order[j] = order[j], order[i]
 
     return best_order, best_iter, best_cost
 
@@ -631,7 +695,7 @@ def validate_multistart_orders(
     -------
     List of (partial_ms, sa_cost, order) sorted by partial_ms ascending.
     """
-    from ham_dp_c import partial_dp_time_c
+    from .ham_dp_c import partial_dp_time_c
 
     if verbose:
         print(f"  Validating {len(candidates)} candidates: "

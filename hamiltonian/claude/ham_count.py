@@ -270,6 +270,24 @@ def parse_args():
                         "rejected outright, letting SA trade early spikes for a smoother "
                         "profile.  P=16 is a reasonable starting point.  "
                         "The resulting ordering may exceed pw_bound.")
+    p.add_argument("--sa-t-start", type=float, default=0.0, metavar="T",
+                   help="SA initial temperature (default: 0 → 5%% of initial cost). "
+                        "Increase to explore more aggressively early on — useful "
+                        "with --spike-penalty where the landscape is rough.")
+    p.add_argument("--sa-t-end", type=float, default=0.0, metavar="T",
+                   help="SA final temperature (default: 0 → 0.01%% of initial cost).")
+    p.add_argument("--sa-schedule", default="geometric", metavar="S",
+                   choices=["geometric", "linear", "cosine", "log"],
+                   help="SA temperature schedule: geometric (default), linear, cosine, "
+                        "or log (T=t0/log(1+kt), near-optimal per Stander & Silverman 1994).")
+    p.add_argument("--sa-restarts", type=int, default=0, metavar="K",
+                   help="Reheat SA K times after each full cool-down, resuming from "
+                        "the best ordering found so far.  n_iter is split evenly across "
+                        "all rounds.  Default: 0 (no restarts).  Useful with "
+                        "--spike-penalty to escape early bad basins.")
+    p.add_argument("--sa-restart-factor", type=float, default=0.5, metavar="F",
+                   help="Temperature multiplier at each restart (default: 0.5 → each "
+                        "restart starts at half the previous initial temperature).")
     p.add_argument("--bound", type=int, default=None, metavar="K",
                    help="Pathwidth upper bound hint for the MaxSAT solver.")
     p.add_argument("--stratified", action="store_true",
@@ -420,7 +438,12 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
                                     expand_base=eb,
                                     density_alpha=da,
                                     spike_penalty=sp,
-                                    ram_gb=_ram_gb)
+                                    ram_gb=_ram_gb,
+                                    t_start=getattr(args, 'sa_t_start', 0.0),
+                                    t_end=getattr(args, 'sa_t_end', 0.0),
+                                    schedule=getattr(args, 'sa_schedule', 'geometric'),
+                                    n_restarts=getattr(args, 'sa_restarts', 0),
+                                    restart_t_factor=getattr(args, 'sa_restart_factor', 0.5))
             if getattr(args, 'verbose', False) or True:
                 pct = 100 * best_iter / args.refine_iters
                 print(f"  SA best found at iter {best_iter:,}/{args.refine_iters:,} "
