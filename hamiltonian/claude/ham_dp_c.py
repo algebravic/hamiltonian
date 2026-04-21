@@ -383,7 +383,8 @@ def _get_lib():
             uint64_t *res_lo, uint64_t *res_hi,
             int verbose,
             const char *checkpoint_path, double checkpoint_secs,
-            int step_limit);
+            int step_limit,
+            uint64_t *cyc_lo, uint64_t *cyc_hi);
 
         void count_ham_paths_peh(
             int n, const int *order, const int *pos, const int *last_s,
@@ -391,13 +392,15 @@ def _get_lib():
             uint64_t *res_lo, uint64_t *res_hi,
             int verbose,
             const char *checkpoint_path, double checkpoint_secs,
-            int step_limit);
+            int step_limit,
+            uint64_t *cyc_lo, uint64_t *cyc_hi);
 
         void count_ham_paths_sm(
             int n, const int *order, const int *pos, const int *last_s,
             const int *adj_off, const int *adj_dat,
             uint64_t *res_lo, uint64_t *res_hi,
-            int verbose, uint64_t ram_bytes, int instrument);
+            int verbose, uint64_t ram_bytes, int instrument,
+            uint64_t *cyc_lo, uint64_t *cyc_hi);
     """)
     lib = ffi.dlopen(so_path)
 
@@ -446,14 +449,12 @@ def _get_lib():
 
 def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
                                verbose: bool = False,
-                               mem_reserve_gb: float = 2.0,  # kept for API compat; EH ignores it
-                               load_factor: int = 75,        # kept for API compat; EH ignores it
+                               mem_reserve_gb: float = 2.0,
+                               load_factor: int = 75,
                                checkpoint_path: str = "",
-                               checkpoint_secs: float = 300.0) -> int:
-    """Count undirected Hamiltonian paths in G_n via the C frontier DP.
-
-    Uses extendible hashing for the state table — memory scales with actual
-    entry count, no pre-allocation mismatch, no 3-table resize spikes.
+                               checkpoint_secs: float = 300.0,
+                               count_cycles: bool = False):
+    """Count undirected Hamiltonian paths (and optionally cycles) via EH frontier DP.
 
     Parameters
     ----------
@@ -461,10 +462,10 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
     order            : vertex ordering (1-indexed), length n.
     adj              : adjacency dict {v: iterable_of_neighbours} (1-indexed).
     verbose          : if True, print per-step profiling to stderr.
-    mem_reserve_gb   : ignored (EH adapts to actual entry count automatically).
-    load_factor      : ignored (EH has no fixed load factor).
     checkpoint_path  : path for checkpoint file ('' = disabled).
     checkpoint_secs  : checkpoint interval in seconds (0 = disable).
+    count_cycles     : if True, also count Hamiltonian cycles and return
+                       (paths, cycles); otherwise return paths (int).
     """
     import sys
     if verbose and (load_factor != 75 or mem_reserve_gb != 2.0):
@@ -497,11 +498,15 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
     c_res_hi  = ffi.new("uint64_t*")
     c_ckpt    = ffi.new("char[]", checkpoint_path.encode() if checkpoint_path else b"")
 
+    c_cyc_lo = ffi.new("uint64_t*") if count_cycles else ffi.NULL
+    c_cyc_hi = ffi.new("uint64_t*") if count_cycles else ffi.NULL
+
     lib.count_ham_paths_c(
         n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
         c_res_lo, c_res_hi, int(verbose),
         c_ckpt, ffi.cast("double", checkpoint_secs),
-        ffi.cast("int", -1),   # step_limit: -1 = full run
+        ffi.cast("int", -1),
+        c_cyc_lo, c_cyc_hi,
     )
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
@@ -509,14 +514,19 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
             "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16). "
             "The packed uint64 state encoding is limited to 15 frontier slots."
         )
-    return (hi << 64) | lo
+    paths = (hi << 64) | lo
+    if count_cycles:
+        cyc_lo2, cyc_hi2 = int(c_cyc_lo[0]), int(c_cyc_hi[0])
+        return paths, (cyc_hi2 << 64) | cyc_lo2
+    return paths
 
 
 def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
                                  verbose: bool = False,
                                  checkpoint_path: str = "",
                                  checkpoint_secs: float = 300.0,
-                                 **kwargs) -> int:
+                                 count_cycles: bool = False,
+                                 **kwargs):
     """Count Hamiltonian paths via parallel EH (PEH) backend.
 
     Like the EH backend but with P inserter threads (default 6), one per
@@ -563,18 +573,26 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
     c_res_hi  = ffi.new("uint64_t*")
     c_ckpt    = ffi.new("char[]", checkpoint_path.encode() if checkpoint_path else b"")
 
+    c_cyc_lo = ffi.new("uint64_t*") if count_cycles else ffi.NULL
+    c_cyc_hi = ffi.new("uint64_t*") if count_cycles else ffi.NULL
+
     lib.count_ham_paths_peh(
         n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
         c_res_lo, c_res_hi, int(verbose),
         c_ckpt, ffi.cast("double", checkpoint_secs),
         ffi.cast("int", -1),
+        c_cyc_lo, c_cyc_hi,
     )
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
             "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16)."
         )
-    return (hi << 64) | lo
+    paths = (hi << 64) | lo
+    if count_cycles:
+        cyc_lo2, cyc_hi2 = int(c_cyc_lo[0]), int(c_cyc_hi[0])
+        return paths, (cyc_hi2 << 64) | cyc_lo2
+    return paths
 
 
 def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
@@ -583,7 +601,8 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 checkpoint_path: str = "",
                                 checkpoint_secs: float = 300.0,
                                 mem_reserve_gb: float = 0.0,
-                                **kwargs) -> int:
+                                count_cycles: bool = False,
+                                **kwargs):
     """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
 
     Parameters
@@ -634,16 +653,24 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     c_res_lo  = ffi.new("uint64_t*")
     c_res_hi  = ffi.new("uint64_t*")
 
+    c_cyc_lo = ffi.new("uint64_t*") if count_cycles else ffi.NULL
+    c_cyc_hi = ffi.new("uint64_t*") if count_cycles else ffi.NULL
+
     lib.count_ham_paths_sm(
         n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
         c_res_lo, c_res_hi, int(verbose), ram, int(instrument),
+        c_cyc_lo, c_cyc_hi,
     )
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
             "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16)."
         )
-    return (hi << 64) | lo
+    paths = (hi << 64) | lo
+    if count_cycles:
+        cyc_lo2, cyc_hi2 = int(c_cyc_lo[0]), int(c_cyc_hi[0])
+        return paths, (cyc_hi2 << 64) | cyc_lo2
+    return paths
 
 
 def partial_dp_time_c(n: int, order: list, adj: dict,
@@ -718,7 +745,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
     start_n = int(sys.argv[1]) if len(sys.argv) > 1 else 15
     end_n   = int(sys.argv[2]) if len(sys.argv) > 2 else start_n
     try:
-        from ham_ordering import build_graph, best_bfs_order, frontier_stats
+        from .ham_ordering import build_graph, best_bfs_order, frontier_stats
     except ImportError:
         from math import isqrt
         def build_graph(n):

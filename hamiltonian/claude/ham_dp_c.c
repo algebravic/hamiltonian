@@ -717,7 +717,7 @@ static void fused_sweep(EHT *curr, EHT *nxt,
                         int fs, int v_idx,
                         const int *widxs, int n_back,
                         const int *elim_idxs_desc, int n_elim,
-                        int step, int n, u128 *total)
+                        int step, int n, u128 *total, u128 *cycles_total)
 {
     int n_subsets = 1 << n_back;
 
@@ -738,6 +738,21 @@ static void fused_sweep(EHT *curr, EHT *nxt,
 
                 for (int j = 0; j < n_back && valid; j++) {
                     if (!(S & (1 << j))) continue;
+
+                    /* Hamiltonian cycle detection (same logic as sm_worker_runs) */
+                    if (cycles_total && step == n - 1) {
+                        int8_t sv = slot_get(nk, v_idx);
+                        int8_t sw = slot_get(nk, widxs[j]);
+                        if (sv == sw && sv > 0 && !(S >> (j + 1)) && !nc_get(nk)) {
+                            int all_int = 1;
+                            for (int k = 0; k < fs && all_int; k++) {
+                                if (k == v_idx || k == widxs[j]) continue;
+                                if (slot_get(nk, k) > 0) all_int = 0;
+                            }
+                            if (all_int) *cycles_total += cnt;
+                        }
+                    }
+
                     int nc_inc = 0;
                     u64 nk2 = apply_edge(nk, fs, v_idx, widxs[j], &nc_inc);
                     if (!nk2) { valid = 0; break; }
@@ -905,7 +920,9 @@ void count_ham_paths_c(
     int        verbose,
     const char *checkpoint_path,
     double     checkpoint_secs,
-    int        step_limit        /* -1 = full run; >=0 = stop after this many steps */
+    int        step_limit,        /* -1 = full run; >=0 = stop after this many steps */
+    uint64_t  *cyc_lo,            /* out: Hamiltonian cycle count low 64 bits (NULL = skip) */
+    uint64_t  *cyc_hi             /* out: Hamiltonian cycle count high 64 bits              */
 ) {
     rsort_global_init();   /* ensure flat rsort buffer is mmap'd             */
     int  frontier[MAX_FS_FAST + 2];
@@ -916,7 +933,8 @@ void count_ham_paths_c(
     EHT *curr = eh_alloc();
     EHT *nxt  = eh_alloc();
 
-    u128 total = (u128)0;
+    u128 total  = (u128)0;
+    u128 cycles = (u128)0;   /* Hamiltonian cycle accumulator */
     int  start_step = 0;
 
     /* Try to resume from checkpoint. */
@@ -998,10 +1016,11 @@ void count_ham_paths_c(
                         (curr->cnt >= FUSED_MIN_STATES || n_back >= 2);
 
         if (use_fused) {
+            u128 *cyc_ptr = (cyc_lo && step == n - 1) ? &cycles : NULL;
             fused_sweep(curr, nxt, fs, v_idx,
                         widxs, n_back,
                         elim_idxs_desc, n_elim,
-                        step, n, &total);
+                        step, n, &total, cyc_ptr);
             { EHT *tmp = curr; curr = nxt; nxt = tmp; }
 
         } else {
@@ -1023,6 +1042,16 @@ void count_ham_paths_c(
                         BINSERT(key);     /* always copy base */
                         if (sv == -1 || sw == -1) { (void)0; } else {
                         u64 nk = key;
+                        /* Cycle detection: at last step, sv==sw>0 closes a cycle */
+                        if (cyc_lo && step == n - 1 && sv == sw && sv > 0
+                                   && !nc_get(key)) {
+                            int all_int = 1;
+                            for (int k2 = 0; k2 < fs && all_int; k2++) {
+                                if (k2 == v_idx || k2 == w_idx) continue;
+                                if (slot_get(key, k2) > 0) all_int = 0;
+                            }
+                            if (all_int) cycles += cnt;
+                        } else
                         if (sv == 0 && sw == 0) {
                             int8_t L = label_max(key, fs) + 1;
                             nk = slot_set(nk, v_idx, L);
@@ -1158,8 +1187,6 @@ void count_ham_paths_c(
                         fprintf(stderr, "# Checkpoint saved at step %d (%zu states)"
                                 " [ckpt_ms=%.1f, excluded from profile]\n",
                                 step, curr->cnt, ckpt_ms);
-                    /* Advance t_prev past checkpoint I/O so next step_ms
-                       reflects DP time only, not disk write latency.       */
                     t_prev = t_ckpt_end;
                     t_last_ckpt = t_now2;
                 }
@@ -1170,7 +1197,7 @@ void count_ham_paths_c(
             double t_elapsed = now_ms() - t_start;
             uint64_t tmp; memcpy(&tmp, &t_elapsed, sizeof tmp);
             *res_lo = tmp;
-            *res_hi = UINT64_MAX - 1;  /* sentinel: partial run (distinct from overflow) */
+            *res_hi = UINT64_MAX - 1;  /* sentinel: partial run */
             goto cleanup;
         }
     }
@@ -1180,15 +1207,15 @@ cleanup:
     eh_free(nxt);
     free(fidx);
 
-    /* Write path count only if neither sentinel is present.
-       Overflow sentinel:     res_lo == res_hi == UINT64_MAX
-       Partial-run sentinel:  res_hi == UINT64_MAX - 1        */
     if (*res_hi != UINT64_MAX && *res_hi != (UINT64_MAX - 1)) {
         *res_lo = (uint64_t) total;
         *res_hi = (uint64_t)(total >> 64);
+        if (cyc_lo) {
+            *cyc_lo = (uint64_t) cycles;
+            *cyc_hi = (uint64_t)(cycles >> 64);
+        }
     }
 }
-
 /* count_ham_paths_peh: PScan parallel backend removed (benchmarks showed
    it offers no advantage over EH+rsort: qsort inside workers costs as much
    as the compute it parallelises, and SM already does the job correctly
@@ -1208,11 +1235,14 @@ void count_ham_paths_peh(
     int         verbose,
     const char *checkpoint_path,
     double      checkpoint_secs,
-    int         step_limit
+    int         step_limit,
+    uint64_t   *cyc_lo,
+    uint64_t   *cyc_hi
 ) {
     count_ham_paths_c(n, order, pos, last_s, adj_off, adj_dat,
                       res_lo, res_hi, verbose,
-                      checkpoint_path, checkpoint_secs, step_limit);
+                      checkpoint_path, checkpoint_secs, step_limit,
+                      cyc_lo, cyc_hi);
 }
 
 
@@ -1912,6 +1942,8 @@ typedef struct {
     SMEntry         *out;
     size_t           out_len;
     size_t           out_size;   /* bytes allocated for out (for sm_free) */
+    u128             local_cycles; /* Hamiltonian cycle count from this worker */
+    int              count_cycles; /* 1 = detect Hamiltonian cycles at last step */
     double           t_compute_ms;
     double           t_flush_ms;
     double           t_merge_ms;
@@ -2129,6 +2161,30 @@ static void *sm_worker_runs(void *arg) {
             u64 nk = base; int valid = 1; int nc_inc = 0;
             for (int j = 0; j < w->n_back && valid; j++) {
                 if (!(S & (1 << j))) continue;
+
+                /* Hamiltonian cycle detection: at the last step (step == n-1),
+                   when sv == sw (two free ends of the same segment), the normal
+                   apply_edge would reject this as a premature cycle.  But at
+                   the final step this closes a Hamiltonian cycle, so count it.
+                   Conditions: no remaining edges in S after this one, nc_bit
+                   clear (no completed sub-components), and all other frontier
+                   slots are internal (-1, not free ends of other segments).   */
+                if (w->count_cycles && w->step == w->n - 1) {
+                    int8_t sv = slot_get(nk, w->v_idx);
+                    int8_t sw = slot_get(nk, w->widxs[j]);
+                    if (sv == sw && sv > 0) {
+                        if (!(S >> (j + 1)) && !nc_get(nk)) {
+                            int all_int = 1;
+                            for (int k = 0; k < w->fs && all_int; k++) {
+                                if (k == w->v_idx || k == w->widxs[j]) continue;
+                                if (slot_get(nk, k) > 0) all_int = 0;
+                            }
+                            if (all_int) w->local_cycles += (u128)cnt;
+                        }
+                        valid = 0; break;   /* still skip for path processing */
+                    }
+                }
+
                 u64 nk2 = apply_edge(nk, w->fs, w->v_idx, w->widxs[j], &nc_inc);
                 if (!nk2) { valid = 0; break; }
                 nk = nk2;
@@ -2803,7 +2859,8 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             int step, int n,
                             u128 *total,
                             size_t ram_bytes,
-                            int instrument) {
+                            int instrument,
+                            u128 *cycles_total) {
     int P = sm_cfg.nthreads;
     size_t ni    = curr->cnt;
     size_t chunk = (ni + P - 1) / P;
@@ -2852,12 +2909,18 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             .elim_idxs_desc=elim_idxs_desc, .n_elim=n_elim,
             .step=step, .n=n,
             .total=total, .total_mu=&mu,
-            .ws=&WS[i]
+            .ws=&WS[i],
+            .count_cycles = (cycles_total != NULL ? 1 : 0)
         };
         pthread_create(&T[i], NULL, sm_worker_runs, &W[i]);
     }
     for (int i = 0; i < P; i++) pthread_join(T[i], NULL);
     pthread_mutex_destroy(&mu);
+
+    /* Accumulate cycle counts from all workers. */
+    if (cycles_total) {
+        for (int i = 0; i < P; i++) *cycles_total += W[i].local_cycles;
+    }
 
     /* Sum raw output counts (before any dedup) from each worker. */
     size_t raw_out_total = 0;
@@ -3088,7 +3151,9 @@ void count_ham_paths_sm(
     uint64_t   *res_hi,
     int         verbose,
     uint64_t    ram_bytes,
-    int         instrument  /* 0=off, 1=per-step phase breakdown to stderr */
+    int         instrument,  /* 0=off, 1=per-step phase breakdown to stderr */
+    uint64_t   *cyc_lo,      /* out: cycle count low 64 bits (NULL = skip)  */
+    uint64_t   *cyc_hi       /* out: cycle count high 64 bits               */
 ) {
     int  frontier[MAX_FS_FAST + 2];
     int *fidx = (int*)malloc((size_t)(n + 1) * sizeof(int));
@@ -3097,7 +3162,8 @@ void count_ham_paths_sm(
 
     SMTab *curr = smtab_alloc(1024);
     SMTab *nxt  = smtab_alloc(1024);
-    u128 total = (u128)0;
+    u128 total  = (u128)0;
+    u128 cycles = (u128)0;
 
     curr->data[0].key = KEY_MARKER;
     curr->data[0].val = (u64)1;
@@ -3153,8 +3219,10 @@ void count_ham_paths_sm(
         /* resolve ram_bytes: use provided value or conservative 8 GB default */
         size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
 
+        u128 *cyc_ptr = (cyc_lo && step == n - 1) ? &cycles : NULL;
         sm_fused_sweep(curr, nxt, fs, v_idx, widxs, n_back,
-                       elim_desc, n_elim, step, n, &total, ram, instrument);
+                       elim_desc, n_elim, step, n, &total, ram, instrument,
+                       cyc_ptr);
         /* Free curr->data (the in-place-introduced table workers just read).
            The ext path already frees it inside sm_fused_sweep (sets to NULL);
            the RAM path does not, so this handles both: free(NULL) is a no-op. */
@@ -3210,6 +3278,10 @@ void count_ham_paths_sm(
 
     *res_lo = (uint64_t) total;
     *res_hi = (uint64_t)(total >> 64);
+    if (cyc_lo) {
+        *cyc_lo = (uint64_t) cycles;
+        *cyc_hi = (uint64_t)(cycles >> 64);
+    }
 
 cleanup:
     smtab_free(curr); smtab_free(nxt);

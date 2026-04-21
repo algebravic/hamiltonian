@@ -324,6 +324,8 @@ def parse_args():
                    help="Use sort-merge DP backend instead of EH+rsort. "
                         "Run storage (RAM vs file-backed) is chosen automatically "
                         "per step based on available physical RAM.")
+    p.add_argument("--cycles", action="store_true",
+                   help="Also count Hamiltonian cycles and report alongside paths.")
     p.add_argument("--instrument", action="store_true",
                    help="(sort-merge only) Print per-step phase timing breakdown: "
                         "compute / flush / merge_runs / parallel-merge times per "
@@ -512,30 +514,39 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
     # --- C frontier DP ---
     verbose = args.verbose or args.profile
     t_dp = time.time()
+    _cc = getattr(args, 'cycles', False)
     if args.sort_merge:
-        count = count_hamiltonian_paths_sm(
+        result = count_hamiltonian_paths_sm(
             n_vertices, order, adj,
             verbose=verbose,
             instrument=args.instrument,
             checkpoint_path=ckpt_path,
             checkpoint_secs=args.checkpoint_interval,
             mem_reserve_gb=getattr(args, 'mem_reserve_gb', 0.0),
+            count_cycles=_cc,
         )
     else:
-        count = count_hamiltonian_paths_c(
+        result = count_hamiltonian_paths_c(
             n_vertices, order, adj,
             verbose=verbose,
             checkpoint_path=ckpt_path,
             checkpoint_secs=args.checkpoint_interval,
             load_factor=args.load_factor,
+            count_cycles=_cc,
         )
     t_dp = time.time() - t_dp
 
+    if _cc and isinstance(result, tuple):
+        count, cycles = result
+    else:
+        count, cycles = result, None
+
     pw_str = f"pw={pw:2d}" if pw is not None else "pw= ?"
     spike_str = f" [SPIKE +{mx-pw}]" if (pw is not None and mx > pw) else ""
+    cyc_str = f"  ham_cycles={cycles}" if cycles is not None else ""
     print(
         f"{label}  {pw_str}  max_fw={mx:2d}  profile={pr:5d}"
-        f"  ord={t_ord:.2f}s  dp={t_dp:.3f}s  ham_paths={count}{spike_str}",
+        f"  ord={t_ord:.2f}s  dp={t_dp:.3f}s  ham_paths={count}{cyc_str}{spike_str}",
         flush=True,
     )
     return use_pw, count
