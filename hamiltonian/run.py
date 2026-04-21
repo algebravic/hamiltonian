@@ -25,6 +25,8 @@ def write_graph():
                         help='The directory to write the file')
     parser.add_argument('--path', type=bool, default=False,
                         help='If True create the path graph')
+    parser.add_argument('--type', type=str, default='dimacs',
+                        help='The output format')
 
     families = {'knight': (knight_graph, 2),
                 'square': (square_graph, 1),
@@ -43,9 +45,15 @@ def write_graph():
     base = args.graph
     if args.path:
         base += '_path'
-    gph.add_edges_from([('root', _) for _ in gph.nodes])
-    name = base + '_' + '_'.join(map(str, args.args)) + '.gb'
-    write_sgb(args.dir + name, gph)
+    name = base + '_' + '_'.join(map(str, args.args))
+    match args.type:
+        case 'dimacs':
+            export_to_dimacs(gph, base + '.dimacs')
+        case 'gb':
+            gph.add_edges_from([('root', _) for _ in gph.nodes])
+            write_sgb(args.dir + name + '.gb', gph)
+        case _:
+            print(f'Unrecognized export type {args.type}')
 
 def run_tours():
     """
