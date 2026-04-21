@@ -747,7 +747,7 @@ static void fused_sweep(EHT *curr, EHT *nxt,
                             int all_int = 1;
                             for (int k = 0; k < fs && all_int; k++) {
                                 if (k == v_idx || k == widxs[j]) continue;
-                                if (slot_get(nk, k) > 0) all_int = 0;
+                                if (slot_get(nk, k) != -1) all_int = 0;
                             }
                             if (all_int) *cycles_total += cnt;
                         }
@@ -1048,7 +1048,7 @@ void count_ham_paths_c(
                             int all_int = 1;
                             for (int k2 = 0; k2 < fs && all_int; k2++) {
                                 if (k2 == v_idx || k2 == w_idx) continue;
-                                if (slot_get(key, k2) > 0) all_int = 0;
+                                if (slot_get(key, k2) != -1) all_int = 0;
                             }
                             if (all_int) cycles += cnt;
                         } else
@@ -2177,7 +2177,7 @@ static void *sm_worker_runs(void *arg) {
                             int all_int = 1;
                             for (int k = 0; k < w->fs && all_int; k++) {
                                 if (k == w->v_idx || k == w->widxs[j]) continue;
-                                if (slot_get(nk, k) > 0) all_int = 0;
+                                if (slot_get(nk, k) != -1) all_int = 0;
                             }
                             if (all_int) w->local_cycles += (u128)cnt;
                         }
