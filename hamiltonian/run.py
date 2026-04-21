@@ -2,8 +2,9 @@
   Command line program.
 """
 import argparse
+from pathlib import Path
 import networkx as nx
-from .util import GraphOrder, get_count, use_networkx, relabeled_graph
+from .util import GraphOrder, get_count, use_networkx, relabeled_graph, export_to_dimacs
 from .squares import square_graph
 from .knights import knight_graph
 from .hamming import hamming_graph
@@ -46,12 +47,13 @@ def write_graph():
     if args.path:
         base += '_path'
     name = base + '_' + '_'.join(map(str, args.args))
+    mydir = Path(args.dir)
     match args.type:
         case 'dimacs':
-            export_to_dimacs(gph, base + '.dimacs')
+            export_to_dimacs(gph, mydir / (name + '.dimacs'))
         case 'gb':
             gph.add_edges_from([('root', _) for _ in gph.nodes])
-            write_sgb(args.dir + name + '.gb', gph)
+            write_sgb(mydir / (name + '.gb'), gph)
         case _:
             print(f'Unrecognized export type {args.type}')
 
