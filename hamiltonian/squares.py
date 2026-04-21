@@ -22,7 +22,7 @@ A071983
 
 """
 from typing import List
-from math import floor
+from math import floor, isqrt
 import networkx as nx
 
 def square_graph(num: int) -> nx.Graph:
@@ -44,6 +44,21 @@ def square_graph(num: int) -> nx.Graph:
                         for ind in range(1, num)
                         for jind in range(ind + 1, num + 1)
                         if ind + jind in squares))
+    return gph
+
+def square_diff_graph(num: int) -> nx.Graph:
+    """
+      Input: n a positive integer
+      Output: A labeled undirected graph with labels from 1 to n
+      (i,j) is an edge if and only if |i-j| is a positive squares.
+      
+    """
+    gph = nx.Graph(name=f'square_diff({num})')
+    squares = {_ ** 2 for _ in range(1, isqrt(num) + 1)}
+    # We must have jind ** 2 < ind <==> jind <= sqrt(ind - 1)
+    gph.add_edges_from((ind, ind - jind)
+                       for ind in range(1, num + 1)
+                       for jind in {_ ** 2 for _ in range(1, isqrt(ind - 1) + 1)})
     return gph
 
 def square_sequence(gph: nx.Graph) -> List[int]:

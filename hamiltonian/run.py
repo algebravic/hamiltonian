@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 import networkx as nx
 from .util import GraphOrder, get_count, use_networkx, relabeled_graph, export_to_dimacs
-from .squares import square_graph
+from .squares import square_graph, square_diff_graph
 from .knights import knight_graph
 from .hamming import hamming_graph
 from .kings import king_graph
@@ -31,6 +31,7 @@ def write_graph():
 
     families = {'knight': (knight_graph, 2),
                 'square': (square_graph, 1),
+                'square_diff' : (square_diff_graph, 1),
                 'hamming': (hamming_graph, 1),
                 'grid'   : (grid_graph, 2),
                 'king'   : (king_graph, 2)
