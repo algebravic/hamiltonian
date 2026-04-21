@@ -81,6 +81,9 @@ def export_to_dimacs(gph: nx.Graph, filename):
     with open(filename, 'w') as fil:
         fil.write(f"c Exported from NetworkX\n")
         fil.write(f"p edge {gph.number_of_nodes()} {gph.number_of_edges()}\n")
+        # Write node translation in commments
+        for ind, node in enumerate(sorted(gph.nodes()), start=1):
+            fil.write(f"c {ind}: {node}\n")
         
         for u, v in gph.edges():
             fil.write(f"e {node_map[u]} {node_map[v]}\n")
