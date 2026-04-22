@@ -395,6 +395,8 @@ def _get_lib():
             int step_limit,
             uint64_t *cyc_lo, uint64_t *cyc_hi);
 
+        int  sm_overflow_detected(void);
+
         void count_ham_paths_sm(
             int n, const int *order, const int *pos, const int *last_s,
             const int *adj_off, const int *adj_dat,
@@ -665,6 +667,12 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
             "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16)."
+        )
+    if lib.sm_overflow_detected():
+        raise OverflowError(
+            "Sort-merge DP: a state count exceeded 2^64 during deduplication. "
+            "The result is INCORRECT. Use the EH backend (drop --sort-merge) "
+            "or increase the field width. Individual state counts exceeded u64 max."
         )
     paths = (hi << 64) | lo
     if count_cycles:

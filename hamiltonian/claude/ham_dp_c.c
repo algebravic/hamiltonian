@@ -36,6 +36,15 @@
 #include <malloc/malloc.h>   /* malloc_size() — macOS only */
 #endif
 
+/* Saturating-add with overflow detection for u64 sort-merge counts.
+   Sets sm_val_overflow flag if a + b would wrap.  Returns the wrapped
+   value (incorrect, but harmless since the flag signals bad results). */
+#define SM_VAL_ADD(a, b) __extension__({\
+    u64 _a=(a), _b=(b), _r=_a+_b; \
+    if (__builtin_expect(_r < _a, 0)) \
+        __sync_fetch_and_or(&sm_val_overflow, 1); \
+    _r; })
+
 #define SM_LARGE_THRESHOLD ((size_t)(1 << 20))   /* 1 MB */
 #define SM_HEADER_SIZE     16    /* one size_t (stored size) + 8 bytes pad  */
 
@@ -128,6 +137,14 @@ typedef struct {
     size_t ext_stream_buf; size_t slc_bytes;
     size_t par_merge_thresh; int steal_factor; size_t rsort_thresh;
 } SMConfig;
+/* ── Sort-merge val overflow detection ─────────────────────────────────
+   SMEntry.val is u64. If the count for any single state exceeds 2^64
+   during deduplication, it wraps silently and the final answer is wrong.
+   sm_val_overflow is set atomically whenever (a + b) wraps: a+b < a.
+   Checked by count_ham_paths_sm and exposed via sm_overflow_detected(). */
+static volatile int sm_val_overflow = 0;
+int sm_overflow_detected(void) { return sm_val_overflow; }
+
 static SMConfig sm_cfg = {
     .nthreads=6,.worker_cap=16*1024*1024,.rbuf_size=32,.bb_buf=32,
     .ext_stream_buf=1024,.slc_bytes=12*1024*1024,
@@ -1371,7 +1388,7 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
         } else { h[0] = h[--hs]; if (hs > 0) sm_heap_sift(h, hs, 0); }
         while (hs > 0 && h[0].key == cur.key) {
             int s2 = h[0].s;
-            cur.val += S[s2].buf[S[s2].pos].val;
+            cur.val = SM_VAL_ADD(cur.val, S[s2].buf[S[s2].pos].val);
             S[s2].pos++;
             if (S[s2].pos < S[s2].len) {
                 h[0].key = S[s2].buf[S[s2].pos].key; sm_heap_sift(h, hs, 0);
@@ -1486,7 +1503,7 @@ static size_t sm_merge_bb(SMStream *S, int K, SMEntry *out) {
         /* Dedup: accumulate values from all streams sharing the same key. */
         while (hs > 0 && h[0].key == cur.key) {
             int s2 = h[0].s;
-            cur.val += sm_bb_pop(&B[s2]).val;
+            cur.val = SM_VAL_ADD(cur.val, sm_bb_pop(&B[s2]).val);
             if (!sm_bb_empty(&B[s2])) {
                 h[0].key = sm_bb_key(&B[s2]);
                 sm_heap_sift(h, hs, 0);
@@ -1958,7 +1975,7 @@ static void sm_flush_run(SMWorkerState *ws) {
     size_t n = ws->buf_len, o = 0;
     for (size_t i = 0; i < n; i++) {
         if (o > 0 && ws->buf[o-1].key == ws->buf[i].key)
-            ws->buf[o-1].val += ws->buf[i].val;
+            ws->buf[o-1].val = SM_VAL_ADD(ws->buf[o-1].val, ws->buf[i].val);
         else
             ws->buf[o++] = ws->buf[i];
     }
@@ -2071,7 +2088,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
             sm_ext_advance(h, &hs, S, s);
             while (hs > 0 && h[0].key == cur.key) {
                 int s2 = h[0].s;
-                cur.val += S[s2].buf[S[s2].buf_pos++].val;
+                cur.val = SM_VAL_ADD(cur.val, S[s2].buf[S[s2].buf_pos++].val);
                 sm_ext_advance(h, &hs, S, s2);
             }
             out[op++] = cur;
@@ -2418,7 +2435,7 @@ static void *sm_ext_par_merge_thread(void *arg) {
         /* Dedup: accumulate all streams sharing the same key. */
         while (hs > 0 && h[0].key == cur.key) {
             int s2 = h[0].s;
-            cur.val += S[s2].buf[S[s2].buf_pos++].val;
+            cur.val = SM_VAL_ADD(cur.val, S[s2].buf[S[s2].buf_pos++].val);
             if (S[s2].buf_pos < S[s2].buf_len) {
                 h[0].key = S[s2].buf[S[s2].buf_pos].key;
                 sm_heap_sift(h, hs, 0);
@@ -2780,7 +2797,7 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
         /* Dedup: accumulate from all streams with the same key.             */
         while (hs > 0 && h[0].key == cur.key) {
             int s2 = h[0].s;
-            cur.val += S[s2].buf[S[s2].buf_pos++].val;
+            cur.val = SM_VAL_ADD(cur.val, S[s2].buf[S[s2].buf_pos++].val);
 
             if (S[s2].buf_pos < S[s2].buf_len) {
                 h[0].key = S[s2].buf[S[s2].buf_pos].key;
