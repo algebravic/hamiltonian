@@ -73,17 +73,3 @@ def get_count(gph: nx.Graph, order: GraphOrder = GraphOrder.Increasing,
     GraphSet.set_universe(myedges, traversal = traversal)
     return (GraphSet.cycles(is_hamilton=True).len() if cycles
             else GraphSet.paths(None, None, is_hamilton=True).len())
-
-def export_to_dimacs(gph: nx.Graph, filename):
-    # Ensure nodes are mapped to 1-indexed integers for DIMACS
-    node_map = {node: _ for _, node in enumerate(sorted(gph.nodes()), start=1)}
-    
-    with open(filename, 'w') as fil:
-        fil.write(f"c Exported from NetworkX\n")
-        fil.write(f"p edge {gph.number_of_nodes()} {gph.number_of_edges()}\n")
-        # Write node translation in commments
-        for ind, node in enumerate(sorted(gph.nodes()), start=1):
-            fil.write(f"c {ind}: {node}\n")
-        
-        for u, v in gph.edges():
-            fil.write(f"e {node_map[u]} {node_map[v]}\n")

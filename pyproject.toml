@@ -14,6 +14,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "scipy>=1.17.1",
     "pandas>=3.0.2",
+    "graph-families",
 ]
 
 [project.scripts]
@@ -30,6 +31,7 @@ dev = ["pytest>=5.2"]
 [tool.uv.sources]
 graphillion = { git = "https://github.com/takemaru/graphillion.git", rev = "v2.0rc0" }
 separation = { git = "https://github.com/algebravic/separation.git" }
+graph-families = { git = "https://github.com/algebravic/graph_families.git" }
 
 [build-system]
 requires = ["hatchling"]

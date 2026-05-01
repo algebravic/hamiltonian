@@ -4,14 +4,11 @@
 import argparse
 from pathlib import Path
 import networkx as nx
-from .util import GraphOrder, get_count, use_networkx, relabeled_graph, export_to_dimacs
-from .squares import square_graph, square_diff_graph
-from .knights import knight_graph
-from .hamming import hamming_graph
-from .kings import king_graph
-from .grid import grid_graph
+from graph_families import square_graph, square_diff_graph, knight_graph
+from graph_families import hamming_graph, king_graph, grid_graph
+from graph_families import export_to_dimacs, write_sgb
+from .util import GraphOrder, get_count, use_networkx, relabeled_graph
 from .timer import Timer
-from .to_sgb import write_sgb
 
 def write_graph():
     """
