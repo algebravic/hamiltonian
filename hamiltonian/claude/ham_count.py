@@ -393,6 +393,14 @@ def parse_args():
                         "remainder theorem (replays from the last snapshot before "
                         "the wrap, or full reruns, mod primes < 2^62; certified by "
                         "the Bregman bound); 'residue' stops with the count mod 2^64.")
+    p.add_argument("--spill-dir", default=None, metavar="DIR",
+                   help="(sort-merge only) Directory for runs that do not fit in "
+                        "RAM and for large CRT snapshots (default: $TMPDIR, else "
+                        "/tmp).  Should be a real disk, not tmpfs.")
+    p.add_argument("--crt-snap-gb", type=float, default=None, metavar="GB",
+                   help="(sort-merge only) Most RAM the CRT anchor snapshot may "
+                        "use; larger tables are written once to --spill-dir. "
+                        "Default: min(RAM/16, 64 GB).")
     p.add_argument("--ram-gb", type=float, default=0.0, metavar="GB",
                    help="(SA ordering only) Physical RAM in GB.  When set, the SA "
                         "cost function adds a quadratic OOM penalty for any "
@@ -636,6 +644,9 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
             mem_reserve_gb=getattr(args, 'mem_reserve_gb', 0.0),
             count_cycles=_cc,
             on_overflow=getattr(args, 'on_overflow', 'crt'),
+            spill_dir=getattr(args, 'spill_dir', None),
+            crt_snap_bytes=(None if getattr(args, 'crt_snap_gb', None) is None
+                            else int(args.crt_snap_gb * (1 << 30))),
         )
     else:
         result = count_hamiltonian_paths_c(

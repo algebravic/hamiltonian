@@ -467,6 +467,7 @@ def _get_lib():
         int  sm_overflow_step(void);
         void sm_set_modulus(uint64_t p);
         void sm_set_word_bits(int b);
+        void sm_set_spill_dir(const char *dir);
         void sm_set_crt(const uint64_t *moduli, int k, uint64_t snap_bytes);
         int  sm_crt_replay_from(void);
         uint64_t sm_crt_residue(int i, int which);
@@ -775,6 +776,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 ram_bytes: int | None = None,
                                 on_overflow: str = "crt",
                                 crt_snap_bytes: int | None = None,
+                                spill_dir: str | None = None,
                                 _word_bits: int = 64,
                                 **kwargs):
     """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
@@ -802,8 +804,13 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                mod each p_i; combine by the CRT.
                      "residue" raise SMOverflow carrying the result mod 2^64
                                and the first wrapping step.
-    crt_snap_bytes : largest state table kept as the replay snapshot
-                     (default min(1 GiB, RAM/64)).
+    crt_snap_bytes : most RAM the CRT anchor snapshot may use; a larger
+                     table is written once to spill_dir instead (default
+                     min(RAM/16, 64 GiB)).  Rolling snapshots later in the
+                     run use at most min(1 GiB, crt_snap_bytes).
+    spill_dir      : directory for runs that do not fit in RAM and for disk
+                     snapshots (default $TMPDIR, else /tmp).  The files are
+                     unlinked at creation, so nothing is left behind.
     _word_bits     : test hook only: emulate 2^b-bit counts (b < 64) so that
                      wraps and the CRT path can be exercised at small n.
     """
@@ -857,7 +864,8 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                    (math.log2(q) for q in crt_primes(k))) < bound2 + 1.0:
         k += 1
     primes = crt_primes(k)
-    snap = crt_snap_bytes if crt_snap_bytes is not None else min(1 << 30, ram // 64)
+    snap = crt_snap_bytes if crt_snap_bytes is not None else min(64 << 30, ram // 16)
+    lib.sm_set_spill_dir((spill_dir or "").encode())
 
     def _run(modulus=0, crt=()):
         lib.sm_set_modulus(modulus)

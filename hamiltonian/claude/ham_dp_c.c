@@ -1745,23 +1745,32 @@ static void smtab_ensure(SMTab *t, size_t needed) {
      - In-place:      curr(si) only — nxt is allocated later in sm_fused_sweep
    At n=75 step 57 (13.3B states = 303GB), this saves 303GB.            */
 
-typedef struct { SMEntry *data; size_t lo, hi; int fs; } SMIntroJob;
+typedef struct { SMEntry *data; size_t lo, hi; int fs; u128 sum; } SMIntroJob;
 
 static void *sm_intro_thread(void *arg) {
     SMIntroJob *j = (SMIntroJob *)arg;
     u64 mask = (u64)enc_v(0) << (4 * j->fs);
-    for (size_t i = j->lo; i < j->hi; i++)
+    u128 sum = 0;
+    for (size_t i = j->lo; i < j->hi; i++) {
         j->data[i].key |= mask;
+        sum += j->data[i].val;
+    }
+    j->sum = sum;
     return NULL;
 }
 
-static void sm_introduce(SMTab *tab, int fs) {
+/* Introduce the new frontier slot in place; returns the sum of all counts
+   (exact in u128), used for the no-wrap test of the CRT snapshots.      */
+static u128 sm_introduce(SMTab *tab, int fs) {
     int P = sm_cfg.nthreads;
     if (P <= 1 || tab->cnt < 65536) {
         u64 mask = (u64)enc_v(0) << (4 * fs);
-        for (size_t i = 0; i < tab->cnt; i++)
+        u128 sum = 0;
+        for (size_t i = 0; i < tab->cnt; i++) {
             tab->data[i].key |= mask;
-        return;
+            sum += tab->data[i].val;
+        }
+        return sum;
     }
     SMIntroJob *jobs = (SMIntroJob *)malloc((size_t)P * sizeof(SMIntroJob));
     pthread_t  *thds = (pthread_t  *)malloc((size_t)P * sizeof(pthread_t));
@@ -1771,11 +1780,13 @@ static void sm_introduce(SMTab *tab, int fs) {
     for (int i = 0; i < P; i++) {
         size_t lo = (size_t)i * chunk;
         size_t hi = lo + chunk < tab->cnt ? lo + chunk : tab->cnt;
-        jobs[i] = (SMIntroJob){ tab->data, lo, hi, fs };
+        jobs[i] = (SMIntroJob){ tab->data, lo, hi, fs, 0 };
         pthread_create(&thds[i], NULL, sm_intro_thread, &jobs[i]);
     }
-    for (int i = 0; i < P; i++) pthread_join(thds[i], NULL);
+    u128 sum = 0;
+    for (int i = 0; i < P; i++) { pthread_join(thds[i], NULL); sum += jobs[i].sum; }
     free(jobs); free(thds);
+    return sum;
 }
 
 /* ── SM worker (capped buffer + run accumulation) ───────────────────── */
@@ -1784,7 +1795,9 @@ static void sm_introduce(SMTab *tab, int fs) {
    curr + P * 2 * sm_cfg.worker_cap * 16B regardless of state count.
    32M entries = 768 MB per worker buf; total 6*2*768MB = 9.2 GB.       */
 
-typedef struct { SMEntry *data; size_t len; size_t alloc_size; } SMRun;
+/* A sorted, deduplicated run: in RAM (fd < 0: data, alloc_size) or in
+   the worker's spill file (fd >= 0: byte offset foff, data == NULL).    */
+typedef struct { SMEntry *data; size_t len; size_t alloc_size; int fd; size_t foff; } SMRun;
 
 /* Align per-thread mutable state to the false-sharing granularity.
    Without this, all workers share 2-3 cache lines, and mid-compute
@@ -1821,6 +1834,11 @@ typedef struct SM_CACHE_ALIGN {
     size_t   run_capacity;
     size_t   run_fd_off;
     size_t  *run_lens;
+    /* in-sweep spill (see sm_flush_run) */
+    int      spill_fd;          /* -1 until the first spilled run          */
+    size_t   spill_off;
+    int      n_spilled;
+    size_t   spilled_bytes;
 } SMWorkerState;
 
 /* ── ext_runs backing store helpers ─────────────────────────────────── */
@@ -2005,6 +2023,71 @@ typedef struct SM_CACHE_ALIGN {
     size_t           raw_out;
 } SMWorker;
 
+/* ── In-sweep spill ──────────────────────────────────────────────────
+   Every run is kept in RAM unless that would break the step's memory
+   budget, judged at the moment the run is produced: sm_resident_runs is
+   the byte count of this step's RAM runs, sm_spill_limit the most they may
+   occupy (set by sm_fused_sweep from the budget minus the input table, the
+   worker buffers, the held CRT snapshot and the smallest merge plan).  A
+   run that does not fit is appended to the worker's spill file in
+   sm_spill_dir (created with mkstemp and unlinked at once).            */
+static volatile size_t sm_resident_runs = 0;
+static size_t sm_spill_limit = (size_t)-1;
+static size_t sm_snap_held = 0;      /* bytes of CRT snapshots held in RAM */
+static char   sm_spill_dir[1024] = "";
+
+void sm_set_spill_dir(const char *dir) {
+    if (!dir) dir = "";
+    strncpy(sm_spill_dir, dir, sizeof sm_spill_dir - 1);
+    sm_spill_dir[sizeof sm_spill_dir - 1] = 0;
+}
+
+static const char *sm_spill_dir_get(void) {
+    if (sm_spill_dir[0]) return sm_spill_dir;
+    const char *t = getenv("TMPDIR");
+    return (t && *t) ? t : "/tmp";
+}
+
+#ifdef __linux__
+#  include <sys/vfs.h>
+#  define SM_TMPFS_MAGIC 0x01021994
+#endif
+
+/* Create an unlinked temporary file in the spill directory. */
+static int sm_spill_open(void) {
+    const char *dir = sm_spill_dir_get();
+    char path[1100];
+    snprintf(path, sizeof path, "%s/ham_sm_spill_XXXXXX", dir);
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        fprintf(stderr, "\nFATAL: cannot create spill file in %s\n", dir);
+        abort();
+    }
+    unlink(path);
+#ifdef __linux__
+    static volatile int warned = 0;
+    struct statfs sf;
+    if (!warned && fstatfs(fd, &sf) == 0 && (unsigned long)sf.f_type == SM_TMPFS_MAGIC
+        && __sync_bool_compare_and_swap(&warned, 0, 1))
+        fprintf(stderr, "# warning: spill directory %s is tmpfs (RAM); "
+                        "set --spill-dir to a disk\n", dir);
+#endif
+    return fd;
+}
+
+static void sm_pwrite_all(int fd, const void *buf, size_t bytes, off_t off) {
+    const char *p = (const char *)buf;
+    while (bytes) {
+        ssize_t w = pwrite(fd, p, bytes, off);
+        if (w <= 0) {
+            fprintf(stderr, "\nFATAL: spill write failed (%zu bytes at %lld in %s)\n",
+                    bytes, (long long)off, sm_spill_dir_get());
+            abort();
+        }
+        p += w; bytes -= (size_t)w; off += w;
+    }
+}
+
 /* ── sm_flush_run: sort+dedup buf, then store as a run ─────────────── */
 static void sm_flush_run(SMWorkerState *ws) {
     if (ws->buf_len == 0) return;
@@ -2028,16 +2111,28 @@ static void sm_flush_run(SMWorkerState *ws) {
         }
         ws->run_lens[ws->n_runs++] = o;
     } else {
-        /* RAM mode: copy run data using sm_alloc (bypasses xzone on macOS). */
         size_t run_bytes = o * sizeof(SMEntry);
-        SMEntry *run_data = (SMEntry*)sm_alloc(run_bytes);
-        memcpy(run_data, ws->buf, run_bytes);
         if (ws->n_runs == ws->runs_cap) {
             ws->runs_cap = ws->runs_cap ? ws->runs_cap * 2 : 4;
             ws->runs = (SMRun*)realloc(ws->runs,
                                        ws->runs_cap * sizeof(SMRun));
         }
-        ws->runs[ws->n_runs++] = (SMRun){ run_data, o, run_bytes };
+        size_t now = __sync_add_and_fetch(&sm_resident_runs, run_bytes);
+        if (now <= sm_spill_limit) {
+            /* RAM run: copy using sm_alloc (bypasses xzone on macOS). */
+            SMEntry *run_data = (SMEntry*)sm_alloc(run_bytes);
+            if (run_bytes) SM_ALLOC_CHECK(run_data, run_bytes);
+            memcpy(run_data, ws->buf, run_bytes);
+            ws->runs[ws->n_runs++] = (SMRun){ run_data, o, run_bytes, -1, 0 };
+        } else {
+            /* Does not fit: append to this worker's spill file. */
+            __sync_sub_and_fetch(&sm_resident_runs, run_bytes);
+            if (ws->spill_fd < 0) { ws->spill_fd = sm_spill_open(); ws->spill_off = 0; }
+            sm_pwrite_all(ws->spill_fd, ws->buf, run_bytes, (off_t)ws->spill_off);
+            ws->runs[ws->n_runs++] = (SMRun){ NULL, o, 0, ws->spill_fd, ws->spill_off };
+            ws->spill_off += run_bytes;
+            ws->n_spilled++; ws->spilled_bytes += run_bytes;
+        }
     }
 }
 
@@ -3018,9 +3113,12 @@ static int sm_should_use_ext(size_t si, int nb, size_t ram_bytes) {
 
 typedef struct {
     int    T;            /* merge threads                                   */
-    size_t G;            /* release granule, bytes                          */
+    size_t G;            /* release granule, bytes (RAM streams)            */
     size_t C;            /* output chunk, bytes                             */
-    size_t R, R_small;   /* bytes of all runs / of non-releasable runs      */
+    size_t Bf;           /* read buffer per file sub-stream, bytes          */
+    size_t R, R_small;   /* bytes of RAM runs / of non-releasable RAM runs  */
+    size_t R_file;       /* bytes of spilled (file) runs                    */
+    int    K, K_file;    /* runs: all / spilled                             */
     size_t pred_peak;    /* predicted resident bound for the merge phase    */
     size_t budget;       /* memory budget used                              */
 } SMA1Plan;
@@ -3031,75 +3129,187 @@ static size_t sm_page_bytes(void) {
     return pg;
 }
 
-/* Returns 1 and fills *p if A1 should be used for this step. */
-static int sm_a1_plan(SMWorkerState *WS, int P, size_t ram_bytes, SMA1Plan *p) {
-    const char *mode = getenv("HAM_SM_MERGE");
-    if (mode && !strcmp(mode, "a0")) return 0;
-    int force = (mode && !strcmp(mode, "a1"));
-    size_t pg = sm_page_bytes();
-    size_t R = 0, R_small = 0; int K = 0;
-    for (int i = 0; i < P; i++)
-        for (int r = 0; r < WS[i].n_runs; r++) {
-            size_t b = WS[i].runs[r].len * sizeof(SMEntry);
-            R += b; K++;
-            if (WS[i].runs[r].alloc_size < SM_RELEASE_MIN) R_small += b;
-        }
-    if (K == 0) return 0;
+/* Memory available to a step's runs and merge: RAM - 4 GiB OS reserve -
+   CRT snapshots held in RAM (HAM_SM_MERGE_BUDGET overrides, for tests). */
+static size_t sm_merge_budget(size_t ram_bytes) {
     size_t os_head = (size_t)4 << 30;
     size_t B = ram_bytes > os_head ? ram_bytes - os_head : 0;
     const char *bud = getenv("HAM_SM_MERGE_BUDGET");
     if (bud && *bud) B = (size_t)strtoull(bud, NULL, 10);
+    B = B > sm_snap_held ? B - sm_snap_held : 0;
+    return B;
+}
+
+/* Free a large table: on Linux the pages are first returned in parallel
+   (madvise from T threads), so the final munmap has little left to do.
+   A single munmap of ~100 GB takes the kernel many seconds on one core.  */
+typedef struct { char *a, *b; } SMFreeJob;
+static void *sm_free_thread(void *arg) {
+    SMFreeJob *j = (SMFreeJob *)arg;
+    if (j->b > j->a) madvise(j->a, (size_t)(j->b - j->a), SM_MADV_RELEASE);
+    return NULL;
+}
+static void sm_free_big(void *p, size_t bytes) {
+#ifdef __linux__
+    int T = sm_cfg.nthreads > 0 ? sm_cfg.nthreads : 1;
+    if (p && bytes >= ((size_t)1 << 30) && T > 1 && bytes >= SM_RELEASE_MIN) {
+        size_t pg = sm_page_bytes();
+        uintptr_t lo = ((uintptr_t)p + pg - 1) & ~(uintptr_t)(pg - 1);
+        uintptr_t hi = ((uintptr_t)p + bytes) & ~(uintptr_t)(pg - 1);
+        if (hi > lo) {
+            SMFreeJob *J = (SMFreeJob *)malloc((size_t)T * sizeof(SMFreeJob));
+            pthread_t *th = (pthread_t *)malloc((size_t)T * sizeof(pthread_t));
+            if (J && th) {
+                size_t ch = ((hi - lo) / (size_t)T + pg - 1) & ~(pg - 1);
+                for (int t = 0; t < T; t++) {
+                    uintptr_t a = lo + (uintptr_t)t * ch, b = a + ch;
+                    if (a > hi) a = hi;
+                    if (b > hi) b = hi;
+                    J[t] = (SMFreeJob){ (char *)a, (char *)b };
+                    pthread_create(&th[t], NULL, sm_free_thread, &J[t]);
+                }
+                for (int t = 0; t < T; t++) pthread_join(th[t], NULL);
+            }
+            free(J); free(th);
+        }
+    }
+#else
+    (void)bytes;
+#endif
+    sm_free(p);
+}
+
+/* Returns 1 and fills *p if A1 should be used for this step.  A step with
+   spilled runs must use A1 (A0 reads runs from RAM only), so the plan is
+   forced then: the smallest plan (T = 1, smallest granule and buffers).  */
+static int sm_a1_plan(SMWorkerState *WS, int P, size_t ram_bytes, SMA1Plan *p) {
+    const char *mode = getenv("HAM_SM_MERGE");
+    size_t pg = sm_page_bytes();
+    size_t R = 0, R_small = 0, R_file = 0; int K = 0, K_file = 0;
+    for (int i = 0; i < P; i++)
+        for (int r = 0; r < WS[i].n_runs; r++) {
+            size_t b = WS[i].runs[r].len * sizeof(SMEntry);
+            K++;
+            if (WS[i].runs[r].fd >= 0) { R_file += b; K_file++; continue; }
+            R += b;
+            if (WS[i].runs[r].alloc_size < SM_RELEASE_MIN) R_small += b;
+        }
+    if (K_file == 0 && mode && !strcmp(mode, "a0")) return 0;
+    if (K == 0) {                                 /* nothing to merge       */
+        memset(p, 0, sizeof *p); p->T = 1; p->budget = sm_merge_budget(ram_bytes);
+        return 1;
+    }
+    /* A1 is used whenever it is not explicitly disabled: even its smallest
+       plan (T = 1, smallest granule) peaks at about R + K*(G + 2 pages) +
+       R_small + C, below A0's R + max_i R_i and its ~2R second stage.    */
+    int force = 1;
+    size_t B = sm_merge_budget(ram_bytes);
+    size_t Rall = R + R_file;
     size_t C = (size_t)32 << 20;                  /* output chunk           */
-    if (C > R / 8 + pg) C = (R / 8 + pg) & ~(pg - 1);
+    if (C > Rall / 8 + pg) C = (Rall / 8 + pg) & ~(pg - 1);
     if (C < pg) C = pg;
     int T = sm_cfg.nthreads > 0 ? sm_cfg.nthreads : 1;
-    if (R / sizeof(SMEntry) < sm_cfg.par_merge_thresh) T = 1;
+    if (Rall / sizeof(SMEntry) < sm_cfg.par_merge_thresh) T = 1;
     size_t Gmin = (size_t)64 << 10, Gmax = (size_t)64 << 20;
     if (Gmin < pg) Gmin = pg;
-    size_t G = 0;
+    size_t Bmin = (size_t)256 << 10, Bmax = (size_t)8 << 20;
+    int K_ram = K - K_file;
+    size_t G = Gmin, Bf = Bmin;
+    int ok = 0;
     for (; T >= 1; T = (T > 1 ? T / 2 : 0)) {
         size_t fixed = R + R_small + (size_t)T * C;
         if (B <= fixed) continue;
-        size_t H = B - fixed;                     /* left for release slack */
-        size_t per = H / ((size_t)T * (size_t)K);
-        if (per <= 2 * pg) continue;
-        G = per - 2 * pg;
-        if (G < Gmin) continue;
-        if (G > Gmax) G = Gmax;
-        G &= ~(pg - 1);
+        size_t H = B - fixed;
+        /* file buffers first take up to half of H, then release slack   */
+        if (K_file) {
+            size_t per = H / 2 / ((size_t)T * (size_t)K_file);
+            if (per < Bmin) continue;
+            Bf = per > Bmax ? Bmax : per;
+            Bf &= ~(size_t)(sizeof(SMEntry) - 1);
+            H -= (size_t)T * (size_t)K_file * Bf;
+        }
+        if (K_ram) {
+            size_t per = H / ((size_t)T * (size_t)K_ram);
+            if (per <= 2 * pg) continue;
+            G = per - 2 * pg;
+            if (G < Gmin) continue;
+            if (G > Gmax) G = Gmax;
+            G &= ~(pg - 1);
+        }
+        ok = 1;
         break;
     }
-    if (T < 1) {
+    if (!ok) {
         if (!force) return 0;
-        T = 1; G = Gmin;                          /* forced: smallest plan  */
+        T = 1; G = Gmin; Bf = Bmin;               /* forced: smallest plan  */
     }
-    p->T = T; p->G = G; p->C = C; p->R = R; p->R_small = R_small;
+    p->T = T; p->G = G; p->C = C; p->Bf = Bf;
+    p->R = R; p->R_small = R_small; p->R_file = R_file;
+    p->K = K; p->K_file = K_file;
     p->budget = B;
-    /* resident <= R + (consumed but unreleased) + partial chunks, and the
-       unreleased part is <= G + 2 pages per large sub-stream plus all of
-       the small runs, and never more than R.                             */
-    size_t unrel = (size_t)T * (size_t)K * (G + 2 * pg) + R_small;
+    /* resident <= R + (consumed but unreleased RAM input) + file buffers +
+       partial chunks; the unreleased part is <= G + 2 pages per large RAM
+       sub-stream plus all of the small runs, and never more than R; the
+       output written is <= the input consumed, RAM or file.  When file
+       runs exist the output can exceed R by up to R_file.              */
+    size_t unrel = (size_t)T * (size_t)K_ram * (G + 2 * pg) + R_small;
     if (unrel > R) unrel = R;
-    p->pred_peak = R + unrel + (size_t)T * C;
+    p->pred_peak = R + unrel + R_file + (size_t)T * (size_t)K_file * Bf + (size_t)T * C;
     return 1;
 }
 
+/* A merge input: a window [cur, end) over a sorted run slice.  RAM runs
+   have one window (the whole slice) and return consumed pages to the OS;
+   spilled runs refill the window from the file with pread.             */
 typedef struct {
-    const SMEntry *buf;      /* slice base                                   */
-    size_t         pos, len; /* position and length within the slice          */
-    uintptr_t      rel;      /* released up to here (page aligned)            */
-    uintptr_t      rel_end;  /* never release at or beyond this               */
-    size_t         next_chk; /* pos at which to try the next release          */
+    const SMEntry *cur, *end;
+    /* RAM streams */
+    const SMEntry *next_chk;  /* try a release when cur reaches this       */
+    uintptr_t      rel;       /* released up to here (page aligned)         */
+    uintptr_t      rel_end;   /* never release at or beyond this            */
+    /* file streams */
+    int            fd;        /* -1 for RAM streams                         */
+    off_t          foff;      /* next byte to read                          */
+    size_t         left;      /* entries not yet read into the window       */
+    SMEntry       *fbuf;
+    size_t         fcap;      /* window capacity, entries                   */
 } SMRStream;
 
 static inline void sm_rs_release(SMRStream *s, size_t G_entries, size_t pg) {
-    uintptr_t end = ((uintptr_t)(s->buf + s->pos)) & ~(uintptr_t)(pg - 1);
+    uintptr_t end = ((uintptr_t)s->cur) & ~(uintptr_t)(pg - 1);
     if (end > s->rel_end) end = s->rel_end;
     if (end > s->rel) {
         madvise((void *)s->rel, end - s->rel, SM_MADV_RELEASE);
         s->rel = end;
     }
-    s->next_chk = s->pos + G_entries;
+    s->next_chk = s->cur + G_entries;
+}
+
+static void sm_pread_all(int fd, void *buf, size_t bytes, off_t off) {
+    char *p = (char *)buf;
+    while (bytes) {
+        ssize_t r = pread(fd, p, bytes, off);
+        if (r <= 0) {
+            fprintf(stderr, "\nFATAL: spill read failed (%zu bytes at %lld)\n",
+                    bytes, (long long)off);
+            abort();
+        }
+        p += r; bytes -= (size_t)r; off += r;
+    }
+}
+
+/* Refill a file stream's window; returns 0 when the stream is exhausted. */
+static int sm_rs_refill(SMRStream *s) {
+    if (s->fd < 0 || s->left == 0) return 0;
+    size_t n = s->left < s->fcap ? s->left : s->fcap;
+    size_t bytes = n * sizeof(SMEntry);
+    sm_pread_all(s->fd, s->fbuf, bytes, s->foff);
+#ifdef POSIX_FADV_DONTNEED
+    posix_fadvise(s->fd, s->foff, (off_t)bytes, POSIX_FADV_DONTNEED);
+#endif
+    s->foff += (off_t)bytes; s->left -= n;
+    s->cur = s->fbuf; s->end = s->fbuf + n;
+    return 1;
 }
 
 typedef struct SM_CACHE_ALIGN {
@@ -3127,9 +3337,14 @@ static inline SMEntry *sm_a1_slot(SMA1Job *j) {
     return &j->chunks[j->n_chunks - 1][j->last_fill++];
 }
 
-static inline void sm_a1_pop(SMA1Job *j, SMRStream *s) {
-    s->pos++;
-    if (s->pos >= s->next_chk) sm_rs_release(s, j->G_entries, j->pg);
+/* Advance stream s past its current entry; returns 0 if now exhausted. */
+static inline int sm_a1_pop(SMA1Job *j, SMRStream *s) {
+    s->cur++;
+    if (s->fd < 0) {
+        if (s->cur >= s->next_chk) sm_rs_release(s, j->G_entries, j->pg);
+        return s->cur < s->end;
+    }
+    return s->cur < s->end || sm_rs_refill(s);
 }
 
 static void *sm_a1_merge_thread(void *arg) {
@@ -3138,30 +3353,28 @@ static void *sm_a1_merge_thread(void *arg) {
     SMHEntry *h = (SMHEntry *)malloc((size_t)j->K * sizeof(SMHEntry));
     if (!h) SM_OOM((size_t)j->K * sizeof(SMHEntry));
     int hs = 0;
-    for (int i = 0; i < j->K; i++)
-        if (S[i].len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
+    for (int i = 0; i < j->K; i++) {
+        if (S[i].cur == S[i].end && !sm_rs_refill(&S[i])) continue;
+        h[hs].key = S[i].cur->key; h[hs].s = i; hs++;
+    }
     for (int i = hs/2-1; i >= 0; i--) sm_heap_sift(h, hs, i);
     size_t op = 0;
     while (hs > 0) {
         int s = h[0].s;
-        SMEntry cur = S[s].buf[S[s].pos];
-        sm_a1_pop(j, &S[s]);
-        if (S[s].pos < S[s].len) { h[0].key = S[s].buf[S[s].pos].key; sm_heap_sift(h, hs, 0); }
+        SMEntry cur = *S[s].cur;
+        if (sm_a1_pop(j, &S[s])) { h[0].key = S[s].cur->key; sm_heap_sift(h, hs, 0); }
         else { h[0] = h[--hs]; if (hs > 0) sm_heap_sift(h, hs, 0); }
         while (hs > 0 && h[0].key == cur.key) {
             int s2 = h[0].s;
-            cur.val = SM_VAL_ADD(cur.val, S[s2].buf[S[s2].pos].val);
-            sm_a1_pop(j, &S[s2]);
-            if (S[s2].pos < S[s2].len) { h[0].key = S[s2].buf[S[s2].pos].key; sm_heap_sift(h, hs, 0); }
+            cur.val = SM_VAL_ADD(cur.val, S[s2].cur->val);
+            if (sm_a1_pop(j, &S[s2])) { h[0].key = S[s2].cur->key; sm_heap_sift(h, hs, 0); }
             else { h[0] = h[--hs]; if (hs > 0) sm_heap_sift(h, hs, 0); }
         }
         *sm_a1_slot(j) = cur;
         op++;
     }
-    for (int i = 0; i < j->K; i++) {             /* release the remainder   */
-        S[i].pos = S[i].len;
-        sm_rs_release(&S[i], j->G_entries, j->pg);
-    }
+    for (int i = 0; i < j->K; i++)              /* release the remainder   */
+        if (S[i].fd < 0) { S[i].cur = S[i].end; sm_rs_release(&S[i], j->G_entries, j->pg); }
     free(h);
     j->out_cnt = op;
     return NULL;
@@ -3185,29 +3398,41 @@ static int sm_u64_cmp(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
-/* Merge all RAM runs of all workers into nxt (exact size).  Frees the
-   runs.  Returns the number of entries; fills timings.                  */
+/* Entry i of run r (RAM or file). */
+static inline u64 sm_run_key(const SMRun *r, size_t i) {
+    if (r->fd < 0) return r->data[i].key;
+    SMEntry e;
+    sm_pread_all(r->fd, &e, sizeof e, (off_t)(r->foff + i * sizeof(SMEntry)));
+    return e.key;
+}
+/* First index in run r whose eh_hash(key) >= target. */
+static size_t sm_run_lower_bound(const SMRun *r, u64 target) {
+    if (r->fd < 0) return sm_lower_bound(r->data, r->len, target);
+    size_t lo = 0, hi = r->len;
+    while (lo < hi) {
+        size_t mid = (lo + hi) >> 1;
+        if (eh_hash(sm_run_key(r, mid)) < target) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+/* Merge all runs of all workers (RAM and spilled) into nxt (exact size).
+   Frees the RAM runs.  Returns the number of entries; fills timings.    */
 static size_t sm_global_ram_merge(SMWorkerState *WS, int P, SMTab *nxt,
                                   const SMA1Plan *pl,
                                   double *t_merge_ms, double *t_copy_ms) {
     size_t pg = sm_page_bytes();
     int K = 0;
     for (int i = 0; i < P; i++) K += WS[i].n_runs;
-    const SMEntry **base = (const SMEntry **)malloc((size_t)K * sizeof(*base));
-    size_t *blen = (size_t *)malloc((size_t)K * sizeof(size_t));
-    int    *relok = (int *)malloc((size_t)K * sizeof(int));
-    SMRun  **runp = (SMRun **)malloc((size_t)K * sizeof(SMRun *));
-    SM_ALLOC_CHECK(base, (size_t)K * sizeof(*base));
-    SM_ALLOC_CHECK(blen, (size_t)K * sizeof(size_t));
-    SM_ALLOC_CHECK(relok, (size_t)K * sizeof(int));
+    if (K == 0) {
+        nxt->cnt = 0; *t_merge_ms = *t_copy_ms = 0;
+        return 0;
+    }
+    SMRun **runp = (SMRun **)malloc((size_t)K * sizeof(SMRun *));
     SM_ALLOC_CHECK(runp, (size_t)K * sizeof(SMRun *));
     { int k = 0;
       for (int i = 0; i < P; i++)
-          for (int r = 0; r < WS[i].n_runs; r++, k++) {
-              runp[k] = &WS[i].runs[r];
-              base[k] = WS[i].runs[r].data; blen[k] = WS[i].runs[r].len;
-              relok[k] = WS[i].runs[r].alloc_size >= SM_RELEASE_MIN;
-          } }
+          for (int r = 0; r < WS[i].n_runs; r++, k++) runp[k] = &WS[i].runs[r]; }
     int T = pl->T;
 
     /* Splitters: SM_SAMPLES_PER_STREAM hash samples per run. */
@@ -3217,10 +3442,11 @@ static size_t sm_global_ram_merge(SMWorkerState *WS, int P, SMTab *nxt,
         u64 *smp = (u64 *)malloc(cap * sizeof(u64));
         SM_ALLOC_CHECK(smp, cap * sizeof(u64));
         for (int k = 0; k < K; k++) {
-            if (!blen[k]) continue;
+            size_t len = runp[k]->len;
+            if (!len) continue;
             for (int q = 0; q < SM_SAMPLES_PER_STREAM; q++) {
-                size_t idx = (size_t)q * (blen[k] - 1) / (SM_SAMPLES_PER_STREAM - 1);
-                smp[ns++] = eh_hash(base[k][idx].key);
+                size_t idx = (size_t)q * (len - 1) / (SM_SAMPLES_PER_STREAM - 1);
+                smp[ns++] = eh_hash(sm_run_key(runp[k], idx));
             }
         }
         qsort(smp, ns, sizeof(u64), sm_u64_cmp);
@@ -3235,7 +3461,8 @@ static size_t sm_global_ram_merge(SMWorkerState *WS, int P, SMTab *nxt,
         free(smp);
     }
 
-    SMA1Job   *J  = (SMA1Job *)sm_aligned_calloc((size_t)T, sizeof(SMA1Job));
+    SMA1Job *J = (SMA1Job *)sm_aligned_calloc((size_t)T, sizeof(SMA1Job));
+    SM_ALLOC_CHECK(J, (size_t)T * sizeof(SMA1Job));
     /* Each thread's K stream cursors are written on every pop: give every
        thread its own 128 B-aligned block so no line is shared.          */
     size_t s_blk = ((size_t)K * sizeof(SMRStream) + SM_ALIGN_BYTES - 1)
@@ -3244,23 +3471,46 @@ static size_t sm_global_ram_merge(SMWorkerState *WS, int P, SMTab *nxt,
     SM_ALLOC_CHECK(AS, (size_t)T * s_blk);
 #define A1S(t) ((SMRStream *)(AS + (size_t)(t) * s_blk))
     size_t G_entries = pl->G / sizeof(SMEntry); if (!G_entries) G_entries = 1;
+    size_t F_entries = pl->Bf / sizeof(SMEntry); if (!F_entries) F_entries = 1;
+    SMEntry *fpool = NULL;
+    if (pl->K_file) {
+        fpool = (SMEntry *)sm_alloc((size_t)T * pl->K_file * F_entries * sizeof(SMEntry));
+        SM_ALLOC_CHECK(fpool, (size_t)T * pl->K_file * F_entries * sizeof(SMEntry));
+    }
+    size_t fslot = 0;
     for (int k = 0; k < K; k++) {
+        const SMRun *run = runp[k];
         size_t lo = 0;
-        uintptr_t run_lo = ((uintptr_t)base[k] + pg - 1) & ~(uintptr_t)(pg - 1);
-        uintptr_t run_hi = ((uintptr_t)(base[k] + blen[k])) & ~(uintptr_t)(pg - 1);
+        uintptr_t run_lo = 0, run_hi = 0;
+        if (run->fd < 0) {
+            run_lo = ((uintptr_t)run->data + pg - 1) & ~(uintptr_t)(pg - 1);
+            run_hi = ((uintptr_t)(run->data + run->len)) & ~(uintptr_t)(pg - 1);
+        }
+        int relok = run->fd < 0 && run->alloc_size >= SM_RELEASE_MIN;
         for (int t = 0; t < T; t++) {
-            size_t hi = (t == T - 1) ? blen[k] : sm_lower_bound(base[k], blen[k], spl[t]);
+            size_t hi = (t == T - 1) ? run->len : sm_run_lower_bound(run, spl[t]);
             if (hi < lo) hi = lo;
             SMRStream *s = &A1S(t)[k];
-            s->buf = base[k] + lo; s->pos = 0; s->len = hi - lo;
-            /* Release only whole pages inside this slice of a large run. */
-            uintptr_t a = ((uintptr_t)s->buf + pg - 1) & ~(uintptr_t)(pg - 1);
-            uintptr_t b = ((uintptr_t)(s->buf + s->len)) & ~(uintptr_t)(pg - 1);
-            if (a < run_lo) a = run_lo;
-            if (b > run_hi) b = run_hi;
-            if (!relok[k] || b <= a) { a = b = 0; }
-            s->rel = a; s->rel_end = b;
-            s->next_chk = G_entries;
+            memset(s, 0, sizeof *s);
+            if (run->fd < 0) {
+                s->fd = -1;
+                s->cur = run->data + lo; s->end = run->data + hi;
+                /* Release only whole pages inside this slice of a large run. */
+                uintptr_t a = ((uintptr_t)s->cur + pg - 1) & ~(uintptr_t)(pg - 1);
+                uintptr_t b = ((uintptr_t)s->end) & ~(uintptr_t)(pg - 1);
+                if (a < run_lo) a = run_lo;
+                if (b > run_hi) b = run_hi;
+                if (!relok || b <= a) { a = b = 0; }
+                s->rel = a; s->rel_end = b;
+                s->next_chk = s->cur + G_entries;
+            } else {
+                s->fd = run->fd;
+                s->foff = (off_t)(run->foff + lo * sizeof(SMEntry));
+                s->left = hi - lo;
+                s->fbuf = fpool + (fslot++) * F_entries;
+                s->fcap = F_entries;
+                s->cur = s->end = s->fbuf;
+            }
             lo = hi;
         }
     }
@@ -3279,10 +3529,14 @@ static size_t sm_global_ram_merge(SMWorkerState *WS, int P, SMTab *nxt,
     else sm_a1_merge_thread(&J[0]);
     double t1 = now_ms();
 
-    /* Inputs fully consumed: free them (also frees straddling pages). */
-    for (int k = 0; k < K; k++) { sm_free(runp[k]->data); runp[k]->data = NULL; }
+    /* Inputs fully consumed: free the RAM runs (also frees straddling
+       pages) and the file read buffers; the spill files are closed by
+       the caller.                                                        */
+    for (int k = 0; k < K; k++)
+        if (runp[k]->fd < 0) { sm_free(runp[k]->data); runp[k]->data = NULL; }
+    sm_free(fpool);
 #undef A1S
-    free(AS); free(base); free(blen); free(relok); free(runp);
+    free(AS); free(runp);
 
     size_t N = 0;
     for (int t = 0; t < T; t++) { J[t].dst_off = N; N += J[t].out_cnt; }
@@ -3346,7 +3600,27 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     int P = sm_cfg.nthreads;
     size_t ni    = curr->cnt;
     size_t chunk = (ni + P - 1) / P;
-    int ext_runs = sm_should_use_ext(ni, n_back, ram_bytes);
+    /* Run layout.  Default: RAM runs with the in-sweep spill rule and the
+       A1 merge for every step.  HAM_SM_LAYOUT=ext restores the old
+       pre-sweep choice of the anonymous-mapping ("ext") store and its
+       merge, for comparison.                                            */
+    const char *layout = getenv("HAM_SM_LAYOUT");
+    int ext_runs = (layout && !strcmp(layout, "ext"))
+                   ? sm_should_use_ext(ni, n_back, ram_bytes) : 0;
+    {
+        size_t pg = sm_page_bytes();
+        size_t B  = sm_merge_budget(ram_bytes);
+        size_t Tm = (size_t)(P > 0 ? P : 1);
+        size_t F  = curr->cap * sizeof(SMEntry)
+                  + (size_t)P * 2 * sm_cfg.worker_cap * sizeof(SMEntry);
+        size_t Mres = Tm * (4 * (size_t)P) * (((size_t)64 << 10) + 2 * pg)
+                    + Tm * ((size_t)32 << 20);
+        sm_resident_runs = 0;
+        sm_spill_limit = (!ext_runs && B > F + Mres) ? B - F - Mres
+                       : (ext_runs ? (size_t)-1 : 0);
+        const char *sl = getenv("HAM_SM_SPILL_LIMIT");     /* test hook */
+        if (!ext_runs && sl && *sl) sm_spill_limit = (size_t)strtoull(sl, NULL, 10);
+    }
 
     /* Capacity for ext_runs backing store per worker.
        Must cover the true worst-case bytes written: all bpt entries before
@@ -3382,6 +3656,10 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         WS[i].run_capacity = 0;
         WS[i].run_fd_off = 0;
         WS[i].run_lens   = NULL;
+        WS[i].spill_fd   = -1;
+        WS[i].spill_off  = 0;
+        WS[i].n_spilled  = 0;
+        WS[i].spilled_bytes = 0;
         if (ext_runs) {
             WS[i].run_capacity = ext_cap_bytes;
             WS[i].run_fd = sm_ext_open(ext_cap_bytes, &WS[i].run_map);
@@ -3413,6 +3691,9 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     /* Compute raw_total for pre-allocation and instrumentation. */
     size_t raw_total = 0;
     size_t after_run_dedup_total = 0;  /* filled below per path */
+    int    total_runs = 0, spilled_runs = 0;
+    size_t spilled_bytes = 0, resident_runs_end = sm_resident_runs;
+    for (int i = 0; i < P; i++) total_runs += WS[i].n_runs;
 
     /* ── Merge strategy ─────────────────────────────────────────────────
        ext_runs path (large steps): sm_global_ext_merge
@@ -3443,7 +3724,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
            Freeing curr (up to 15 GB at n=61 step 39) ensures the
            ×1.5-growth reallocs in sm_global_ext_merge stay under 36 GB.
            curr->data = NULL makes the outer cleanup free() a no-op.       */
-        sm_free(curr->data); curr->data = NULL; curr->cap = 0;
+        sm_free_big(curr->data, curr->cap * sizeof(SMEntry)); curr->data = NULL; curr->cap = 0;
 
         /* Free worker scratch buffers before the merge: they held pre-flush
            data and are no longer needed now that all runs are on SSD.
@@ -3490,7 +3771,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
            the sm_merge_runs + parallel-merge phase, which itself
            needs up to raw_out×16B of run data simultaneously.
            curr->data = NULL makes the outer free() a no-op.          */
-        sm_free(curr->data); curr->data = NULL; curr->cap = 0;
+        sm_free_big(curr->data, curr->cap * sizeof(SMEntry)); curr->data = NULL; curr->cap = 0;
 
         /* Stage 1: sum run lengths = entries after intra-run sort+dedup.
            Assigns to the outer after_run_dedup_total (not a new variable). */
@@ -3500,6 +3781,9 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
 
         SMA1Plan a1;
         int use_a1 = sm_a1_plan(WS, P, ram_bytes, &a1);
+        for (int i = 0; i < P; i++) {
+            spilled_runs += WS[i].n_spilled; spilled_bytes += WS[i].spilled_bytes;
+        }
         if (instrument) sm_hwm_reset();
         if (use_a1) {
             /* A1: one global, memory-budgeted parallel merge (see above). */
@@ -3511,15 +3795,19 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             t_par0 = now_ms();
             sm_global_ram_merge(WS, P, nxt, &a1, &tm, &tc);
             t_par_merge = now_ms() - t_par0;
-            for (int i = 0; i < P; i++) { free(WS[i].runs); WS[i].runs = NULL; WS[i].n_runs = 0; }
+            for (int i = 0; i < P; i++) {
+                free(WS[i].runs); WS[i].runs = NULL; WS[i].n_runs = 0;
+                if (WS[i].spill_fd >= 0) { close(WS[i].spill_fd); WS[i].spill_fd = -1; }
+            }
             if (instrument) {
                 int life = 0; double hwm = sm_hwm_gb(&life);
                 fprintf(stderr,
-                    "  [inst]   ram_merge: mode=a1 T=%d K=%d G=%zuKB C=%zuMB "
-                    "R=%.2fGB R_small=%.2fGB budget=%.1fGB pred_peak=%.2fGB "
+                    "  [inst]   ram_merge: mode=a1 T=%d K=%d K_file=%d G=%zuKB Bf=%zuKB C=%zuMB "
+                    "R=%.2fGB R_small=%.2fGB R_file=%.2fGB budget=%.1fGB pred_peak=%.2fGB "
                     "%s=%.2fGB merge=%.0fms copy=%.0fms\n",
-                    a1.T, Kr, a1.G >> 10, a1.C >> 20,
+                    a1.T, Kr, a1.K_file, a1.G >> 10, a1.Bf >> 10, a1.C >> 20,
                     a1.R / 1073741824.0, a1.R_small / 1073741824.0,
+                    a1.R_file / 1073741824.0,
                     a1.budget / 1073741824.0, a1.pred_peak / 1073741824.0,
                     life ? "maxrss_lifetime" : "hwm", hwm, tm, tc);
             }
@@ -3621,8 +3909,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             "  [inst]   dedup_stages: raw=%zuM  after_run=%zuM(%.2fx)  "
             "after_wmerge=%zuM(%.2fx)  final=%zuM(%.2fx)\n"
             "  [inst]   worker details (compute / flush / merge_runs / n_runs / out):\n",
-            step, n_back, ext_runs,
-            ext_runs ? (int)(raw_total / (sm_cfg.worker_cap/2)) : WS[0].n_runs,
+            step, n_back, ext_runs, total_runs,
             t_compute_max, t_wall_compute/P,
             t_flush_max,   t_wall_flush/P,
             t_merge_runs_total, t_merge_max,
@@ -3637,6 +3924,13 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             raw_total>0 ? (double)after_run_dedup_total/raw_total : 1.0,
             nxt->cnt/1000000,
             raw_total>0 ? (double)raw_total/nxt->cnt : 1.0);
+        fprintf(stderr,
+            "  [inst]   runs: total=%d spilled=%d (%.2fGB)  resident_runs=%.2fGB  "
+            "spill_limit=%.2fGB  dir=%s\n",
+            total_runs, spilled_runs, spilled_bytes / 1073741824.0,
+            resident_runs_end / 1073741824.0,
+            sm_spill_limit == (size_t)-1 ? -1.0 : sm_spill_limit / 1073741824.0,
+            spilled_runs ? sm_spill_dir_get() : "-");
         for (int i = 0; i < P; i++) {
             fprintf(stderr,
                 "  [inst]     w%-2d  %6.0fms / %6.0fms / %6.0fms / %2d / %zuK\n",
@@ -3652,7 +3946,9 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         free(WS[i].runs);      /* NULL if already freed above */
         free(WS[i].run_lens);  /* NULL if already freed above */
         sm_ext_close(WS[i].run_fd, WS[i].run_map, WS[i].run_capacity);
+        if (WS[i].spill_fd >= 0) close(WS[i].spill_fd);
     }
+    sm_spill_limit = (size_t)-1;
     free(W); free(WS); free(T);
 }
 
@@ -3666,11 +3962,19 @@ typedef struct {
     u128   total, cycles;
 } SMRunState;
 
-/* Snapshot of the state at the start of a step (before introduce).  Kept
-   for the latest step whose input fits in snap_bytes, until the first
-   wrap; any snapshot taken at or before the wrap step holds exact counts. */
+/* CRT snapshots.  A snapshot is the state of the run just before step s's
+   sweep (after introduce and after v joined the frontier).  It holds exact
+   counts if no count has wrapped before step s.  Two kinds:
+     anchor   taken at the first step s* at which a wrap becomes possible
+              (U_s = 2^n_back * sum of counts >= 2^64, see sm_run_steps);
+              kept in RAM if it fits sm_crt_snap_bytes, otherwise written
+              once to a file in the spill directory;
+     rolling  after s*, the input of every step that fits min(1 GiB,
+              sm_crt_snap_bytes), until the first wrap; it replaces the
+              anchor (it is later and still exact).
+   A wrap at step w is replayed from the latest snapshot at step <= w.  */
 typedef struct {
-    int      valid, step, fs;
+    int      valid, step, fs, on_disk, fd;
     int      frontier[MAX_FS_FAST + 2];
     int     *fidx;
     SMEntry *data; size_t cnt, cap;
@@ -3685,7 +3989,7 @@ static int    sm_crt_from = -1;                 /* replay start, -1 = none */
 static u64    sm_crt_res[SM_CRT_MAX][2];        /* [i][0]=paths, [1]=cycles */
 
 /* Configure CRT replays for the next count_ham_paths_sm call: moduli are
-   primes < 2^62; snap_bytes bounds the snapshot kept for the replay.     */
+   primes < 2^62; snap_bytes = most RAM an anchor snapshot may take.      */
 void sm_set_crt(const uint64_t *moduli, int k, uint64_t snap_bytes) {
     if (k > SM_CRT_MAX) k = SM_CRT_MAX;
     if (k < 0) k = 0;
@@ -3697,15 +4001,57 @@ uint64_t sm_crt_residue(int i, int which) {
     return (i >= 0 && i < SM_CRT_MAX && (which == 0 || which == 1)) ? sm_crt_res[i][which] : 0;
 }
 
-static void sm_snap_take(SMSnap *sn, const SMRunState *R, int step, int n) {
+static void sm_snap_free(SMSnap *sn) {
+    if (!sn->on_disk) sm_snap_held -= sn->cap * sizeof(SMEntry) * (sn->data != NULL);
+    sm_free(sn->data); sn->data = NULL; sn->cap = 0;
+    if (sn->fd >= 0) close(sn->fd);
+    sn->fd = -1; sn->valid = 0; sn->on_disk = 0;
+}
+
+/* Parallel pwrite / pread of a table in P slices. */
+typedef struct { int fd; SMEntry *a; size_t lo, hi; int wr; u64 p; } SMIoJob;
+static void *sm_io_thread(void *arg) {
+    SMIoJob *j = (SMIoJob *)arg;
+    size_t bytes = (j->hi - j->lo) * sizeof(SMEntry);
+    off_t off = (off_t)(j->lo * sizeof(SMEntry));
+    if (j->wr) sm_pwrite_all(j->fd, j->a + j->lo, bytes, off);
+    else {
+        sm_pread_all(j->fd, j->a + j->lo, bytes, off);
+        if (j->p) for (size_t i = j->lo; i < j->hi; i++) j->a[i].val %= j->p;
+    }
+    return NULL;
+}
+static void sm_table_io(int fd, SMEntry *a, size_t cnt, int wr, u64 p) {
+    int P = sm_cfg.nthreads > 0 ? sm_cfg.nthreads : 1;
+    if (cnt < ((size_t)1 << 20)) P = 1;
+    SMIoJob *J = (SMIoJob *)malloc((size_t)P * sizeof(SMIoJob));
+    pthread_t *th = (pthread_t *)malloc((size_t)P * sizeof(pthread_t));
+    SM_ALLOC_CHECK(J, (size_t)P * sizeof(SMIoJob)); SM_ALLOC_CHECK(th, (size_t)P * sizeof(pthread_t));
+    size_t ch = (cnt + (size_t)P - 1) / (size_t)P;
+    for (int t = 0; t < P; t++) {
+        size_t lo = (size_t)t * ch, hi = lo + ch < cnt ? lo + ch : cnt;
+        if (lo > hi) lo = hi;
+        J[t] = (SMIoJob){ fd, a, lo, hi, wr, p };
+        pthread_create(&th[t], NULL, sm_io_thread, &J[t]);
+    }
+    for (int t = 0; t < P; t++) pthread_join(th[t], NULL);
+    free(J); free(th);
+}
+
+static void sm_snap_take(SMSnap *sn, const SMRunState *R, int step, int n, int to_disk) {
     size_t c = R->curr->cnt;
-    if (sn->cap < c) {
-        sm_free(sn->data);
+    sm_snap_free(sn);
+    if (to_disk) {
+        sn->fd = sm_spill_open();
+        sm_table_io(sn->fd, R->curr->data, c, 1, 0);
+        sn->on_disk = 1;
+    } else {
         sn->data = (SMEntry *)sm_alloc((c ? c : 1) * sizeof(SMEntry));
         SM_ALLOC_CHECK(sn->data, (c ? c : 1) * sizeof(SMEntry));
         sn->cap = c ? c : 1;
+        memcpy(sn->data, R->curr->data, c * sizeof(SMEntry));
+        sm_snap_held += sn->cap * sizeof(SMEntry);
     }
-    memcpy(sn->data, R->curr->data, c * sizeof(SMEntry));
     sn->cnt = c;
     if (!sn->fidx) { sn->fidx = (int *)malloc((size_t)(n + 1) * sizeof(int)); SM_ALLOC_CHECK(sn->fidx, (size_t)(n + 1) * sizeof(int)); }
     memcpy(sn->fidx, R->fidx, (size_t)(n + 1) * sizeof(int));
@@ -3719,10 +4065,12 @@ static void sm_snap_restore(const SMSnap *sn, SMRunState *R, int n, u64 p) {
     smtab_free(R->curr); smtab_free(R->nxt);
     R->curr = smtab_alloc(sn->cnt ? sn->cnt : 1);
     R->nxt  = smtab_alloc(1024);
-    for (size_t i = 0; i < sn->cnt; i++) {
-        R->curr->data[i].key = sn->data[i].key;
-        R->curr->data[i].val = sn->data[i].val % p;
-    }
+    if (sn->on_disk) sm_table_io(sn->fd, R->curr->data, sn->cnt, 0, p);
+    else
+        for (size_t i = 0; i < sn->cnt; i++) {
+            R->curr->data[i].key = sn->data[i].key;
+            R->curr->data[i].val = sn->data[i].val % p;
+        }
     R->curr->cnt = sn->cnt;
     memcpy(R->fidx, sn->fidx, (size_t)(n + 1) * sizeof(int));
     memcpy(R->frontier, sn->frontier, sizeof R->frontier);
@@ -3735,15 +4083,17 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
                         const int *order, const int *pos, const int *last_s,
                         const int *adj_off, const int *adj_dat,
                         int verbose, uint64_t ram_bytes, int instrument,
-                        int want_cycles, SMSnap *snap, const char *tag) {
+                        int want_cycles, SMSnap *snap, const char *tag,
+                        int resume) {
+    /* snap: snap[0] = anchor, snap[1] = rolling (NULL: no snapshots).
+       resume: s0's introduce and frontier update were already done (the
+       state was restored from a snapshot taken just before the sweep).  */
     double t_start = now_ms(), t_prev = t_start;
     for (int step = s0; step < n; step++) {
         sm_cur_step = step;
-        if (snap && sm_wrap_step < 0 && sm_crt_k > 0 &&
-            R->curr->cnt * sizeof(SMEntry) <= sm_crt_snap_bytes)
-            sm_snap_take(snap, R, step, n);
         int v = order[step];
         if (R->fs > MAX_FS_FAST) return -1;
+        int skip_intro = (resume && step == s0);
 
         /* A. Introduce: transform curr->data in-place.
            introduce(key, fs) ORs enc_v(0)<<(4*fs) into each key — it only
@@ -3754,14 +4104,15 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
              New (in-place): curr(si) only — nxt allocated later in sweep
            At n=75 step 57 (13.3B states = 303GB) this saves 303GB.      */
         double t_intro0 = now_ms();
-        sm_introduce(R->curr, R->fs);
+        u128 sum_in = 0;
+        if (!skip_intro) sum_in = sm_introduce(R->curr, R->fs);
         double t_intro_ms = now_ms() - t_intro0;
         if (instrument)
             fprintf(stderr, "  [inst] introduce: si=%zuM  %.0fms\n",
                     R->curr->cnt / 1000000, t_intro_ms);
         /* curr->data now holds the introduced keys; pass directly to sweep.
            No swap needed — curr IS the introduced table.                  */
-        R->frontier[R->fs] = v; R->fidx[v] = R->fs; R->fs++;
+        if (!skip_intro) { R->frontier[R->fs] = v; R->fidx[v] = R->fs; R->fs++; }
 
         /* nxt is still empty (data=NULL from previous step's free or initial
            state).  sm_fused_sweep will allocate it via smtab_ensure.      */
@@ -3785,6 +4136,36 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
         /* resolve ram_bytes: use provided value or conservative 8 GB default */
         size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
 
+        /* CRT snapshots.  Every count after this step is a sum of
+           contributions, each the count of one input state, and each input
+           contributes to at most 2^n_back outputs; hence every count is
+           <= U = 2^n_back * sum_in.  If U < 2^64 (2^sm_wbits in tests) this
+           step cannot wrap.  sum_in is exact while nothing has wrapped.  */
+        if (snap && !skip_intro && sm_wrap_step < 0 && sm_crt_k > 0) {
+            int wb = sm_wbits;
+            int risky = (sum_in >> (wb > n_back ? wb - n_back : 0)) != 0;
+            size_t bytes = R->curr->cnt * sizeof(SMEntry);
+            size_t roll = sm_crt_snap_bytes < ((size_t)1 << 30) ? sm_crt_snap_bytes
+                                                                : ((size_t)1 << 30);
+            const char *what = "none";
+            if (!snap[0].valid && !snap[1].valid && risky) {
+                int disk = bytes > sm_crt_snap_bytes;
+                sm_snap_take(&snap[0], R, step, n, disk);
+                what = disk ? "anchor(disk)" : "anchor(ram)";
+            } else if ((snap[0].valid || snap[1].valid) && bytes <= roll) {
+                sm_snap_take(&snap[1], R, step, n, 0);
+                if (snap[0].valid) sm_snap_free(&snap[0]);
+                what = "rolling";
+            }
+            if (instrument) {
+                int l2 = -1;                       /* floor(log2 U), -1 if U = 0 */
+                for (u128 t = sum_in; t; t >>= 1) l2++;
+                if (l2 >= 0) l2 += n_back;
+                fprintf(stderr, "  [inst]   crt: log2U=%d snapshot=%s held=%.2fGB\n",
+                        l2, what, sm_snap_held / 1073741824.0);
+            }
+        }
+
         u128 *cyc_ptr = (want_cycles && step == n - 1) ? &R->cycles : NULL;
         sm_fused_sweep(R->curr, R->nxt, R->fs, v_idx, widxs, n_back,
                        elim_desc, n_elim, step, n, &R->total, ram, instrument,
@@ -3792,7 +4173,7 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
         /* Free curr->data (the in-place-introduced table workers just read).
            The ext path already frees it inside sm_fused_sweep (sets to NULL);
            the RAM path does not, so this handles both: free(NULL) is a no-op. */
-        sm_free(R->curr->data); R->curr->data = NULL; R->curr->cap = 0; R->curr->cnt = 0;
+        sm_free_big(R->curr->data, R->curr->cap * sizeof(SMEntry)); R->curr->data = NULL; R->curr->cap = 0; R->curr->cnt = 0;
         { SMTab *t = R->curr; R->curr = R->nxt; R->nxt = t; }
 
         /* Optional per-step checksum (HAM_SM_CKSUM=1): order-independent
@@ -3883,11 +4264,12 @@ void count_ham_paths_sm(
             "step  vertex  fs  n_back  e_bag  states_in  states_out"
             "  step_ms  cumul_ms  bag  [sm]\n");
 
-    SMSnap snap = {0};
+    SMSnap snaps[2] = {{0}, {0}};
+    snaps[0].fd = snaps[1].fd = -1;
     int use_snap = (sm_mod == 0 && sm_crt_k > 0);
     int rc = sm_run_steps(R, 0, n, order, pos, last_s, adj_off, adj_dat,
                           verbose, ram_bytes, instrument, cyc_lo != NULL,
-                          use_snap ? &snap : NULL, "");
+                          use_snap ? snaps : NULL, "", 0);
     if (rc < 0) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
 
     *res_lo = (uint64_t) R->total;
@@ -3897,19 +4279,21 @@ void count_ham_paths_sm(
         *cyc_hi = (uint64_t)(R->cycles >> 64);
     }
 
-    if (use_snap && sm_val_overflow && snap.valid && snap.step <= sm_wrap_step) {
+    SMSnap *sp = snaps[1].valid ? &snaps[1] : &snaps[0];
+    if (use_snap && sm_val_overflow && sp->valid && sp->step <= sm_wrap_step) {
+        SMSnap snap_ = *sp; SMSnap *snapp = &snap_;   /* read-only view */
         int wrap = sm_wrap_step;
-        sm_crt_from = snap.step;
+        sm_crt_from = snapp->step;
         for (int i = 0; i < sm_crt_k; i++) {
             u64 p = sm_crt_mod[i];
             if (verbose)
                 fprintf(stderr, "# CRT replay mod %llu from step %d (first wrap at step %d, "
-                        "snapshot %zu states)\n", (unsigned long long)p, snap.step, wrap, snap.cnt);
-            sm_snap_restore(&snap, R, n, p);
+                        "snapshot %zu states)\n", (unsigned long long)p, snapp->step, wrap, snapp->cnt);
+            sm_snap_restore(snapp, R, n, p);
             sm_mod = p;
             char tag[48]; snprintf(tag, sizeof tag, "[crt %d]", i);
-            sm_run_steps(R, snap.step, n, order, pos, last_s, adj_off, adj_dat,
-                         verbose, ram_bytes, instrument, cyc_lo != NULL, NULL, tag);
+            sm_run_steps(R, snapp->step, n, order, pos, last_s, adj_off, adj_dat,
+                         verbose, ram_bytes, instrument, cyc_lo != NULL, NULL, tag, 1);
             sm_mod = 0;
             sm_crt_res[i][0] = (u64)(R->total % p);
             sm_crt_res[i][1] = (u64)(R->cycles % p);
@@ -3919,7 +4303,7 @@ void count_ham_paths_sm(
     }
 
 cleanup:
-    sm_free(snap.data); free(snap.fidx);
+    for (int i = 0; i < 2; i++) { sm_snap_free(&snaps[i]); free(snaps[i].fidx); }
     smtab_free(R->curr); smtab_free(R->nxt);
     free(R->fidx);
 }
