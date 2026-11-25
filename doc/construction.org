@@ -1,0 +1,252 @@
+* From the Mersenne Forum
+
+R. Gerbicz
+
+Returning to the original square-sum problem,
+a non trivial result: the sequence is infinite, for n=(71*25^k-1)/2 there is a solution for every k>=0 integer.
+
+For given "a" sequence that is a solution for n.
+let us define T(c)=25*a[1]+c,25*a[2]-c,25*a[3]+c,25*a[4]-c,...,25*a[n]+(-1)^(n+1)*c
+and R(a)=a[n],a[n-1],..,a[2],a[1] the reversing of a[].
+
+Then obviously if abs(c)<=12 then in T(c) and in R(T(c)) we see different integers,
+and if we consider all these sequences for c=-12...,12 then it will give the
+permutation of [13,25*n+12]. Moreover in these sequences the sum of adjacent terms
+is square, because we see (25*a(k)+-c)+(25*a(k+1)-+c)=25*(a(k)+a(k+1)), and here
+a(k)+a(k+1) was square.
+What is left to use the integers from [1,12] to glue these 25 sequences so that
+we see squaresums at the sequence endpoints (and in the constructed new pairs).
+And this is possible:
+
+if n is odd, a(1)=1 and a(n)=3, then
+b=1,T(-1),T(1),R(T(-7)),T(6),T(-6),R(T(0)),11,R(T(-5)),5,4,12,T(-12),T(12),\
+R(T(7)),T(-8),R(T(2)),T(-3),9,7,T(4),T(-4),10,6,T(5),R(T(-11)),2,T(-2),8,T(3),\
+R(T(-9)),R(T(9)),T(-10),T(10),T(11),R(T(8)),3
+
+is a good sequence, and this is a Hamiltonian cycle, constructed in such a
+way, that b(1)=1 and b(n)=3.
+So we can use induction for the new sequence.
+
+We need only to find a good sequence, an example for n=35:
+v=[1,8,28,21,4,32,17,19,6,30,34,15,10,26,23,13,12,24,25,11,5,20,29,35,14,2,7,18,31,33,16,9,27,22,3];
+
+This gives a solution for n=25*35+12=887, what gives a solution for n=25*887+12=22187 etc.
+An explicit formula for the length z(n)=(71*25^n-1)/2.
+
+trivial code to get b from a.
+Code:
+
+F(a,b,c,ty)={local(n,i,v);if(ty==0,v=[c],n=length(b);v=25*b+c*vector(n,i,(-1)^(i+1));
+if(ty==-1,v=Vecrev(v)));return(concat(a,v))}
+
+fun_odd(a)={local(r,w,n);
+n=length(a);
+if(n%2==0,print("Not implemented even n.");return());
+if(a[1]!=1||a[n]!=3,print("Invalid input.");return());
+w=a;r=[];
+r=F(r,w,1,0);
+r=F(r,w,-1,1);
+r=F(r,w,1,1);
+r=F(r,w,-7,-1);
+r=F(r,w,6,1);
+r=F(r,w,-6,1);
+r=F(r,w,0,-1);
+r=F(r,w,11,0);
+r=F(r,w,-5,-1);
+r=F(r,w,5,0);
+r=F(r,w,4,0);
+r=F(r,w,12,0);
+r=F(r,w,-12,1);
+r=F(r,w,12,1);
+r=F(r,w,7,-1);
+r=F(r,w,-8,1);
+r=F(r,w,2,-1);
+r=F(r,w,-3,1);
+r=F(r,w,9,0);
+r=F(r,w,7,0);
+r=F(r,w,4,1);
+r=F(r,w,-4,1);
+r=F(r,w,10,0);
+r=F(r,w,6,0);
+r=F(r,w,5,1);
+r=F(r,w,-11,-1);
+r=F(r,w,2,0);
+r=F(r,w,-2,1);
+r=F(r,w,8,0);
+r=F(r,w,3,1);
+r=F(r,w,-9,-1);
+r=F(r,w,9,-1);
+r=F(r,w,-10,1);
+r=F(r,w,10,1);
+r=F(r,w,11,1);
+r=F(r,w,8,-1);
+r=F(r,w,3,0);
+return(r)}
+
+v=[1,8,28,21,4,32,17,19,6,30,34,15,10,26,23,13,12,24,25,11,5,20,29,35,14,2,7,18,31,33,16,9,27,22,3];
+fun_odd(v)
+
+You can easily find a similar rule for even n value.
+It could be possible to extend this idea to prove that every n>=25 is in the sequence,
+I haven't reached this, for example a nice blocking subproblem was this:
+for n>1 there is no such sequence where a(i)-i is even for all i.
+Last edited by R. Gerbicz; 2018-01-17, 21:19. Reason: typo
+
+henryzz
+henryzz
+Just call me Henry
+
+    Join Date: Sep 2007
+    Posts: 6381
+
+#20
+2018-01-17, 22:06
+If I understand correctly you gave an example based upon a known solution for n=35. This led to solutions for n=(71*25^k-1)/2.
+Given a solution for n=37 you would be able to generate solutions for (75*25^k-1)/2 in the same way.
+
+It also looks like 25 should be replaceable with any odd square. I am not quite certain why 9 wouldn't qualify for this. I need to give this more thought. I suppose 25 relies on there being a solution that connects the 25 sequences together. This wouldn't happen for 9. Is this guaranteed to work for any odd square >=25?
+
+R. Gerbicz
+R. Gerbicz
+
+    Join Date: Oct 2005
+    Posts: 1717
+
+#21
+2018-01-17, 22:26
+Originally posted by henryzz View Post
+If I understand correctly you gave an example based upon a known solution for n=35. This led to solutions for n=(71*25^k-1)/2.
+Given a solution for n=37 you would be able to generate solutions for (75*25^k-1)/2 in the same way.
+Correct, but the goal was to prove that n>=25 is in the sequence. Since it wasn't reached I've posted the above weaker result.
+
+Originally posted by henryzz View Post
+It also looks like 25 should be replaceable with any odd square. I am not quite certain why 9 wouldn't qualify for this. I need to give this more thought. I suppose 25 relies on there being a solution that connects the 25 sequences together. This wouldn't happen for 9. Is this guaranteed to work for any odd square >=25?
+Yes, you need odd square, otherwise c=k^2/2 gives the same residue as -c.
+
+Using only odd squares and the above construction is not enough, since
+sum(k>1,1/k^2)<1, so the density is smaller than 1, not every integer will be covered.
+
+The main following idea (from me) was to use two sequences a0 and a1, one for length of n,
+and one for length (n+1), with this you could build a solution for length=e^2*n+res for
+all res=[(e^2-1)/2,(3*e^2-1)/2) if you can give the base cases for all [N..e^2*N)
+then with induction there is a solution for all n>=N. The main problem is that to use induction
+you need the same parity of the position of k in a0() and in a1(), and it is hard
+to maintain this in the induction.
+Maybe one could reach say 25<=n<=81*2^20 *easily* using e=9, but in the induction it will
+be collapsing.
+
+R. Gerbicz
+R. Gerbicz
+
+    Join Date: Oct 2005
+    Posts: 1717
+
+#22
+2018-01-21, 17:09
+There is a solution for every n>=25 !
+Giving a Hamiltonian cycle for all n>=32, see my linked code:
+https://drive.google.com/file/d/1XpY...h-HdPA708/view
+somewhat large file ( 5.7 MB ), but the actual code is pretty short,
+using a constant memory, and fast algorithm in O(n*log(n)) time.
+[it could be faster but using O(n) memory]
+n=10000000 is solved in roughly 5 seconds
+
+examples:
+Code:
+
+gerbicz@gerbicz:~/gmp-6.1.2$ gcc -o squares squares.c -lm
+gerbicz@gerbicz:~/gmp-6.1.2$ ./squares -n 10000 -out "seq.txt"
+Computed the sequence for n=10000 in 0 sec.
+gerbicz@gerbicz:~/gmp-6.1.2$ ./squares -n 100 -screen
+1 80 64 36 85 84 16 48 73 71 50 94 75 69 100 96 4 5 76 24 97 72 49 95 74 47 17 19 45 99 22 59 62 82 39 25 11 70 51 30 91 53 28 93 7 57 43 78 66 34 87 13 68 32 89 55 9 27 54 90 31 18 46 98 2 14 86 35 65 79 42 58 63 81 40 41 23 26 38 83 61 60 21 15 10 6 3 33 67 77 92 52 29 20 44 37 12 88 56 8 
+Computed the sequence for n=100 in 0 sec.
+gerbicz@gerbicz:~/gmp-6.1.2$
+
+note: for n<=2032 we are actually using a precomputed table, for larger n values
+we are using a recursion.
+
+
+The above ideas were quite good, call seq0 and seq1 a nice pair of sequence iff
+length(seq0)=n and length(seq1)=n+1 and for all k<=n it is true that
+if k=seq0[p]=seq1[q] then p-q is even (in other word p+q is even), so we see the same
+terms in the same position's parity.
+
+Using such a pair of sequence I'm giving a nice pair of sequence for every
+49*n+res, where res=24..72, this a complete residue system for mod=49, and
+with a larger precomputed table I'll give a solution for every n=41..2032.
+This completes the proof for n>=41, for smaller n values using another
+lookup table.
+
+The construction is similar to the above strategy, just using two(!) sequences,
+one with length=n and one with length=n+1, lets define
+
+T(c,0)=49*seq0[1]+c,49*seq0[2]-c,..,49*seq0[n]+(-1)^(n+1)*c
+T(c,1)=49*seq1[1]+c,49*seq1[2]-c,..,49*seq1[n+1]+(-1)^(n+2)*c
+
+so T(c,1) is longer by one. For each c=-24..24 use exactly one of them
+or its reversed sequence, use the remaining [1,24] integers to glue/attach
+them at the sequence endpoints, so we are seeing only square pairsums.
+It was a somewhat harder problem as above, because we needed
+two glues: one for N=49*n+res and one for N=49*n+res+1 so that the resulted
+pair of sequence is still nice, to make sure the induction will work.
+Observe that it is determined what we should choose T(c,0) or T(c,1) for each c
+(so here you have no real choice), because these contain the same integers, and we
+know the extra term in T(c,1), why(?), because if in seq1 the (n+1) is in
+position k, then k==n+1 mod 2.
+
+Suprisingly my code found these glues in roughly 1 second, and
+the basic sequences in 1 hour (could be maybe somewhat faster) using one thread.
+In code data[][][] contains the glues, the very large S[][]
+the basic sequences for small n values.
+
+Note that in all sequences a[1]=1 and for even n: a[n]=8, for odd n: a[n]=3,
+and we maintain this property also, so it'll be a Hamiltonian cycle.
+
+Furthermore, the code checks (in several ways) that the output sequence
+is good, for example checking that sum(i=1,n,a[i]^3)=(n*(n+1)/2)^2 mod 2^64 is true,
+and the square tests are done for all consecutive pair sums.
+
+If we'd need just Hamiltonian path then we can use 25*n+res in the recursion:
+use a[1]=1 and for even n: a[n]=2, for odd n: a[n]=3. (this results smaller tables).
+And for 9*n+res there is absolutely nothing in our plate.
+Last edited by R. Gerbicz; 2018-01-21, 17:21. Reason: typos
+
+LaurV
+LaurV
+Romulan Interpreter
+
+    Join Date: Jun 2011
+    Posts: 10539
+
+#23
+2018-01-22, 03:16
+Originally posted by R. Gerbicz View Post
+There is a solution for every n>=25 !
+Very nice! Man, you are good!
+
+henryzz
+henryzz
+Just call me Henry
+
+    Join Date: Sep 2007
+    Posts: 6381
+
+#24
+2018-01-22, 09:20
+Very nice. Maybe someone should let numberphile know.
+Also I believe papers have been published on less worthwhile subjects.
+
+MattcAnderson
+MattcAnderson
+
+    Join Date: Dec 2010
+    Posts: 1657
+
+#25
+2018-01-23, 01:50
+I posted to the numberphile youtube page that this problem has been solved.
+
+Regards,
+Matt
+* From Claude
+

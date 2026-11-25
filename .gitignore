@@ -2,3 +2,7 @@
 /hamiltonian/__pycache__/
 /hamiltonian/claude/machine.yaml
 *.yaml
+doc/Claude
+doc/ChatGpt
+*.pdf
+*.zip

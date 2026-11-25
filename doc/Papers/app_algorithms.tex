@@ -1,0 +1,292 @@
+\section{Algorithms}\label{app:algorithms}
+
+This appendix specifies every computation used in the paper, in enough detail to be
+reimplemented independently. Two kinds of computation occur.
+\begin{itemize}
+\item \emph{Exact} computations (\cref{alg:frontier,alg:lift,alg:glue,alg:moves,alg:certificate,alg:seeds,alg:bregman,alg:edges})
+use integer arithmetic only. Their outputs either are certificates that can be checked
+independently (\cref{app:data-cert,app:data-glue}) or support statements labelled
+``computer-verified''.
+\item \emph{Numerical} computations (\cref{alg:sinkhorn-cont,alg:bethe,alg:predictor}) use
+double-precision floating point. They support only the numerical evidence for the
+conjectures, never a theorem. We report convergence residuals with each result.
+\end{itemize}
+Throughout, $\mathrm{Adj}_n(v)=\{k^2-v:\ \lfloor\sqrt v\rfloor<k\le\lfloor\sqrt{v+n}\rfloor\}\setminus\{v\}$ is the
+neighbourhood of $v$ in $G(n)$, and $\operatorname{issq}(m)$ tests whether $m$ is a perfect square
+using an integer square root. In particular,
+\begin{equation}\label{eq:deg}
+\deg_{G(n)}(v)=\lfloor\sqrt{v+n}\rfloor-\lfloor\sqrt v\rfloor-[\,2v\text{ is a square}\,].
+\end{equation}
+
+\subsection{Exact counting of Hamiltonian paths}
+The values of $\Ham(n)$ in \cref{tab:counts} were computed in two stages.
+
+\emph{Graphillion stage.} For $n\le56$ we first used the library Graphillion \cite{graphillion},
+which represents sets of subgraphs as zero-suppressed decision diagrams \cite{Minato1993} and
+builds them by frontier-based search in the spirit of Knuth's \textsc{Simpath}
+\cite[\S7.1.4]{KnuthTAOCP4A}. On the advice of S.~Minato, the vertex order was an optimal
+\emph{vertex-separation} ordering, whose width equals the pathwidth \cite{Kinnersley}. It was
+computed exactly by encoding Coudert's integer-programming formulation \cite{Coudert} as a weighted
+MaxSAT instance. This approach exhausted the available storage at about $n=56$.
+
+\emph{Dynamic programming stage.} We then switched to a dynamic program over the same ordering.
+It is a Held--Karp-type recursion \cite{Bellman,HeldKarp} restricted to a path decomposition, so
+that a state describes only the frontier rather than an arbitrary subset of vertices. This is the
+approach of Pettersson \cite{Pettersson}, which we found only afterwards. The frontier after
+step~$t$ is the set of processed vertices that still have an unprocessed neighbour. Its size is at
+most the width $w$ of the ordering; for example $w=11$ for $n=57$ and $w=13$ for $n=59$.
+
+\emph{States.} A state is a tuple $(\sigma_f)_{f\in F}$ together with a counter $c\in\{0,1\}$.
+\begin{itemize}
+\item $\sigma_f=0$ if $f$ has no chosen edges yet.
+\item $\sigma_f=-1$ if $f$ has degree $2$, i.e.\ is interior to a chain.
+\item $\sigma_f=L>0$ if $f$ is an endpoint of the partial path segment (``chain'') labelled $L$.
+\item $c$ records whether a chain has been \emph{closed}, meaning both of its endpoints have
+left the frontier.
+\end{itemize}
+Labels are canonicalised by renumbering them in order of first appearance, so there are at most
+$\mathrm{Bell}(w)$ connectivity patterns per frontier. The counter $c$ is essential for
+correctness. Without it, two half-external chains (each with one endpoint already gone) that are
+joined by an edge leave no trace in $\sigma$, and the resulting phantom states are counted as
+Hamiltonian paths. For $n=15$ the naive version returns $11$ instead of $1$.
+
+\begin{algorithm}[h]
+\caption{Frontier dynamic program for $\Ham(n)$ along a pathwidth ordering}\label{alg:frontier}
+\begin{algorithmic}[1]
+\Require $n$; an ordering $v_1,\dots,v_n$ of $[n]$ of small width (exact vertex separation, then refined)
+\State $\mathcal T\gets\{(\emptyset,c{=}0)\mapsto1\}$ \Comment{state $\to$ number of partial edge sets}
+\For{$t=1,\dots,n$}
+  \State $N_t\gets$ neighbours of $v_t$ among the processed vertices (all of them are in the frontier)
+  \State $\mathcal T'\gets\emptyset$
+  \For{each $(\sigma,c)\mapsto\#$ in $\mathcal T$}
+    \For{each $X\subseteq\{u\in N_t:\sigma_u\ne-1\}$ with $|X|\le2$} \Comment{edges from $v_t$ to the past}
+      \If{$X=\{u,u'\}$ with $u,u'$ the two endpoints of one chain} \textbf{continue} \Comment{cycle}\EndIf
+      \State $\sigma'\gets\sigma$ updated by adding the edges $\{v_t,u\}$, $u\in X$: a vertex with
+      \State \hspace{1.2em} status $0$ becomes an endpoint of a new or extended chain, an endpoint becomes
+      \State \hspace{1.2em} interior ($-1$), chains joined through $v_t$ are merged, and $v_t$ gets status $0$, $L$ or $-1$
+      \State $\mathcal T'[(\sigma',c)]\mathrel{+}=\#$
+    \EndFor
+  \EndFor
+  \For{each $f$ with no unprocessed neighbour left} \Comment{fused elimination}
+    \State in every state: discard if $\sigma_f=0$; delete $f$ if $\sigma_f=-1$;
+    \State \hspace{1.2em} if $\sigma_f=L$, then $f$ becomes a path end: delete $f$, and if the other end of chain $L$
+    \State \hspace{1.2em} has already left, set $c\gets c+1$; discard if $c>1$, or if $c=1$ while
+    \State \hspace{1.2em} $t<n$ or other chains remain
+  \EndFor
+  \State canonicalise labels, merge equal states; $\mathcal T\gets\mathcal T'$
+\EndFor
+\State \Return $\mathcal T[(\emptyset,c{=}1)]$ \Comment{each undirected Hamiltonian path counted once}
+\end{algorithmic}
+\end{algorithm}
+
+\emph{Ordering and engineering.} Among orderings of optimal width, the running time still
+varies considerably. We therefore refined the exact vertex-separation ordering by simulated
+annealing on a cost function that predicts the size of the state tables from the frontier
+profile. The implementation is in C. States are packed into $64$-bit keys with $128$-bit counts,
+and the edge sweep for $v_t$ (all subsets $X$ at once) is fused with the eliminations that
+follow it. At each step the main cost is merging a stream of $(\text{key},\text{count})$ pairs,
+in which many source states map to the same key, into the next table. This is done as follows.
+\begin{itemize}
+\item The next table is an extendible hash table \cite{Fagin}, so it grows in proportion to the
+actual output.
+\item New pairs are first collected in a radix-sort buffer indexed by a hash prefix, and are
+inserted bucket by bucket, so that each bucket is brought into cache once per flush rather than
+once per insertion.
+\item Buffer and bucket sizes are chosen from the cache sizes of the machine.
+\item Freed slabs are returned to the operating system explicitly.
+\end{itemize}
+With these measures, $n=61$ (width $14$; peak $6.2\cdot10^8$ states in one step) runs in
+$97$ minutes in under $2$\,GB of memory on a laptop (Apple M3 Pro). The largest cases, up to $n=75$, were run on a machine with $768$\,GB of memory and $64$ cores,
+with a parallel sort--merge version of the same step. Each source state and each subset of
+back-edges contributes independently, and only the summation of counts with equal keys couples
+them. So $P$ workers process disjoint contiguous slices of the current table. Each worker writes
+its contributions into a private bounded buffer, which it sorts by a hash of the key and
+deduplicates into sorted runs, kept in memory or spilled to SSD. The runs are then merged with
+deduplication by $P$ threads, each owning a disjoint interval of hash space chosen from sampled
+splitters. Because each table is stored in hash order, a contiguous slice is in effect a random
+sample of states, so static slices balance the very uneven per-state work: the slowest worker
+was within $20\%$ of the mean on the dominant steps. The run for $n=75$ is the only one that
+reaches frontier width $15$ and the only one whose total exceeds $2^{64}$, and it has not been
+repeated. Details of the implementation will appear separately \cite{MillerEngineering}.
+
+\subsection{The lifting step and the glue}
+
+\begin{algorithm}[h]
+\caption{Lift (\cref{lem:segments,prop:lift})}\label{alg:lift}
+\begin{algorithmic}[1]
+\Require odd $t$, $T=t^2$, $h=(T-1)/2$; a Hamiltonian path $b=(b_1,\dots,b_n)$ of $G(n)$, $n$ odd, from $1$ to $3$;
+a glue arrangement $\Gamma$ (a list of glue vertices and segment pairs $[x\ y]$)
+\For{$c=-h,\dots,h$}
+  \State $T_c\gets(Tb_p+(-1)^{p+1}c)_{p=1}^n$ \Comment{from $T+c$ to $3T+c$}
+\EndFor
+\State $P'\gets(\,)$; $\mathrm{offset}\gets\{\}$
+\For{each item of $\Gamma$ in order}
+  \If{the item is a glue vertex $g$} append $g$ to $P'$
+  \Else{ (a pair $[x\ y]$)} let $c$ be the index with $\{x,y\}=\{T+c,3T+c\}$;
+    \State \hspace{1.2em} record $\mathrm{offset}[c]\gets(|P'|,\ \text{reversed}:=[x=3T+c])$;
+    \State \hspace{1.2em} append $T_c$, reversed if $x=3T+c$, to $P'$
+  \EndIf
+\EndFor
+\State \Return $P'$ (a Hamiltonian path of $G(Tn+h)$ from $1$ to $3$) and $\mathrm{offset}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{Glue search for $(t,u,w,\text{parity of }n)$}\label{alg:glue}
+\begin{algorithmic}[1]
+\State $h\gets(t^2-1)/2$; for $c\in[-h,h]$ let the forced pair be $\{t^2u+c,\ t^2w+\varepsilon c\}$, with $\varepsilon=+1$ for $n$ odd and $-1$ for $n$ even
+\State $V\gets\{1,\dots,h\}\cup\{\text{all endpoints}\}$; join $x\ne y$ in $V$ if $x+y$ is a square (forced pairs excluded)
+\Procedure{Extend}{$\pi$} \Comment{$\pi$ a path in $V$ starting at $u$}
+  \If{$|\pi|=|V|$} \Return $[\text{last}(\pi)=w]$ \EndIf
+  \State $x\gets\text{last}(\pi)$
+  \If{$x$ is an endpoint and its partner $x^*$ is unused}
+     \State \Return \Call{Extend}{$\pi\cdot x^*$} \Comment{traverse the segment}
+  \EndIf
+  \For{each unused neighbour $y$ of $x$, with $y\ne w$ unless $|\pi|=|V|-1$}
+     \If{\Call{Extend}{$\pi\cdot y$}} \Return true \EndIf
+  \EndFor
+  \State \Return false
+\EndProcedure
+\State \Call{Extend}{$(u)$} \Comment{exhaustive: complete search; randomised: shuffled neighbours, step budget, restarts}
+\end{algorithmic}
+\end{algorithm}
+
+For $t=3$ the search is exhaustive and terminates without success in all $24$ cases. For
+$t=5,7$ the randomised variant (step budget $2\cdot10^5$--$3\cdot10^5$, up to $60$ restarts)
+found the arrangements of \cref{app:data-glue}. Each was then checked directly: every
+junction sum is a square, and every segment occurs exactly once.
+
+\subsection{Moves and certificates}
+
+\begin{algorithm}[h]
+\caption{Parity-preserving moves of a path $P=(v_1,\dots,v_N)$}\label{alg:moves}
+\begin{algorithmic}[1]
+\Function{Alternative}{$i,j$} \Comment{a parity-preserving re-ordering of window $[i,j]$, or none}
+  \State $W\gets\{v_i,\dots,v_j\}$; $\mathrm{par}(v_p)\gets p\bmod 2$
+  \State depth-first search for sequences $w_i,\dots,w_j$ of distinct elements of $W$ with
+  \State \hspace{1.2em} $w_i\sim v_{i-1}$, $w_{p+1}\sim w_p$, $\mathrm{par}(w_p)=p\bmod 2$, $w_j\sim v_{j+1}$, and $(w_p)\ne(v_p)$
+  \State \Return the first sequence found, or \textsc{none}
+\EndFunction
+\State $\mathcal W\gets\emptyset$
+\For{$i=2,\dots,N-1$}
+  \For{$j=i,\dots,\min(N-1,i+L-1)$} \Comment{$L$: maximum window length}
+    \If{\Call{Alternative}{$i,j$}$\ne$\textsc{none}} add $[i,j]$ to $\mathcal W$; \textbf{break} \EndIf
+  \EndFor
+\EndFor
+\State sort $\mathcal W$ by right endpoint; $\mathcal F\gets\emptyset$; $\ell\gets-\infty$
+\For{$[i,j]\in\mathcal W$}
+  \If{$i\ge\ell+2$} add $[i,j]$ to $\mathcal F$; $\ell\gets j$ \EndIf
+\EndFor
+\State \Return $\mathcal F$ \Comment{a maximum separated family among windows of length $\le L$}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lemma}
+\Cref{alg:moves} returns a separated family of maximum size among all families of windows of
+length at most $L$ that admit moves.
+\end{lemma}
+\begin{proof}
+Any window $[i,j']$ admitting a move contains the shortest such window $[i,j]$, $j\le j'$, which
+starts at the same position. Replacing windows by these shorter ones preserves separation, so
+it suffices to consider the shortest window at each start. Two windows are compatible if and only
+if the closed intervals $[i,j+1]$ are disjoint, so this is interval scheduling, and the greedy
+choice by right endpoint is optimal.
+\end{proof}
+
+\begin{algorithm}[h]
+\caption{Verification of \cref{thm:main} for given seeds}\label{alg:certificate}
+\begin{algorithmic}[1]
+\Require a seed path $P$ of $G(n_0)$ from $1$ to $3$, $n_0$ odd; moves $(i_r,\omega_r)_{r\le k}$; the glue $\Gamma$ of \cref{tab:glue}; a number of levels $m$
+\State check: $P$ is a permutation of $[n_0]$, consecutive sums are squares, $P_1=1$, $P_{n_0}=3$
+\State check each move: $\omega_r$ re-orders the window, keeps parities, and all sums including those at the anchors are squares; check separation
+\For{level $=1,\dots,m$}
+  \State $(P',\mathrm{offset})\gets$ \Call{Lift}{$P,\Gamma$} (\cref{alg:lift}); check $P'$ as in line 1, with $n=25n_0+12$
+  \For{each move $(i,\omega)$ of $P$, window $[i,j]$, and each $c\in[-12,12]$}
+     \State $\omega^c_q\gets25\,\omega_q+(-1)^{i+q+1}c$ for $q=0,\dots,j-i$ \Comment{entry at position $i+q$ of $T_c$}
+     \State $(o,\rho)\gets\mathrm{offset}[c]$ \Comment{$o$ = number of entries of $P'$ before the block}
+     \State new move on window $[o+i,\,o+j]$ with content $\omega^c$ if $\rho$ is false,
+     \State \hspace{1.2em} else on window $[o+n+1-j,\ o+n+1-i]$ with content $\omega^c$ reversed
+  \EndFor
+  \State check every new move as in line 2; check separation
+  \State $P\gets P'$; $n\gets25n+12$; the moves $\gets$ the new moves
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:certificate} performs only integer operations. We ran it with $m=2$ for the three
+seeds of \cref{app:data-cert}. The results are in \cref{tab:liftcheck}.
+
+\begin{algorithm}[h]
+\caption{Seed search}\label{alg:seeds}
+\begin{algorithmic}[1]
+\Require odd $n$; a mode, exhaustive or random; a sample count $s$; a maximum window length $L$
+\If{exhaustive}
+  \State enumerate all Hamiltonian paths of $G(n)$ from $1$ to $3$ by depth-first search
+\Else
+  \State draw $s$ paths by randomised depth-first search: at each step try the unused neighbours in order
+  \State \hspace{1.2em} of increasing number of unused neighbours (Warnsdorff's rule), ties broken at random,
+  \State \hspace{1.2em} with a step budget of $2\cdot10^5$ and restarts
+\EndIf
+\State \Return $\max$ over the paths of $|\mathcal F|$ from \cref{alg:moves}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Numerical procedures}
+
+\begin{algorithm}[h]
+\caption{The constant $C$}\label{alg:sinkhorn-cont}
+\begin{algorithmic}[1]
+\Require grid size $M$, iteration count $I$
+\State $x_a\gets(a-\frac12)/M$ for $a=1,\dots,M$; $K_{ab}\gets1/(2\sqrt{x_a+x_b})$; $\alpha\gets\mathbf1$
+\For{$I$ iterations} $\alpha_a\gets\bigl(\alpha_a\big/\tfrac1M\sum_bK_{ab}\alpha_b\bigr)^{1/2}$ \EndFor
+\State \Return $C\approx-\frac2M\sum_a\log\alpha_a$ and the residual $\max_a\bigl|\alpha_a\tfrac1M\sum_bK_{ab}\alpha_b-1\bigr|$
+\end{algorithmic}
+\end{algorithm}
+We used $I=5000$ and $M\in\{400,1600,3200\}$. The midpoint rule handles the integrable corner
+singularity adequately; the three values agree to $10^{-5}$.
+
+\begin{algorithm}[h]
+\caption{Sinkhorn scaling of $A_{G(n)}$, Bethe value, ansatz error}\label{alg:bethe}
+\begin{algorithmic}[1]
+\State build $A=A_{G(n)}$ in sparse form from $\mathrm{Adj}_n$; $x\gets\mathbf1$
+\For{$3000$ iterations} $x\gets(x/Ax)^{1/2}$ \Comment{entrywise}\EndFor
+\State $S\gets\operatorname{diag}(x)A\operatorname{diag}(x)$; check $\max_i|\sum_jS_{ij}-1|$ (below $2\cdot10^{-15}$ in all reported runs)
+\State $F\gets\sum_{(i,j):A_{ij}=1}\bigl[-S_{ij}\log S_{ij}+(1-S_{ij})\log(1-S_{ij})\bigr]$ \Comment{\cref{cor:bethe}: $\log\operatorname{per}A\ge F$}
+\State ansatz: $\widetilde p_{ij}=a(i/n)a(j/n)/\sqrt n$ with $a$ from \cref{alg:sinkhorn-cont}, linearly interpolated; report $\max_i$ and r.m.s.\ of $|\sum_j\widetilde p_{ij}-1|$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{Finite Bregman bound}\label{alg:bregman}
+\begin{algorithmic}[1]
+\State $d_i\gets$ \eqref{eq:deg} for $i=1,\dots,n$
+\State \Return $\log\mathrm{UB}(n)=\sum_i\frac{\log((d_i+1)!)}{d_i+1}+\frac{\log n!}{n}-\log2$ \Comment{$\Ham(n)\le\mathrm{UB}(n)$, \cref{prop:bregman}}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{Edge count}\label{alg:edges}
+\begin{algorithmic}[1]
+\State \Return $e(G(n))=\sum_{k=2}^{\lfloor\sqrt{2n-1}\rfloor}\max\Bigl(0,\ \bigl\lfloor\tfrac{k^2-1}2\bigr\rfloor-\max(1,k^2-n)+1\Bigr)$
+\end{algorithmic}
+\end{algorithm}
+The induced subgraph on the multiples of $4$ is isomorphic to $G(\lfloor n/4\rfloor)$ (\cref{prop:mod4}),
+so its edge count is $e(G(\lfloor n/4\rfloor))$.
+
+\begin{algorithm}[h]
+\caption{Scaling predictor and residuals}\label{alg:predictor}
+\begin{algorithmic}[1]
+\For{each $n$ with $\Ham(n)>0$}
+  \State $r_C\gets\log\Ham(n)-\bigl[\log(n!/2)-\frac{n-1}2\log n+Cn\bigr]$
+  \If{$n\ge31$}
+    \State dense Sinkhorn: $d\gets\mathbf1$; repeat $4\cdot10^4$ times $d\gets(d/Ad)^{1/2}$; $S\gets\operatorname{diag}(d)A\operatorname{diag}(d)$
+    \State $\log\widehat\Ham(n)\gets\log\frac n2+\log n!-n\log n-2\sum_j\log d_j+2\log\bigl(\frac1n\sum_jd_j\bigr)$; $r_S\gets\log\Ham(n)-\log\widehat\Ham(n)$
+    \State loop corrections, reported but not used: with $\lambda$ the eigenvalues of $S$ other than $1$,
+    \State \hspace{1.2em} $-\sum_{\ell=1}^{n-1}(1-\ell/n)\bigl(\sum_\lambda\lambda^\ell\bigr)$ and $\sum_\lambda\log(1-\lambda)$
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+For $n\le30$ the iteration does not converge: some entries of $S$ tend to $0$ and the scaling
+vector diverges, because $A_{G(n)}$ lacks total support. For $31\le n\le75$ the row sums of $S$
+equal $1$ to within $5\cdot10^{-16}$.

@@ -1,0 +1,623 @@
+\documentclass[11pt]{amsart}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,booktabs,tikz,graphicx}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usetikzlibrary{positioning}
+\usepackage[pdfusetitle]{hyperref}
+\pdfstringdefDisableCommands{\def\\{ }\def\times{x}}
+\usepackage[capitalize]{cleveref}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{conjecture}[theorem]{Conjecture}
+\newtheorem{problem}[theorem]{Problem}
+\crefname{problem}{Problem}{Problems}
+\crefname{algorithm}{Algorithm}{Algorithms}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{heuristic}[theorem]{Heuristic}
+
+\newcommand{\Ham}{\mathrm{H}}
+\newcommand{\Zhat}{\widehat{\mathbb{Z}}}
+\newcommand{\KL}{\mathrm{KL}}
+
+\title[Hamiltonian paths in square-sum graphs]{Hamiltonian paths in square-sum graphs:\\
+an exponential lower bound, a limit object,\\ and a conjectural asymptotic}
+\author{Victor S. Miller}
+\date{Extended version with algorithms and data. Draft, \today}
+
+\begin{document}
+
+\begin{abstract}
+Let $G(n)$ be the graph on $\{1,\dots,n\}$ in which $i\sim j$ iff $i+j$ is a perfect
+square, and let $\Ham(n)$ be the number of its (undirected) Hamiltonian paths.
+Gerbicz showed that $\Ham(n)>0$ for all $n\ge 25$. We isolate a class of local
+\emph{parity-preserving moves} which are multiplied by $25$ under Gerbicz's
+$\times 25$ lifting step, whereas path counts are not, and deduce the exponential bound
+$\Ham(N)\ge 2^{(4N+2)/91}$ along the sequence $N=(91\cdot 25^m-1)/2$,
+from a computer-verified seed in $G(45)$. We explain why $25$ is the smallest
+square factor for which the lifting scheme closes, and discuss what is needed to
+reach all large $N$. We then turn to limits. The rescaled graphs do not converge in cut
+norm to the obvious kernel $1/(2\sqrt{x+y})$: the arithmetic of squares
+survives in the limit, which naturally lives on $[0,1]\times\Zhat$ as a singular
+measure. A first-moment computation in this limit predicts
+$\log \Ham(n) = \log n! - \tfrac n2\log n + Cn + o(n)$ with
+$C=-0.632538\ldots$ given by a Schr\"odinger (entropic transport) problem. This is
+consistent with exact counts for $15\le n\le 74$ to within $O(1)$, and lies
+just below the rigorous Bregman upper bound, whose constant is $B=-0.614954\ldots$.
+The results of \cref{sec:lift,sec:moves} are theorems
+(with computer-verified certificates); those of \cref{sec:limits,sec:heuristic,sec:superexp}
+are partly heuristic, and we mark clearly which statements are proved. This extended version
+is self-contained: \cref{app:algorithms} gives pseudocode for every computation, and \cref{app:data}
+lists the data and certificates.
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+
+For $n\ge1$ let $G(n)$ have vertex set $[n]=\{1,\dots,n\}$, with $\{i,j\}$ an edge iff
+$i+j$ is a perfect square. Hamiltonian paths of $G(n)$ are the \emph{square chains}
+of recreational mathematics. They exist exactly for $n\in\{15,16,17,23\}$ and all $n\ge25$
+(OEIS \cite{OEIS-A090461}). The existence for all $n\ge 25$, and of Hamiltonian cycles
+for all $n\ge32$, is due to Gerbicz \cite{Gerbicz}, by a combination of
+construction and computation; see also \cite[Appendix]{BerlekampGuy}.
+The number $\Ham(n)$ of undirected Hamiltonian paths is OEIS A071983
+\cite{OEIS-A071983}. Exact values are known for $n\le 75$; they were computed by a frontier dynamic program along an exact pathwidth ordering
+(\cref{alg:frontier}; cf.\ \cite{Pettersson}) and are listed in \cref{tab:counts} (\cref{app:data}).
+
+Since $G(n)$ is an induced subgraph of $G(n+1)$, the graphs form a nested
+sequence with direct limit $G(\infty)$ on $\mathbb{N}$. Every vertex $i\le n$ has
+$\sqrt{n+i}-\sqrt{i}+O(1)=\Theta(\sqrt n)$ neighbours, so $G(n)$ has edge density
+$\asymp n^{-1/2}$. This is the ``intermediate'' regime, too sparse for graphons and too
+dense for local (Benjamini--Schramm) limits.
+
+\subsection*{Results}
+\begin{enumerate}
+\item (\cref{thm:main}) $\Ham(N_m)\ge 2^{2\cdot 25^m}$ for $N_m=(91\cdot25^m-1)/2$,
+i.e.\ $\Ham(N)\ge 2^{(4N+2)/91}$ along this sequence. The proof combines Gerbicz's
+lifting step with a notion of \emph{parity-preserving move} (\cref{def:move}),
+which is the invariant that survives lifting with full multiplicity.
+\item (\cref{prop:t3}) Within the lifting scheme, the factor $9$ is impossible
+and $25$ is the smallest square that works. There is also a heuristic reason
+(\cref{rem:threshold}).
+\item (\cref{prop:mod4}) The rescaled graphs $\sqrt n\,G(n)$ do not converge in cut norm to
+$\kappa(x,y)=1/(2\sqrt{x+y})$. We propose a limit on $[0,1]\times\Zhat$
+(\cref{conj:limit}).
+\item (\cref{conj:asymp}) $\log\Ham(n)=\log n!-\frac n2\log n+Cn+o(n)$ with
+$C\approx-0.632538$. The prediction is compared with data in \cref{tab:resid}. Rigorously,
+$\log\Ham(n)\le\frac n2\log n+(B-1)n+o(n)$ with
+$B=\frac{\sqrt2}2-\frac32\log(1+\sqrt2)\approx-0.61495$, and $C<B$ (\cref{prop:bregman}).
+\item (\cref{sec:deterministic}) The count of cycle covers transfers to $G(n)$
+deterministically: by Gurvits's Bethe bound, any doubly stochastic matrix supported on
+$E(G(n))$ gives a lower bound for $\log\operatorname{per}A_{G(n)}$, and the Sinkhorn scaling
+of $A_{G(n)}$ reproduces $C-1$ numerically up to $n=64000$. \Cref{app:limits} explains graph
+limits, permutons and the Schr\"odinger problem in detail.
+\item (\cref{sec:superexp}) If \cref{conj:asymp} is true, $\Ham(n)$ is superexponential.
+We outline the permanent-plus-rotation method of
+\cite{Krivelevich,GlebovKrivelevich} as a possible route to bounds of that order.
+\end{enumerate}
+
+\section{Gerbicz's lifting step}\label{sec:lift}
+
+Throughout, $t$ is odd, $T=t^2$, and $h=(T-1)/2$. The basic observation is that
+$T(a+b)=(tk)^2$ whenever $a+b=k^2$. We give a self-contained account of the
+$\times25$ step that underlies \cite{Gerbicz}. (The glue arrangement in
+\cref{tab:glue} was found independently by computer search and may differ from
+Gerbicz's.)
+
+\begin{lemma}[Lifted segments]\label{lem:segments}
+Let $b=(b_1,\dots,b_n)$ be a Hamiltonian path of $G(n)$. For $c\in[-h,h]$ put
+\[
+  T_c(b)=\bigl(T b_p+(-1)^{p+1}c\bigr)_{p=1}^n .
+\]
+Then each $T_c(b)$ is a path in $G(Tn+h)$. The vertex sets of the $2h+1$ paths
+$T_c(b)$ partition $[h+1,\,Tn+h]$.
+\end{lemma}
+
+\begin{proof}
+Consecutive terms have opposite signs on $c$, so their sum is
+$T(b_p+b_{p+1})$, which is a square. Each integer in $[h+1,Tn+h]$ is uniquely of the
+form $Tb+c$ with $1\le b\le n$ and $|c|\le h$. For $c\ne0$, the number $Tb+c$ lies in
+$T_c(b)$ if $b$ sits at an odd position of $b$, and in $T_{-c}(b)$ if it sits at an even
+position, and in no other $T_{c'}(b)$. The numbers $Tb$ all lie in $T_0(b)$.
+\end{proof}
+
+\begin{remark}\label{rem:pairs}
+\Cref{lem:segments} remains true if $T_c$ and $T_{-c}$ are built from two different
+base paths $b,b'$, provided $b$ and $b'$ have the same set of vertices at even
+positions. Only the $h+1$ classes $\{0\},\{\pm1\},\dots,\{\pm h\}$ can choose
+their base paths independently. Counting paths therefore gives only
+$\log\Ham(Tn+h)\gtrsim (h+1)\log\Ham'(n)$, where $\Ham'$ counts base paths with the
+required endpoints. This yields $\log\Ham(N)\gtrsim N^{\alpha}$ with
+$\alpha=\log((T+1)/2)/\log T<1$ (for $t=5$, $\alpha=\log13/\log25\approx0.797$).
+\Cref{sec:moves} removes this loss.
+\end{remark}
+
+\subsection{Gluing}
+Suppose now that $n$ is odd and $b$ runs from $b_1=1$ to $b_n=3$. Then $T_c(b)$ runs from
+$T+c$ to $3T+c$. These endpoints are independent of $n$. A \emph{glue
+arrangement} is a Hamiltonian path from $1$ to $3$ in the auxiliary graph on
+$\{1,\dots,h\}\cup\{T+c,3T+c:|c|\le h\}$ (edges: square sums) which traverses each
+pair $(T+c,3T+c)$ consecutively. Replacing each such pair by $T_c(b)$, or by its reverse,
+gives:
+
+\begin{proposition}\label{prop:lift}
+If a glue arrangement exists for $t$, then for every odd $n$ and every Hamiltonian
+path of $G(n)$ from $1$ to $3$, there is a Hamiltonian path of $G(Tn+h)$ from $1$ to $3$
+that contains each $T_c(b)$ as a contiguous block. Moreover $Tn+h$ is odd if $h$ is even.
+\end{proposition}
+
+For $t=5$ we found the glue arrangement of \cref{tab:glue}. Iterating from a seed $n_0$
+gives Hamiltonian paths from $1$ to $3$ in $G(N_m)$ with
+$N_{m+1}=25N_m+12$, i.e.\ $N_m=(n_0+\frac12)25^m-\frac12$. With
+$n_0=35$ this is Gerbicz's sequence $(71\cdot25^m-1)/2$ \cite{OEIS-A090461}.
+
+\begin{table}[h]
+\small
+\[
+\begin{array}{l}
+1\ [15\ 65]\ [35\ 85]\ [36\ 86]\ [14\ 64]\ [80\ 30]\ [70\ 20]\ 5\ 11\ [25\ 75]\ 6\ [19\ 69]\ 12\ [24\ 74]\ 7\\
+{}[29\ 79]\ 2\ [34\ 84]\ [37\ 87]\ [82\ 32]\ 4\ [21\ 71]\ 10\ [26\ 76]\ [68\ 18]\ [31\ 81]\ [63\ 13]\ [23\ 73]\ 8\\
+{}[28\ 78]\ [66\ 16]\ 9\ [72\ 22]\ [27\ 77]\ [67\ 17]\ [83\ 33]\ 3
+\end{array}
+\]
+\caption{A glue arrangement for $t=5$. A bracket $[x\ y]$ denotes the segment
+$T_c$ with endpoints $\{x,y\}=\{25+c,75+c\}$, traversed from $x$ to $y$ (so
+$[80\ 30]$ is $T_5$ reversed). Unbracketed entries are glue vertices. Each of the
+$36$ junctions, i.e.\ each pair of consecutive entries not inside one bracket, sums to a square:
+$1+15=16$, $65+35=100$, $85+36=121$, \dots, $33+3=36$.}
+\label{tab:glue}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\resizebox{\linewidth}{!}{\input{../figs/gluing.tex}}
+\caption{The start of the glued path in $G(1137)$, lifted from the seed
+$b=(1,35,29,20,\dots,33,3)$ in $G(45)$. Inside a segment, consecutive sums are
+$25\times$ the corresponding sums in $b$. The junction between $T_{-10}$ and $T_{10}$ is
+the ordinary square $65+35=100$.}
+\label{fig:gluing}
+\end{figure}
+
+\subsection{Why $25$?}
+The multiplier must be a square $m=t^2$: $mk^2$ must be a square for all $k$. The
+alternating offsets $\pm c$ then use one representative of each residue class mod $T$.
+For even $t$ the class of $T/2$ is self-paired, and covering each $T(k+\frac12)$
+exactly once would force all vertices of $b$ to occupy positions of the same parity,
+which is impossible. So $t$ is odd. For the step to iterate, the output endpoints
+must again be glue numbers. So the base path runs between some $u,w\le h$, and
+the glue problem is a fixed finite problem for each $(t,u,w)$ and each parity of $n$.
+
+\begin{proposition}[computer-verified]\label{prop:t3}
+For $t=3$ there is no glue arrangement for any $u\ne w$ in $\{1,2,3,4\}$ and either
+parity of $n$ (exhaustive search, 24 cases). For $t=5$ arrangements exist for
+$(u,w)=(1,3)$ and $(1,2)$ with both parities. For $t=7$ one was found for $(1,2)$
+with $n$ even.
+\end{proposition}
+
+\begin{remark}\label{rem:threshold}
+Heuristically, the endpoints of the lifted segments lie in windows of width $\approx T$
+around $Tu$ and $Tw$. Most junctions join two such windows, with sums near $T(u+w)$, where
+consecutive squares are $\approx 2t\sqrt{u+w}$ apart. Enough square-sum pairs are
+available only if $T\gtrsim 2t\sqrt{u+w}$, i.e.\ $t>2\sqrt{u+w}$. With $(u,w)=(1,3)$ this
+is $t>4$, and for $t=3$ it already fails at $u+w=3$. \Cref{prop:t3} concerns only this
+scheme (glue set $\{1,\dots,h\}$, base endpoints $\le h$). Other schemes with
+multiplier $9$ are not excluded.
+\end{remark}
+
+\section{Moves that survive lifting}\label{sec:moves}
+
+\begin{definition}\label{def:move}
+Let $P=(v_1,\dots,v_N)$ be a Hamiltonian path. A \emph{move} of $P$ is a window
+$[i,j]$ with $2\le i\le j\le N-1$, together with an ordering
+$(w_i,\dots,w_j)\ne(v_i,\dots,v_j)$ of $\{v_i,\dots,v_j\}$ such that
+$v_{i-1},w_i,\dots,w_j,v_{j+1}$ is a path, and such that each vertex keeps the
+parity of its position: if $w_p=v_q$ then $p\equiv q\pmod 2$. A family of moves is
+\emph{separated} if the windows are pairwise disjoint and any two are at
+distance at least $2$ (some position lies strictly between them).
+\end{definition}
+
+Odd-length segment reversals with the two chords present are moves. So are
+transpositions of two adjacent blocks of even length. A pair of P\'osa rotations
+\cite{Posa} at the same end that restores the endpoint is a fixed-endpoint rerouting;
+it is a move if it preserves parities.
+
+\begin{lemma}\label{lem:2k}
+If $P$ has $k$ separated moves then $G$ has at least $2^k$ Hamiltonian paths with the
+same endpoints as $P$.
+\end{lemma}
+\begin{proof}
+Separation means the anchors $v_{i-1},v_{j+1}$ of one move are not inside another
+window. So any subset $S$ of the moves can be applied simultaneously, giving a
+Hamiltonian path $P_S$. Different subsets give different sequences, since the content
+of each window records whether its move was applied. All $P_S$ start at $v_1$ and end at
+$v_N$, so they are also distinct as undirected paths.
+\end{proof}
+
+\begin{lemma}[Lifting moves]\label{lem:liftmoves}
+In the situation of \cref{prop:lift}, every move of $b$ induces a move of the lifted path
+$P'$ inside each of the $2h+1$ blocks $T_c(b)$. If the moves of $b$ are separated,
+so are the resulting $(2h+1)k$ moves of $P'$.
+\end{lemma}
+\begin{proof}
+Let $(w_i,\dots,w_j)$ reorder $(b_i,\dots,b_j)$ with parities preserved. In $T_c(b)$,
+replace $Tb_p+(-1)^{p+1}c$ ($i\le p\le j$) by $Tw_p+(-1)^{p+1}c$. Since $w_p$
+and the vertex it replaces have positions of the same parity, the new entries form
+the same set. Consecutive sums, including the two at the anchors, are
+$T\cdot(\text{square})$. In $P'$ the block $T_c(b)$ occupies consecutive positions,
+traversed forwards or backwards. Since $n$ is odd, reversal $p\mapsto n+1-p$
+preserves parity. Hence positions within the block are shifted by a constant
+(possibly after reversal), parities are uniformly preserved or uniformly flipped,
+and the induced reordering preserves parities in $P'$. The windows are interior to
+$b$, so the block endpoints and the glue are untouched. Separation is preserved
+within a block. Windows in different blocks are separated because each window is
+interior to its block, so the block endpoints lie between them.
+\end{proof}
+
+The point is that a parity-preserving move does not change the even-position set,
+so $T_c$ and $T_{-c}$ may apply it independently. This removes the pairing loss of
+\cref{rem:pairs}.
+
+\begin{theorem}\label{thm:main}
+Let $n_0$ be odd and suppose $G(n_0)$ has a Hamiltonian path from $1$ to $3$ with $k$
+separated moves. Let $N_m=(n_0+\frac12)25^m-\frac12$. Then $G(N_m)$ has a
+Hamiltonian path from $1$ to $3$ with $k\,25^m$ separated moves, and
+\[
+\Ham(N_m)\ \ge\ 2^{k\,25^m}\ =\ 2^{k(2N_m+1)/(2n_0+1)} .
+\]
+\end{theorem}
+\begin{proof}
+Induction on $m$ using \cref{prop:lift} with \cref{tab:glue}, and
+\cref{lem:liftmoves}; then \cref{lem:2k}.
+\end{proof}
+
+\begin{corollary}[computer-verified seeds]\label{cor:seeds}
+\begin{enumerate}
+\item $n_0=45$, $k=2$:\quad $\Ham(N)\ge 2^{(4N+2)/91}$ for $N=(91\cdot25^m-1)/2$
+$=45,1137,28437,\dots$
+\item $n_0=35$, $k=1$:\quad $\Ham(N)\ge 2^{(2N+1)/71}$ for $N=(71\cdot25^m-1)/2$
+$=35,887,22187,\dots$ (Gerbicz's sequence).
+\item $n_0=43$, $k=1$:\quad $\Ham(N)\ge 2^{(2N+1)/87}$ for $N=(87\cdot25^m-1)/2$.
+\end{enumerate}
+\end{corollary}
+
+The seed for (1) is
+\[
+\begin{aligned}
+&1\ 35\ 29\ 20\ 44\ 37\ 27\ 22\ 14\ 11\ 5\ 31\ 18\ 7\ 42\ 39\ 25\ 24\ 12\ 13\ 36\ 28\ 8\ 17\ 32\ 4\ 45\ 19\ 30\\
+&6\ 10\ 26\ 38\ 43\ 21\ 15\ 34\ 2\ 23\ 41\ 40\ 9\ 16\ 33\ 3,
+\end{aligned}
+\]
+with the two moves
+\[
+\begin{aligned}
+&1\,35\,|\,29\,20\,44\,37\,27\,22\,|\,14\,11\,5\,31\,18\,7\,|\,42\\
+&\quad\longmapsto\ 1\,35\,|\,14\,11\,5\,31\,18\,7\,|\,29\,20\,44\,37\,27\,22\,|\,42,\\[2pt]
+&28\,|\,8\,17\,32\,4\,45\,19\,30\,6\,10\,26\,38\,43\,21\,15\,34\,2\,23\,|\,41\\
+&\quad\longmapsto\ 28\,|\,21\,43\,38\,26\,23\,2\,34\,15\,10\,6\,30\,19\,45\,4\,32\,17\,8\,|\,41 .
+\end{aligned}
+\]
+(The first is a transposition of two blocks of length $6$, with chords
+$35+14=49$, $7+29=36$, $22+42=64$. The second reverses the block of length $17$ between $28$ and $41$ and then
+exchanges the two blocks $23\,2\,34\,15$ and $21\,43\,38\,26$ inside it; the new
+adjacencies are $28+21=49$, $26+23=49$, $15+10=25$ and $8+41=49$.) \Cref{alg:certificate} checks the seeds and builds the lifts
+explicitly for $m=1,2$ ($N=1137$ and $28437$), verifying the $50$ and $1250$
+separated moves. Exhaustive search over all Hamiltonian paths from $1$ to $3$ gives
+$k\le1$ for all odd $n_0\le 41$ (with equality for $n_0=35,39,41$). Random sampling
+(windows of length $\le24$) gives $k=2$ at $n_0=45,55,63,65,69$, and $n_0=45$ has the largest ratio
+$k/(n_0+\frac12)$ found so far.
+
+\begin{remark}
+A seed with $k\ge1$ is not actually needed. Any level at which the glue or the
+``cross'' edges (sums that are not $25\times$ a square) create one new move
+gives the same conclusion, because every later level multiplies it by $25$.
+\end{remark}
+
+\subsection{All large $N$}
+\Cref{thm:main} gives exponential growth only along sparse sequences. Gerbicz's
+general construction \cite{Gerbicz} reaches every $N\ge25$ using further offsets and
+residues. Write $k(N)$ for the largest number of separated moves in a Hamiltonian path of
+$G(N)$ with the endpoints that construction requires.
+
+\begin{proposition}[conditional]\label{prop:allN}
+Suppose that for all large $N$ there are $n$ and $t$ (from a finite set of odd
+$t\ge5$) with $N\le t^2 n+O(t^2)$, and a Hamiltonian path of $G(N)$ containing, as
+contiguous blocks, $t^2$ lifted segments $T_c(b^{(c)})$ whose base paths $b^{(c)}$
+are Hamiltonian paths of $G(n_c)$ with $n_c\in\{n-1,n,n+1\}$ and the required endpoints.
+Then $\liminf k(N)/N>0$, and $\Ham(N)\ge 2^{\delta N}$ for some $\delta>0$ and all
+large $N$, provided the finitely many base cases in a range $[n_*,t^2n_*]$ have
+$k(n)\ge\delta_0 n$.
+\end{proposition}
+\begin{proof}[Sketch]
+By \cref{lem:liftmoves}, $k(N)\ge t^2\min_c k(n_c)$. With $\rho(N)=k(N)/N$ this gives
+$\rho(N)\ge\rho(n')(1-O(t^2/N))$ for some $n'\approx N/t^2$. Along any descending
+chain the $N$'s grow geometrically, so $\prod(1-O(t^2/N_j))$ converges to a
+positive limit.
+\end{proof}
+We have not checked that Gerbicz's general step has this ``every class is a lift''
+form. This is the main gap between \cref{thm:main} and an exponential bound for all $N$.
+
+\section{Limit objects}\label{sec:limits}
+
+\begin{proposition}\label{prop:edges}
+$e(G(n))=\frac23(\sqrt2-1)\,n^{3/2}+O(n)$.
+\end{proposition}
+\begin{proof}
+$e(G(n))=\sum_{k}\#\{i<j\le n:\ i+j=k^2\}$, and the summand is $k^2/2+O(1)$ for
+$k^2\le n$ and $n-k^2/2+O(1)$ for $n<k^2\le 2n$. Summing gives
+$\frac{n^{3/2}}6+(\sqrt2-1)n^{3/2}-\frac{2\sqrt2-1}6n^{3/2}+O(n)$.
+\end{proof}
+Equivalently, $e(G(n))\sim\frac{n^{2}}{2}\cdot n^{-1/2}\iint_{[0,1]^2}\kappa$, with
+\[
+\kappa(x,y)=\frac{1}{2\sqrt{x+y}},
+\]
+the local density of squares near $n(x+y)$. Note $\kappa\in L^p([0,1]^2)$ exactly for $p<4$.
+The natural candidate limit, in the sense of the $L^p$ graphons of
+Borgs--Chayes--Cohn--Zhao \cite{BCCZ1,BCCZ2}, is therefore $\kappa$ with
+normalisation $\rho_n=n^{-1/2}$. It is the wrong one:
+
+\begin{proposition}\label{prop:mod4}
+Let $S_n=4\mathbb{Z}\cap[1,n]$. Then $e(G(n)[S_n])\sim\frac18 e(G(n))$, whereas
+$\kappa$ predicts $\frac1{16}e(G(n))$. Consequently, for the step graphon $W_n$ of
+$\sqrt n\,A_{G(n)}$ (natural labelling), $\|W_n-\kappa\|_\square\not\to0$.
+\end{proposition}
+\begin{proof}
+$a\mapsto 4a$ is an isomorphism $G(\lfloor n/4\rfloor)\to G(n)[S_n]$, because
+$4a+4b$ is a square iff $a+b$ is. By \cref{prop:edges},
+$e(G(n)[S_n])\sim\frac23(\sqrt2-1)(n/4)^{3/2}=\frac18e(G(n))$. Because $S_n$ is
+equidistributed in $[0,1]$ after scaling, $\kappa$ predicts the fraction
+$(1/4)^2=1/16$. The sets $S_n/n$ give a cut-norm discrepancy bounded below.
+\end{proof}
+(\Cref{alg:edges} gives the ratio $2.0000$ at $n=10^8$; see \cref{app:numerics}.)
+
+\begin{remark}[failure of upper regularity; heuristic]
+Partition $[n]$ by residues modulo $Q$. The averaged density on block $(r,s)$ is
+asymptotically $\varrho_Q(r+s)$ times the $\kappa$-prediction, where
+$\varrho_Q(a)=\#\{x\bmod Q:x^2\equiv a\}$. For odd primes $\ell\mid Q$, half the
+residues have $\varrho_\ell=2$, so the $L^p$ norm of the block-averaged graphon is about
+$\prod_{\ell\mid Q}\bigl(2^{p-1}+O(1/\ell)\bigr)$, which is unbounded as $Q$ runs
+through primorials. So the sequence is not $L^p$ upper regular in the sense of
+\cite{BCCZ1} for any $p>1$, and that theory does not apply directly.
+\end{remark}
+
+\subsection{A profinite limit}
+Map vertex $i$ of $G(n)$ to $(i/n,\,i)\in\Omega=[0,1]\times\Zhat$, with measure
+$\lambda\otimes\mu_{\Zhat}$ (Lebesgue times Haar). Let $\sigma$ be the law of $k^2$
+for Haar-random $k\in\Zhat$, and let $\nu$ be the law of $(\alpha,\beta)$ with $\alpha$
+Haar and $\beta=s-\alpha$, $s\sim\sigma$ independent. Since squares form a Haar-null
+set, $\nu$ is singular with respect to $\mu_{\Zhat}^{\otimes2}$. Define the symmetric
+measure
+\[
+\Lambda=\kappa(x,y)\,dx\,dy\ \otimes\ \nu(d\alpha,d\beta)\qquad\text{on }\Omega^2 .
+\]
+By the equidistribution of squares in residue classes, for intervals $I,J$ and residue
+classes $A,B$ modulo $Q$,
+\[
+\frac{\#\{(i,j)\in E(G(n)):\ i/n\in I,\ j/n\in J,\ i\in A,\ j\in B\}}{n^{3/2}}
+\ \longrightarrow\ \Lambda\bigl((I\times A)\times(J\times B)\bigr).
+\]
+So $\Lambda$ captures all ``finite-level'' statistics. Measure-valued limits of
+this kind (s-graphons) are the subject of Kunszenti-Kov\'acs, Lov\'asz and Szegedy
+\cite{KLS}. The more general framework of action convergence and graphops is due to
+Backhausz and Szegedy \cite{BackhauszSzegedy}; it covers graphons, $L^p$ graphons and
+graphings, and is designed for intermediate densities.
+
+\begin{conjecture}\label{conj:limit}
+$n^{-1/2}A_{G(n)}$ action-converges, in the sense of \cite{BackhauszSzegedy}, to the
+graphop on $(\Omega,\lambda\otimes\mu_{\Zhat})$ with kernel measure $\Lambda$.
+\end{conjecture}
+
+The archimedean part is scale-covariant: $\kappa(sx,sy)=s^{-1/2}\kappa(x,y)$.
+This is reminiscent of graphex models for sparse graphs \cite{VeitchRoy,BCCH}, but
+$G(\infty)$ is not exchangeable.
+
+\section{A conjectural asymptotic for $\Ham(n)$}\label{sec:heuristic}
+
+\begin{heuristic}\label{heu:first}
+Consider the random graph $R(n)$ with independent edges of probability
+$p_{ij}=\kappa(i/n,j/n)/\sqrt n$. A Hamiltonian cycle is a cyclic permutation $\pi$,
+weighted by $\prod_i p_{i\pi(i)}$. To exponential order, restricting from all
+permutations to cyclic ones and from cycles to paths costs only polynomial factors.
+So
+\[
+\mathbb{E}\,\Ham(R(n))\ =\ \exp\Bigl(\log n!-\tfrac n2\log n+Cn+o(n)\Bigr),
+\qquad
+C=\lim_{n\to\infty}\tfrac1n\log\mathbb{E}_{\pi}\prod_{i=1}^n\kappa\bigl(\tfrac in,\tfrac{\pi(i)}n\bigr),
+\]
+with $\pi$ uniform in $S_n$, and by the large-deviation principle for permutons
+(\cite[Theorem~1]{KKRW}, restated from Trashorras),
+\[
+C=\sup_{\mu}\Bigl\{\int\log\kappa\,d\mu-\KL(\mu\,\|\,\lambda\otimes\lambda)\Bigr\},
+\]
+with the supremum over couplings $\mu$ of two uniform marginals (permutons).
+The unboundedness of $\log\kappa$ near $(0,0)$ is a technical point we ignore.
+\end{heuristic}
+
+This is a Schr\"odinger bridge, or entropic optimal transport, problem
+\cite{Leonard}. The maximiser is $d\mu=a(x)a(y)\kappa(x,y)\,dx\,dy$, where
+\[
+a(x)\int_0^1 a(y)\kappa(x,y)\,dy=1\quad(0\le x\le1),\qquad\text{and}\qquad C=-2\int_0^1\log a(x)\,dx .
+\]
+Symmetric Sinkhorn iteration \cite{Sinkhorn} with the midpoint rule on $M=400,1600,3200$
+nodes gives
+$C=-0.632547,\ -0.632539,\ -0.632538$.
+
+\begin{remark}[dictionary and references]\label{rem:eot}
+Let $Z=\iint\kappa$ and $R=Z^{-1}\kappa\,dx\,dy$. Then
+$C=\log Z-\min_{\mu\in\Pi(\lambda,\lambda)}\KL(\mu\,\|\,R)$. This is the static
+Schr\"odinger bridge with cost $c=-\log\kappa$, regularisation $\varepsilon=1$ and uniform
+marginals, in the notation of Nutz's notes \cite{Nutz}. The minimiser is
+$e^{\varphi(x)+\psi(y)}R$ with Schr\"odinger potentials $e^\varphi=e^\psi=\sqrt Z\,a$, and
+Sinkhorn's algorithm is alternating projection onto the two marginal constraints.
+\begin{itemize}
+\item Existence and uniqueness of the continuous scaling $a\,\kappa\,a$ (the ``DAD
+problem'' for kernels): \cite{BLN,Nussbaum}.
+\item Surveys: \cite{Idel} for matrix scaling, and \cite{Leonard,Nutz} for Schr\"odinger bridges.
+\item Numerics: \cite{PeyreCuturi}.
+\item The same variational formula as the limiting normalising constant of exponential
+families on permutations, $\sum_\pi\exp(\theta\sum_i f(i/n,\pi(i)/n))$, computed by
+iterative proportional fitting, with worked examples $f=|x-y|$ and $f=xy$:
+\cite{Mukherjee,MukherjeeTagami}.
+\item A fully worked example of the same entropy principle, for a two-body weight
+(the Mallows model): \cite{Starr}.
+\item Permanental means versus scaling means (cf.\ Lemma~L1 in \cref{sec:superexp}):
+\cite{BochiIommiPonce}.
+\end{itemize}
+Most of these results assume a kernel bounded above and below. Here
+$\kappa\ge1/(2\sqrt2)$, but $\kappa$ has an integrable singularity at $(0,0)$, so the
+Hilbert-metric contraction argument of \cite{Nussbaum} does not apply verbatim, and
+\cite{Mukherjee} needs a truncation of $\log\kappa$ near the corner.
+\end{remark}
+
+\begin{heuristic}[no arithmetic correction at exponential order]
+$G(n)$ is not $R(n)$: its edges carry the local factors $\varrho_{\ell^e}(i+j)$. At
+a prime power $q$, the local kernel $(r,s)\mapsto\varrho_q(r+s)$ on $\mathbb{Z}/q$ is
+translation invariant, so it has uniform marginals. Hence the local analogue of
+$C$, namely $\sup_\mu\{\int\log\varrho_q\,d\mu-\KL\}$, is attained at
+$\mu\propto\varrho_q$ and equals $\log\int\varrho_q=0$. We therefore expect the
+arithmetic (a ``singular series'') to affect $\log\Ham(n)$ only by $o(n)$.
+\end{heuristic}
+
+\begin{conjecture}\label{conj:asymp}
+$\log\Ham(n)=\log n!-\frac n2\log n+Cn+o(n)$, with $C=-0.632538\ldots$ as above.
+In particular $\Ham(n)=(\sqrt n/e)^{n}e^{Cn+o(n)}$.
+\end{conjecture}
+
+\begin{proposition}[rigorous upper bound]\label{prop:bregman}
+Let $f(x)=\sqrt{1+x}-\sqrt x$ and
+\[
+B=\int_0^1\log f(x)\,dx=\frac{\sqrt2}{2}-\frac32\log(1+\sqrt2)=-0.6149536\ldots
+\]
+Then $\log\Ham(n)\le\frac n2\log n+(B-1)n+o(n)$. Moreover $C<B$.
+\end{proposition}
+\begin{proof}
+Adjoin a vertex $0$ adjacent to all of $[n]$, and let $A'$ be the adjacency matrix of
+the resulting graph. A directed Hamiltonian path $v_1\cdots v_n$ of $G(n)$ gives the
+cycle cover $0\to v_1\to\cdots\to v_n\to0$ of the augmented graph. So
+$2\Ham(n)\le\operatorname{per}A'\le\prod_i (r_i!)^{1/r_i}$ by Bregman's theorem
+\cite{Bregman}, where $r_i=\deg_{G(n)}(i)+1$ for $i\ge1$ and $r_0=n$. Now
+$\deg(i)=\sqrt n\,f(i/n)+O(1)$ uniformly, with $f\ge\sqrt2-1$, and
+$\log (r!)^{1/r}=\log r-1+O(\log r/r)$. Summing gives the bound. For $B$, substitute
+$x=\sinh^2t$: then $f=e^{-t}$, and $B=-\int_0^{\log(1+\sqrt2)}t\sinh 2t\,dt$.
+
+For $C\le B$, disintegrate a coupling $\mu$ with first marginal $\lambda$ as
+$\mu(dx\,dy)=dx\,\mu_x(dy)$. Then $\KL(\mu\|\lambda^2)=\int\KL(\mu_x\|\lambda)\,dx$.
+By the Gibbs variational principle,
+$\int\log\kappa(x,\cdot)\,d\mu_x-\KL(\mu_x\|\lambda)\le\log\int_0^1\kappa(x,y)\,dy=\log f(x)$.
+Equality would force $\mu_x\propto\kappa(x,\cdot)$, which does not have a uniform second
+marginal, so the inequality is strict.
+\end{proof}
+Since $\log n!-\frac n2\log n=\frac n2\log n-n+O(\log n)$, \cref{conj:asymp}
+asserts that the true constant $C-1$ lies only $B-C\approx0.0175$ below the rigorous
+bound $B-1$. The finite-$n$ Bregman bound converges to its limit slowly (at $n=3000$
+the normalised value is still $\approx-0.49$), because the error terms are of order
+$\log d/d$ with $d\asymp\sqrt n$.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{rrrrrrrrrrrr}
+\toprule
+$n$ & 15 & 25 & 30 & 35 & 40 & 45 & 50 & 55 & 60 & 65 & 70\\
+$r(n)$ & $+1.24$ & $-0.57$ & $-2.68$ & $+0.89$ & $-1.81$ & $+0.10$ & $-1.18$ & $-0.87$ & $-1.81$ & $+0.34$ & $-1.82$\\
+\midrule
+$n$ & 71 & 72 & 73 & 74 & 75\\
+$r(n)$ & $-1.18$ & $-1.50$ & $-1.12$ & $-0.75$ & $+3.92$\\
+\bottomrule
+\end{tabular}
+\caption{Residuals $r(n)=\log\Ham(n)-\bigl[\log(n!/2)-\frac{n-1}2\log n+Cn\bigr]$
+(natural logarithms), computed from \cref{tab:counts}; all values are in \cref{tab:residfull}. For $15\le n\le74$ (all $n$
+with $\Ham(n)>0$), $r(n)\in[-2.68,1.24]$, while $\log\Ham(74)\approx42.2$. On
+$40\le n\le74$ the mean is $-0.70$ and the standard deviation $0.72$. A least-squares
+fit $r=a\log n+b$ gives $a\approx-1.0$, which is consistent with an extra $-\log n$
+term, but the range is short.}
+\label{tab:resid}
+\end{table}
+
+\begin{remark}
+The value at $n=75$ is anomalous: $\Ham(75)/\Ham(74)\approx300$, whereas the ratios
+$\Ham(n+1)/\Ham(n)$ for $70\le n\le73$ are between $2.0$ and $5.2$. The residual jumps by $4.7$.
+Since vertex $75$ has degree $4$ in $G(75)$ (neighbours $6,25,46,69$), we suggest
+rechecking $\Ham(75)$.
+\end{remark}
+
+\section{Towards superexponential lower bounds}\label{sec:superexp}
+
+If \cref{conj:asymp} holds, the bounds of \cref{sec:moves} are far from the truth.
+For random and pseudo-random graphs, the method of choice runs as follows.
+(i) Bound the number of $2$-factors (cycle covers) from below via the permanent, using
+the Egorychev--Falikman theorem \cite{Egorychev,Falikman} after Sinkhorn scaling; the
+matching upper bound is Bregman's \cite{Bregman}. (ii) Show that covers with many
+cycles contribute little. (iii) Merge the cycles into a Hamiltonian cycle by
+P\'osa rotation--extension \cite{Posa}. This gives $n!p^n(1+o(1))^n$ Hamiltonian cycles in
+$G(n,p)$ above the Hamiltonicity threshold \cite{GlebovKrivelevich} and in
+$(n,d,\lambda)$-graphs \cite{Krivelevich}. See \cite{CooperFrieze,CucklerKahn,FKS} for
+related counts.
+
+For $G(n)$, step (i) should give, rigorously, about $(\sqrt n/e)^n e^{Cn}$ cycle
+covers, provided the Sinkhorn scalings of $A_{G(n)}$ track the continuum solution $a(x)$.
+The arithmetic enters only through $o(n)$ terms, by the heuristic above. Step (iii)
+needs expansion of small vertex sets in $G(n)$. Here the arithmetic is a genuine obstacle: $G(n)$ is far from
+pseudo-random in the usual sense. Squares are $0$ or $1$ modulo $4$, so the residue
+classes $1$ and $3$ modulo $4$ are independent sets of size about $n/4$, and there are no
+edges between the classes $0$ and $2$ modulo $4$. Likewise, the class $1$ modulo $3$ is
+an independent set of size about $n/3$. Every allowed pair of classes mod $4$ has twice the
+$\kappa$-density. Rotation--extension arguments that rely on edges between any two
+large sets therefore have to be made residue-aware. This is where rotations would do
+real work.
+By contrast, a single rotation changes an endpoint. In the lifting scheme the
+endpoints of each $T_c$ are pinned by the glue, so rotations contribute only constant
+factors per level unless they are composed into the fixed-endpoint moves of
+\cref{def:move}.
+
+A different general mechanism, rerouting inside consecutive blocks of a
+Hamiltonian path, gives exponential counts for traceable graphs with certain forbidden
+induced subgraphs \cite{JookenZamfirescu}. It requires every sufficiently long block
+to be non-rigid. In $G(n)$ chords between path vertices at bounded distance become rare
+as $n\to\infty$, so it does not apply directly. That is why \cref{sec:moves} needs
+the lift.
+
+\input{sec_deterministic}
+
+\section{Computations}\label{sec:computations}
+Every computational statement in this paper is backed by a procedure in \cref{app:algorithms} and
+by data in \cref{app:data}, as follows.
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+statement & procedure & data\\
+\midrule
+exact counts $\Ham(n)$, $n\le75$ & \cref{alg:frontier} & \cref{tab:counts}\\
+glue arrangements; \cref{prop:t3} & \cref{alg:glue} & \cref{tab:glue}, \cref{app:data-glue}\\
+\cref{thm:main}, \cref{cor:seeds} & \cref{alg:lift,alg:moves,alg:certificate} & \cref{app:data-cert}, \cref{tab:liftcheck}\\
+seed statistics & \cref{alg:seeds,alg:moves} & \cref{tab:seeds}\\
+the constant $C$ & \cref{alg:sinkhorn-cont} & \cref{app:numerics}\\
+\cref{prop:edges,prop:mod4} (numerics) & \cref{alg:edges} & \cref{app:numerics}\\
+\cref{prop:bregman} (finite $n$) & \cref{alg:bregman} & \cref{app:numerics}\\
+Bethe table (\cref{sec:deterministic}) & \cref{alg:bethe} & \cref{app:numerics}\\
+\cref{tab:resid}, \cref{fig:predictor} & \cref{alg:predictor} & \cref{tab:residfull}\\
+\bottomrule
+\end{tabular}
+\end{center}
+The certificate data of \cref{app:data-cert,app:data-glue} are complete. Together with
+\cref{tab:glue}, they suffice to verify \cref{thm:main} independently: the seeds by hand, and the
+lifts with a few lines of code.
+
+\subsection*{Acknowledgement}
+The arguments and computations in this draft were developed in conversation with
+Claude (Anthropic), and should be checked independently.
+
+\appendix
+\input{app_limits_long}
+\input{app_algorithms}
+\input{app_data}
+
+\bibliographystyle{amsplain}
+\bibliography{square_sum}
+\end{document}

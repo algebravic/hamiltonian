@@ -1,0 +1,300 @@
+\section{Graph limits, permutons, and the Schr\"odinger problem}\label{app:limits}
+
+This appendix explains in more detail the analytic objects used in
+\cref{sec:limits,sec:heuristic,sec:deterministic}. Its aim is to let a reader who has not
+met graphons or entropic transport check each step. Statements marked as theorems are
+quoted from the literature or proved here. Heuristic steps are labelled as such.
+
+\subsection{Dense graph limits}
+For a graph $G$ on $[n]$, define the step function $W_G$ on $[0,1]^2$ to be $1$ on
+$\bigl(\frac{i-1}n,\frac in\bigr]\times\bigl(\frac{j-1}n,\frac jn\bigr]$ when $i\sim j$ and
+$0$ otherwise. Thus $W_G$ is ``the adjacency matrix drawn as a picture''. A
+\emph{graphon} is a symmetric measurable $W:[0,1]^2\to[0,1]$. For a fixed graph $F$
+on $[k]$ the homomorphism density is
+\[
+t(F,W)=\int_{[0,1]^k}\prod_{\{u,v\}\in E(F)}W(x_u,x_v)\,dx_1\cdots dx_k .
+\]
+$t(F,W_G)$ is the probability that a random map $V(F)\to V(G)$ is a homomorphism. The
+\emph{cut norm} is $\|W\|_\square=\sup_{S,T}\bigl|\int_{S\times T}W\bigr|$, the supremum
+over measurable $S,T\subseteq[0,1]$. The \emph{cut distance}
+$\delta_\square(W,U)=\inf_\phi\|W-U^\phi\|_\square$ takes the infimum over
+measure-preserving relabellings $\phi$ of $[0,1]$.
+
+\begin{theorem}[Lov\'asz--Szegedy \cite{LovaszSzegedy}; see \cite{Lovasz}]
+Every sequence of graphs with $|V(G_n)|\to\infty$ has a subsequence along which
+$t(F,W_{G_n})$ converges for every $F$. The limits are $t(F,W)$ for a graphon $W$, and
+convergence of all $t(F,\cdot)$ is equivalent to $\delta_\square(W_{G_n},W)\to0$.
+\end{theorem}
+
+Conversely, a graphon $W$ generates \emph{$W$-random graphs}: choose
+$x_1,\dots,x_n$ independently and uniformly from $[0,1]$, and join $i,j$ independently with
+probability $W(x_i,x_j)$. These converge to $W$ almost surely. For example,
+$G(n,\tfrac12)\to\tfrac12$, and the graphs with $i\sim j\iff i+j\le n$ converge to
+$\mathbf 1[x+y\le1]$.
+
+\subsection{Sparse graphs, and why $G(n)$ needs more}
+If $e(G_n)=o(n^2)$ then $W_{G_n}\to0$, which carries no information. The theory of $L^p$
+graphons \cite{BCCZ1,BCCZ2} rescales by the edge density $\rho_n=2e(G_n)/n^2$. One
+studies $W_{G_n}/\rho_n$, whose limits are symmetric $W\in L^p([0,1]^2)$, $p>1$, with no
+upper bound required. Compactness requires \emph{$L^p$ upper regularity}: block averages of
+$W_{G_n}/\rho_n$ over partitions into parts of measure at least $\eta$ must have $L^p$ norm
+at most a constant $K$ independent of $\eta$. The sampling model joins $i,j$ with
+probability $\min(1,\rho_nW(x_i,x_j))$.
+
+For $G(n)$ we have $\rho_n\asymp n^{-1/2}$. The natural candidate limit is $\kappa(x,y)=1/(2\sqrt{x+y})$:
+the squares near $m$ have density $1/(2\sqrt m)$, and
+$\sqrt n\cdot 1/(2\sqrt{n(x+y)})=\kappa(x,y)$. \Cref{prop:mod4} shows that cut-norm
+convergence to $\kappa$ fails, and the remark after it shows that upper regularity fails.
+Both failures come from residues: whether $i+j$ is a square depends on $i\bmod q$ and
+$j\bmod q$ for every $q$. The limit must therefore record residues.
+
+\subsection{The profinite integers}
+$\Zhat=\varprojlim\mathbb{Z}/q\mathbb{Z}\cong\prod_p\mathbb{Z}_p$ is a compact ring
+containing $\mathbb{Z}$ densely. An element is a compatible choice of residues modulo every
+$q$. Its Haar probability measure $\mu_{\Zhat}$ gives each residue class modulo $q$ mass
+$1/q$. Let $\sigma$ be the law of $k^2$ when $k$ is Haar-distributed. With
+$\varrho_q(a)=\#\{x\bmod q:\ x^2\equiv a\}$,
+\[
+\sigma(\{s\equiv a\bmod q\})=\varrho_q(a)/q .
+\]
+The squares in $\mathbb{Z}_p$ have Haar measure $\sum_{k\ge0}p^{-2k}\cdot\frac{p-1}{2p}=\frac{p}{2(p+1)}$
+for odd $p$, and $\sum_{k\ge0}4^{-k}\cdot\frac18=\frac16$ for $p=2$. The infinite
+product over $p$ is $0$, so the squares form a Haar-null set in $\Zhat$, and $\sigma$
+is singular with respect to $\mu_{\Zhat}$.
+
+\begin{proposition}[joint equidistribution]\label{prop:equid}
+Fix $q$, residues $r,s\bmod q$, and intervals $I,J\subseteq[\delta,1]$, $\delta>0$. Then
+\[
+\#\bigl\{(i,j):\ i\sim j,\ \tfrac in\in I,\ \tfrac jn\in J,\ i\equiv r,\ j\equiv s\ (\mathrm{mod}\ q)\bigr\}
+=\frac{\varrho_q(r+s)}{q^2}\,n^{3/2}\!\iint_{I\times J}\kappa+O_{q,\delta}(n).
+\]
+\end{proposition}
+
+\begin{proof}
+Fix $i\equiv r$. Its neighbours are $j=k^2-i$, and $j\equiv s$ if and only if
+$k^2\equiv r+s\pmod q$. Within any $q$ consecutive values of $k$ there are exactly
+$\varrho_q(r+s)$ such $k$. Apply \cref{lem:squaresum} with $f=\mathbf 1_J$ to the
+subsequence of $k$ in a fixed residue class; this changes the mesh by the factor $q$.
+The count for fixed $i$ is $\frac{\varrho_q(r+s)}q\sqrt n\int_J\kappa(i/n,y)\,dy+O_{q,\delta}(1)$.
+Now sum over the $\frac nq|I|+O(1)$ values of $i$.
+\end{proof}
+
+Accordingly, put $\Omega=[0,1]\times\Zhat$ with measure $\lambda\otimes\mu_{\Zhat}$, and send
+vertex $i$ to $(i/n,i)$. Define the operator
+\[
+(Tf)(x,\alpha)=\int_0^1\kappa(x,y)\,\mathbb{E}_{s\sim\sigma}\,f(y,\,s-\alpha)\,dy .
+\]
+\Cref{prop:equid} says exactly that the normalised adjacency operator
+$(A_nf)(i)=n^{-1/2}\sum_{j\sim i}f(j)$ converges to $T$ against all test functions that
+depend on $\alpha$ only through a fixed modulus. In the language of Backhausz--Szegedy
+\cite{BackhauszSzegedy}, a \emph{graphop} is a positivity-preserving self-adjoint
+operator $L^\infty(\Omega)\to L^1(\Omega)$. \emph{Action convergence} asks that, for
+every $k$ and all $f_1,\dots,f_k$ with $\|f_i\|_\infty\le1$, the joint laws of
+the $2k$-tuples
+\[(f_1,\dots,f_k,\,A_nf_1,\dots,A_nf_k)\]
+be approximated by those for $T$, and conversely.
+\Cref{conj:limit} asserts this for $T$. None of the arguments below depends on it. Its
+role is to explain why a single analytic object, $\kappa$ together with $\sigma$,
+should govern all of the asymptotics.
+
+\subsection{Permutons and their large deviations}
+A \emph{permuton} is a probability measure on $[0,1]^2$ with both marginals uniform; the
+set of permutons is $\Pi(\lambda,\lambda)$. A permutation $\pi\in S_n$ defines the
+permuton $\mu_\pi$ with density $n$ on the squares
+$\bigl(\frac{i-1}n,\frac in\bigr]\times\bigl(\frac{\pi(i)-1}n,\frac{\pi(i)}n\bigr]$. We use the weak
+topology on permutons.
+
+\begin{theorem}[Trashorras; Kenyon--Kr\'al'--Radin--Winkler {\cite[Thm.~1]{KKRW}}]\label{thm:LDPperm}
+If $\pi$ is uniform in $S_n$, the laws of $\mu_\pi$ satisfy a large deviation principle
+with speed $n$ and rate function $I(\mu)=\KL(\mu\,\|\,\lambda^2)=\int\rho\log\rho$ if $\mu$
+has density $\rho$, and $I=+\infty$ otherwise. Informally,
+$\#\{\pi:\mu_\pi\approx\mu\}\approx n!\,e^{-n\KL(\mu\|\lambda^2)}$.
+\end{theorem}
+
+By Varadhan's lemma \cite[Thm.~4.3.1]{DemboZeitouni}, for bounded continuous $\Phi$ on
+permutons,
+\[
+\lim_{n\to\infty}\frac1n\log\mathbb{E}_\pi\,e^{n\Phi(\mu_\pi)}=\sup_\mu\{\Phi(\mu)-I(\mu)\}.
+\]
+We apply this to $\Phi(\mu)=\int\log\kappa\,d\mu$. Since $\kappa\ge 1/(2\sqrt2)$,
+$\log\kappa$ is bounded below. It is unbounded above only at the corner, where
+$\kappa(x,y)\le 1/(2\sqrt x)$. Let $\kappa_M=\min(\kappa,M)$. Only rows with
+$i<n/(4M^2)$ can have $\kappa>M$, so for every permutation
+\[
+0\le\sum_i\Bigl[\log\kappa\bigl(\tfrac in,\tfrac{\pi(i)}n\bigr)-\log\kappa_M\bigl(\tfrac in,\tfrac{\pi(i)}n\bigr)\Bigr]
+\le\sum_{i<n/(4M^2)}\tfrac12\log\frac{n}{4M^2i}=O\!\left(\frac n{M^2}\right).
+\]
+Also $\sum_i\log\kappa_M(i/n,\pi(i)/n)=n\int\log\kappa_M\,d\mu_\pi+o(n)$ uniformly in $\pi$,
+by uniform continuity. Letting $M\to\infty$ after $n\to\infty$ proves:
+
+\begin{proposition}\label{prop:firstmoment}
+Let $R_n$ be the random $0/1$ matrix with independent entries
+$\mathbb{P}(R_n(i,j)=1)=p_{ij}=\frac1{2\sqrt{i+j}}$. Then
+\[
+\mathbb{E}\operatorname{per}R_n=\sum_{\pi\in S_n}\prod_ip_{i\pi(i)}=\frac{n!}{n^{n/2}}\ \mathbb{E}_\pi\prod_i\kappa\bigl(\tfrac in,\tfrac{\pi(i)}n\bigr),
+\qquad
+\frac1n\log\mathbb{E}_\pi\prod_i\kappa\bigl(\tfrac in,\tfrac{\pi(i)}n\bigr)\longrightarrow C,
+\]
+where $C=\sup_{\mu\in\Pi(\lambda,\lambda)}\{\int\log\kappa\,d\mu-\KL(\mu\|\lambda^2)\}$.
+\end{proposition}
+
+This is a theorem, given \cref{thm:LDPperm}. The \emph{heuristic} steps of
+\cref{sec:heuristic} are: (i) the passage from $\mathbb{E}\operatorname{per}R_n$, the
+first moment of the number of cycle covers of the random model, to Hamiltonian cycles,
+i.e.\ to cyclic $\pi$, at a cost of $e^{o(n)}$; and (ii) the passage from $R_n$ to $G(n)$.
+\Cref{sec:deterministic} replaces (ii) for cycle covers by a deterministic argument.
+
+\subsection{The Schr\"odinger problem}
+We now analyse the variational problem
+\[
+C=\sup_{\mu\in\Pi(\lambda,\lambda)}\Bigl\{\int\log\kappa\,d\mu-\KL(\mu\,\|\,\lambda^2)\Bigr\}.
+\]
+
+\emph{Gibbs variational principle.} For a probability measure $\nu$ and measurable $g$
+with $\int e^g\,d\nu<\infty$,
+\[
+\sup_\mu\Bigl\{\int g\,d\mu-\KL(\mu\|\nu)\Bigr\}=\log\int e^g\,d\nu,
+\]
+attained exactly at $d\mu\propto e^g\,d\nu$. This follows from Jensen's inequality applied to
+$\log\int e^{g}\frac{d\nu}{d\mu}\,d\mu$. Without the marginal constraints, our
+supremum would therefore be $\log\iint\kappa=\log\frac43(\sqrt2-1)$. The constraints are what
+make the problem a \emph{Schr\"odinger bridge}: with
+$R=\kappa\,dx\,dy/\iint\kappa$,
+\[
+C=\log\iint\kappa-\min_{\mu\in\Pi(\lambda,\lambda)}\KL(\mu\,\|\,R).
+\]
+This is the static Schr\"odinger problem, equivalently entropic optimal transport with cost
+$c=-\log\kappa$ and regularisation parameter $1$ \cite{Leonard,Nutz,PeyreCuturi}.
+
+\emph{Existence and uniqueness.} $\Pi(\lambda,\lambda)$ is weakly compact, $\KL(\cdot\|R)$
+is lower semicontinuous and strictly convex, and $\KL(\mu\|R)<\infty$ for $\mu=\lambda^2$.
+So there is a unique minimiser $\mu^*$.
+
+\emph{Form of the minimiser.} Perturb $\mu$ within $\Pi(\lambda,\lambda)$ and introduce
+Lagrange multipliers $\varphi(x),\psi(y)$ for the two marginal constraints. Stationarity of
+$\int\log\kappa\,d\mu-\int\rho\log\rho$ gives $\log\kappa-\log\rho-1=\varphi(x)+\psi(y)$,
+that is,
+\[
+d\mu^*=a(x)\,b(y)\,\kappa(x,y)\,dx\,dy .
+\]
+The rigorous version, the product form of $I$-projections onto sets of measures with
+given marginals, is due to Csisz\'ar \cite{Csiszar}. Borwein--Lewis--Nussbaum
+\cite{BLN} treat kernels in exactly this ``$DAD$'' form, including measurable kernels. Since
+$\kappa$ is symmetric and $\mu^*$ is unique, $\mu^*$ is symmetric. Then $a(x)b(y)=a(y)b(x)$,
+so $b$ is a constant multiple of $a$, and after rescaling $b=a$. The marginal constraints
+become the \emph{Schr\"odinger equation}
+\begin{equation}\label{eq:schrod}
+a(x)\int_0^1a(y)\,\kappa(x,y)\,dy=1\qquad(0\le x\le1).
+\end{equation}
+
+\emph{The value.} Since $\log\frac{d\mu^*}{d\lambda^2}=\log a(x)+\log a(y)+\log\kappa$, we get
+$\int\log\kappa\,d\mu^*-\KL(\mu^*\|\lambda^2)=-\int(\log a(x)+\log a(y))\,d\mu^*=-2\int_0^1\log a$,
+using the uniform marginals. Hence $C=-2\int_0^1\log a$.
+
+\emph{A dual formula giving certified bounds.} For any measurable $u>0$ and any
+$\mu\in\Pi(\lambda,\lambda)$, apply the Gibbs principle with $g=\log(\kappa\,u\otimes u)$, and use
+$\int\log(u\otimes u)\,d\mu=2\int\log u$:
+\[
+\int\log\kappa\,d\mu-\KL(\mu\|\lambda^2)\ \le\ \log\iint\kappa(x,y)u(x)u(y)\,dx\,dy-2\int_0^1\log u .
+\]
+Equality holds for $u=a$ by \eqref{eq:schrod}. So
+\[
+C=\min_{u>0}\Bigl\{\log\iint\kappa\,u\otimes u-2\int\log u\Bigr\}
+ =\max_{\mu\in\Pi(\lambda,\lambda)}\Bigl\{\int\log\kappa\,d\mu-\KL(\mu\|\lambda^2)\Bigr\}.
+\]
+Any trial function $u$ gives an upper bound for $C$, and any permuton gives a lower bound.
+With $u=1$ we get $C\le\log\iint\kappa=-0.5937$. The comparison $C<B$ of
+\cref{prop:bregman} is the same principle with only the first marginal constrained.
+
+\subsection{Sinkhorn's iteration}
+Write $(Kf)(x)=\int_0^1\kappa(x,y)f(y)\,dy$. Sinkhorn's iteration
+\cite{Sinkhorn,SinkhornKnopp} alternately enforces the two marginals:
+$b_{k+1}=1/(Ka_k)$, $a_{k+1}=1/(Kb_{k+1})$. A fixed point satisfies $a\,Kb=1=b\,Ka$. In the
+symmetric case we use the damped form
+\[
+a_{k+1}=\bigl(a_k/Ka_k\bigr)^{1/2},
+\]
+the geometric mean of $a_k$ and the Sinkhorn update. Its fixed points are exactly the
+solutions of \eqref{eq:schrod}.
+
+\emph{Convergence.} On positive functions, use Hilbert's projective metric
+$d_H(f,g)=\log\bigl(\sup\frac fg\cdot\sup\frac gf\bigr)$. The map $f\mapsto1/f$ is a
+$d_H$-isometry. By the Birkhoff--Hopf theorem \cite{Birkhoff}, a positive linear operator
+whose image has projective diameter $\Delta<\infty$ contracts $d_H$ by the factor
+$\tanh(\Delta/4)$. Taking geometric means halves distances. So the damped iteration
+contracts with factor at most $\frac12\bigl(1+\tanh(\Delta/4)\bigr)<1$ whenever
+$\kappa$ is bounded above and below, and then $\Delta\le2\log(\sup\kappa/\inf\kappa)$.
+Our $\kappa$ is unbounded only at the origin. For the truncation $\kappa_M$ the iteration
+converges geometrically. $C$ is monotone in the kernel, and the estimate preceding
+\cref{prop:firstmoment} gives $0\le C-C_M=O(M^{-2})$. Nussbaum \cite{Nussbaum} treats
+the scaling of integral kernels in this Hilbert-metric framework in much greater generality.
+
+\emph{Numerics.} With the midpoint rule on $M$ nodes, $K$ becomes an $M\times M$ matrix.
+For $M=400,1600,3200$ the iteration converges to residual below $10^{-12}$ and gives
+$C=-0.632547$, $-0.632539$ and $-0.632538$ respectively (\cref{alg:sinkhorn-cont}). The potential
+$a$ increases from about $0.82$ at $x=0$, a finite value because $\kappa(0,\cdot)$ is
+integrable, to about $1.76$ at $x=1$. It is plotted in the talk figures.
+
+\subsection{The discrete counterpart: scaling, permanents, Bethe}\label{app:bethe}
+The finite-$n$ analogue of a permuton is a doubly stochastic matrix. The analogue of the
+Schr\"odinger problem is matrix scaling.
+
+\emph{Matrix scaling.} If a nonnegative matrix $A$ has total support, there are positive
+diagonal $D_1,D_2$ with $D_1AD_2$ doubly stochastic (Sinkhorn--Knopp
+\cite{SinkhornKnopp}), and for symmetric $A$ one may take $D_1=D_2=D=\mathrm{diag}(d_i)$.
+Then $\operatorname{per}A=\operatorname{per}(S)/\prod_id_i^2$ with $S=DAD$, and the van der
+Waerden bound $\operatorname{per}S\ge n!/n^n$ \cite{Egorychev,Falikman} gives
+\[
+\log\operatorname{per}A\ \ge\ \log\frac{n!}{n^n}-2\sum_i\log d_i=-n-2\sum_i\log d_i+O(\log n).
+\]
+
+\emph{Bethe.} \Cref{thm:GS} with $P=S$ gives
+$\log\operatorname{per}A\ge F(S)=-2\sum_i\log d_i-n+O\bigl(\sum s_{ij}^2\bigr)$. Indeed
+$-\sum s_{ij}\log s_{ij}=-\sum s_{ij}(\log d_i+\log d_j)=-2\sum_i\log d_i$ because the rows and
+columns sum to $1$, and $\sum(1-s)\log(1-s)=-\sum s+O(\sum s^2)=-n+O(\sum s^2)$. For
+$G(n)$, $\sum s_{ij}^2\le n\max s_{ij}=O(\sqrt n)$. So van der Waerden and Bethe-at-$S$
+agree up to $o(n)$. The advantage of \cref{thm:GS} is that \emph{any} doubly stochastic $P$
+is allowed, so an exact scaling is not needed. This is what makes \cref{prob:L1} a
+perturbation problem.
+
+\emph{Discrete versus continuum.} Suppose $d_i=n^{-1/4}a(i/n)(1+o(1))$ in an averaged sense.
+Then
+\[
+-2\sum_i\log d_i=\frac n2\log n-2\sum_i\log a(i/n)+o(n)=\frac n2\log n+Cn+o(n),
+\]
+and hence $F(S)=\frac n2\log n+(C-1)n+o(n)$. This is exactly the first-moment value of
+\cref{prop:firstmoment}, since $\log n!-\frac n2\log n=\frac n2\log n-n+O(\log n)$. The
+ansatz $n^{1/4}d_i\approx a(i/n)$ is consistent because the scaling equation
+$d_i\sum_{j\sim i}d_j=1$ becomes, by \cref{lem:squaresum},
+$a(x)\cdot\sqrt n\int a\,\kappa(x,\cdot)\cdot n^{-1/2}=1$, which is \eqref{eq:schrod}. The
+same computation for the explicit ansatz \eqref{eq:ansatz} gives
+$-\sum\widetilde p\log\widetilde p=\frac12\log n\sum\widetilde p-2\sum_i\log a(i/n)\sum_j\widetilde p_{ij}
+=\frac n2\log n+Cn+o(n)$, since its row sums are $1+o(1)$ on average.
+
+\emph{Where the residues went.} In the limit on $\Omega$, the analogue of
+\eqref{eq:schrod} uses the kernel $\kappa(x,y)$ times the arithmetic coupling $\nu$ of
+$(\alpha,\beta)$, $\beta=s-\alpha$. If $\alpha$ is Haar-distributed and $s\sim\sigma$ is
+independent, then $\beta$ is Haar-distributed. So $\nu$ \emph{already has uniform
+marginals}, the potentials do not depend on $\alpha$, and the optimal coupling on
+$\Omega^2$ is $\mu^*\otimes\nu$. The arithmetic layer contributes $0$ to $C$. In finite
+terms, this is why \cref{lem:squaresum} needs no congruence conditions: the row sums of
+the ansatz involve only the sizes of the neighbours. The numerical values of $F(S)$ in
+\cref{sec:deterministic}, computed for the actual graphs $G(n)$, confirm this.
+
+\subsection{Dictionary}
+\begin{center}\small
+\begin{tabular}{ll}
+\toprule
+continuum (limit object) & finite $n$ (the graph $G(n)$)\\
+\midrule
+kernel $\kappa(x,y)$ on $[0,1]^2$ & $\sqrt n\,A_{G(n)}$, via \cref{lem:squaresum}\\
+arithmetic coupling $\nu$ on $\Zhat^2$ & residues of $i,j$ with $i+j$ a square, \cref{prop:equid}\\
+permuton $\mu\in\Pi(\lambda,\lambda)$ & doubly stochastic $P$ supported on $E(G(n))$\\
+$\int\log\kappa\,d\mu-\KL(\mu\|\lambda^2)$ & $F(P)-\frac n2\log n+n$, the Bethe free energy\\
+Schr\"odinger potential $a(x)$ & $n^{1/4}d_i$, the scaling vector\\
+Sinkhorn on $L^\infty[0,1]$ & Sinkhorn on $A_{G(n)}$\\
+$C$ & $\frac1n\bigl(\log\operatorname{per}A_{G(n)}-\frac n2\log n\bigr)+1$ (conjecturally)\\
+$B=\int\log f$ (Gibbs, one marginal) & Bregman's bound via the degrees $d(i)$\\
+\bottomrule
+\end{tabular}
+\end{center}

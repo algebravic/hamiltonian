@@ -1,0 +1,205 @@
+% ---------------------------------------------------------------
+% Section: Evolution of the secondary-ordering cost function
+% Insert as Section 7.5, after the sojourn/treewidth section.
+% Macros needed: \pw, \Bell, \nb  (already in paper preamble)
+% New macro needed: \proxy  (defined below if not already present)
+% ---------------------------------------------------------------
+
+% Add to preamble if not present:
+% \newcommand{\proxy}{\hat{s}}
+
+\subsection{Evolution of the secondary-ordering cost function}
+\label{sec:costfn-evolution}
+
+Selecting a vertex ordering that minimises the maximum frontier width
+(i.e.\ the exact pathwidth) is handled by the MaxSAT solver described
+in Section~\ref{sec:ordering}.
+Within the space of pathwidth-optimal orderings, the simulated-annealing
+refinement (Section~\ref{sec:ordering2}) uses a differentiable cost
+function $\mathrm{cost}(\sigma)$ to guide the search.
+This cost function underwent five iterations before reaching its current
+form, each motivated by a specific empirical failure of the preceding
+version.
+Table~\ref{tab:costfn} summarises the progression; this section
+describes the design rationale and failure mode of each version in turn.
+
+\paragraph{V1 — peak-only penalty.}
+The first version penalised only those steps where the frontier width
+equals the pathwidth:
+\[
+  \mathrm{cost}_1(\sigma)
+    = \sum_{\{s\,:\,f_s = \pw\}} 2^{\nb(s)}
+      + 0.01 \sum_s f_s.
+\]
+The $2^{\nb}$ term reflects the fused-sweep cost (Section~\ref{sec:v4}):
+processing $2^{\nb}$ edge subsets per source state at peak width.
+This reduced the $n=57$ DP time from $42.7$\,s to $31.8$\,s.
+The failure mode was that it was blind to steps at $f_s < \pw$: the SA
+moved a vertex with $\nb=4$ away from $f_s = \pw = 11$ (saving $16$
+cost units) into a step at $f_s = 10$ (gaining $16 \times (10/11)^2 =
+13.2$ units), which was operationally more expensive than what was
+avoided.
+
+\paragraph{V2 — frontier-weighted penalty.}
+The second version applied a continuous weight $(f_s/\pw)^2$ to all
+steps:
+\[
+  \mathrm{cost}_2(\sigma)
+    = \sum_s 2^{\nb(s)} \cdot \!\left(\tfrac{f_s}{\pw}\right)^{\!2}
+      + 0.001 \sum_s f_s.
+\]
+This correctly identified $(f_s=10,\,\nb=4)$ as more expensive than
+$(f_s=11,\,\nb=3)$: $16 \times (10/11)^2 = 13.2 > 8 \times 1 = 8$.
+V2 produced the best result seen for $n=58$ (138\,s, peak 18.3M
+states), and remained the best single-purpose function for that graph
+size.
+The failure mode emerged at $n=58$: the profile contained a six-step
+plateau of consecutive net-expanding steps (Section~\ref{sec:sojourn}),
+each with $f_s = \pw$ and $\nb = 2$.
+Because each step was scored independently at $4 \times 1 = 4$ units,
+the SA accepted the plateau as equivalent to six isolated cheap steps,
+failing to account for the compounding effect on the hash-table size.
+
+\paragraph{V3 — pressure with sojourn penalty.}
+The third version attempted to address two issues simultaneously:
+the plateau problem (via a multiplicative ``pressure'' variable that
+accumulated across expanding steps) and long frontier sojourns (via an
+explicit per-vertex penalty):
+\begin{align*}
+  \mathrm{pressure}_0 &= 1, \\
+  \mathrm{pressure}_{s+1} &= \max\!\left(1,\; \mathrm{pressure}_s
+      \cdot (1 + 0.3\,\max(0,\, \nb(s) - n_\mathrm{elim}(s)))\right), \\
+  \mathrm{cost}_3(\sigma)
+    &= \sum_s \Bigl[
+        \mathrm{pressure}_s \cdot 2^{\nb(s)} \cdot \!\left(\tfrac{f_s}{\pw}\right)^{\!2}
+        + \mathrm{soj}(v_s) \cdot \left(\tfrac{f_s}{\pw}\right)^{\!2} \cdot 0.5
+      \Bigr]
+      + 0.01 \sum_s f_s,
+\end{align*}
+where $\mathrm{soj}(v_s) = \mathrm{last\_step}(v_s) - s$ is the number
+of steps vertex $v_s$ will remain in the frontier after its introduction.
+The sojourn penalty with weight $0.5$ gave a 30-step sojourn at $f_s =
+\pw = 14$ a cost of $15$ units---larger than a single peak-width step
+with $\nb = 3$ ($8$ units)---so the SA aggressively moved long-sojourn
+vertices later in the ordering.
+Unfortunately this over-correction caused $n=61$ to peak at 423M states
+instead of 108M: reducing one vertex's sojourn forced other vertices
+into positions with four back-edges at peak width, which was far more
+expensive than the sojourn it avoided.
+The additive pressure variable also grew only linearly with net
+expansion (factor $1+0.3\,\nb$), still underestimating geometric
+compounding.
+
+\paragraph{V4 — pure geometric proxy.}
+The fourth version replaced the pressure variable with a purely
+multiplicative proxy $\proxy_s$ tracking an estimate of the hash-table
+occupancy:
+\[
+  \proxy_0 = 1, \qquad
+  \proxy_{s+1} = \max\!\left(1,\; \proxy_s
+      \cdot 2^{\nb(s)} \cdot \!\left(\tfrac{f_s}{\pw}\right)^{\!2}
+      \cdot \max\!\left(0.01,\, 0.5^{n_\mathrm{elim}(s)}\right)\right),
+\]
+\[
+  \mathrm{cost}_4(\sigma) = \sum_s \proxy_s + 0.001 \sum_s f_s.
+\]
+Geometric compounding correctly scores a six-step plateau of
+$\nb=2$ steps as $85\times$ the cost of a single such step (since
+the proxy compounds at each step), compared to $6\times$ under V2.
+Long sojourns are also penalised implicitly: a vertex in the frontier
+for $k$ steps participates in $k$ compounding cycles.
+The failure mode was that $\proxy_s \times 2^{\nb}$ and $\proxy_s$
+differ only by a scalar after two consecutive steps, making two
+$\nb=2$ steps look equivalent to one $\nb=4$ step (since
+$2^2 \times 2^2 = 2^4$).
+In practice V4 produced a $n=58$ time of $265$\,s, worse than V2's
+$138$\,s, because it could not distinguish a single step with $\nb=4$
+and 17M states from two steps with $\nb=2$ and 5M states each.
+
+\paragraph{V5 — hybrid (current).}
+The current version combines both signals explicitly:
+\[
+  \proxy_0 = 1, \qquad
+  \proxy_{s+1} = \max\!\left(1,\; \proxy_s
+      \cdot 2^{\nb(s)} \cdot \!\left(\tfrac{f_s}{\pw}\right)^{\!2}
+      \cdot \max\!\left(0.01,\, 0.5^{n_\mathrm{elim}(s)}\right)\right),
+\]
+\begin{equation}
+  \mathrm{cost}_5(\sigma)
+    = \sum_s \proxy_s \cdot 2^{\nb(s)} \cdot \!\left(\tfrac{f_s}{\pw}\right)^{\!2}
+      + 0.001 \sum_s f_s.
+  \label{eq:cost_fn_v5}
+\end{equation}
+The step cost $\proxy_s \times 2^{\nb(s)} \times (f_s/\pw)^2$
+approximates the actual fused-sweep cost at step $s$:
+$\proxy_s$ estimates the current hash-table occupancy (state count),
+and $2^{\nb(s)}$ is the number of edge subsets enumerated per source
+state.
+V5 satisfies both desiderata simultaneously:
+\begin{itemize}[nosep]
+  \item \emph{Single-step accuracy}: $\nb = 4$ is correctly scored
+    $2^4/2^2 = 4\times$ more expensive than $\nb=2$ at the same proxy
+    level, regardless of history.
+  \item \emph{Plateau sensitivity}: four consecutive $\nb=2$ steps at
+    $f_s = \pw$ cost $340$ units under V5 vs $4 \times 4 = 16$ under
+    V2---a $21\times$ ratio---correctly reflecting the compounding
+    table growth.
+\end{itemize}
+Empirically, V5 produces a $n=59$ run that is more than $2\times$
+faster than V2 up to the same point in the computation, with a lower
+peak state count (52.6M vs 68.4M at step 36).
+
+\begin{table}[H]
+\centering
+\caption{Performance of secondary-ordering cost function versions across
+graph sizes.  DP times are wall-clock seconds.  Peak states are the
+maximum hash-table occupancy over all steps.
+``$>2\times$ faster'' for V5 at $n=59$ is measured up to step~36.
+Dashes indicate the run was in progress at the time of writing.}
+\label{tab:costfn}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llrrrl}
+\toprule
+Version & Formula summary & $n$ & DP time & Peak states & Note \\
+\midrule
+No SA & MaxSAT order only
+  & 57 & 42.7\,s & 4.6M  & Fused B+C baseline \\
+V1 & $\sum_{f_s=\pw} 2^{\nb}$
+  & 57 & 31.8\,s & 4.6M  & +25\% \\
+\midrule
+No SA & MaxSAT order only
+  & 58 & 229\,s  & 22.0M & \\
+V1 & $\sum_{f_s=\pw} 2^{\nb}$
+  & 58 & 224\,s  & 22.4M & No improvement \\
+V2 & $\sum 2^{\nb}(f_s/\pw)^2$
+  & 58 & \textbf{138\,s}  & 18.3M & Best for $n=58$ \\
+V3 & V2 + pressure + sojourn
+  & 58 & 601\,s  & ---   & Regression \\
+V4 & $\sum \proxy_s$
+  & 58 & 265\,s  & 23.8M & Plateau fix, nb blind \\
+V5 & $\sum \proxy_s \cdot 2^{\nb}(f_s/\pw)^2$
+  & 58 & 186\,s  & ---   & Hybrid \\
+\midrule
+V2 & $\sum 2^{\nb}(f_s/\pw)^2$
+  & 59 & ---     & 68.4M & Swap at steps 36--37 \\
+V5 & $\sum \proxy_s \cdot 2^{\nb}(f_s/\pw)^2$
+  & 59 & $>2\times$ faster & 52.6M & To step 36 \\
+\midrule
+V2 & $\sum 2^{\nb}(f_s/\pw)^2$
+  & 61 & ---     & 108M  & Stalls at step 32 \\
+V3 & V2 + pressure + sojourn
+  & 61 & ---     & 423M  & $4\times$ worse peak \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The evolution of the cost function illustrates a recurring theme in
+combinatorial optimisation: a cost function designed to capture one
+phenomenon can inadvertently blind the SA to another.
+V1 was blind to near-peak-width steps; V2 was blind to compounding
+across consecutive steps; V3 over-corrected for sojourns at the expense
+of single-step accuracy; V4 lost the per-step $2^{\nb}$ signal while
+gaining the plateau signal.
+V5 resolves the tension by using the geometric proxy as a multiplier
+rather than as the cost itself, so both the single-step cost and the
+accumulated state-count growth are represented in every term of the sum.

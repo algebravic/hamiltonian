@@ -1,0 +1,244 @@
+\section{A deterministic route for $G(n)$}\label{sec:deterministic}
+
+The random graph $R(n)$ of \cref{heu:first} was used only to \emph{guess} the constant
+$C$. \Cref{conj:asymp} is a statement about the deterministic family $G(n)$. In the
+proofs for random graphs \cite{GlebovKrivelevich}, randomness is used only to verify a
+few structural inputs. Krivelevich's version for pseudo-random graphs \cite{Krivelevich}
+makes these inputs explicit and is entirely deterministic. In this section we isolate the
+corresponding statements for $G(n)$. We show that the first of them, the count of cycle
+covers, already transfers to $G(n)$ in a deterministic way, and we verify it numerically.
+\Cref{app:limits} explains the analytic background in more detail.
+
+Throughout, $A=A_{G(n)}$ is the adjacency matrix. Then $\operatorname{per}A$ is the number
+of permutations $\pi$ of $[n]$ with $i\sim\pi(i)$ for all $i$. These are the cycle covers
+of the directed graph obtained by doubling each edge; $2$-cycles are allowed.
+Directed Hamiltonian cycles are among them, so $2\cdot\#\{\text{Hamiltonian cycles}\}\le\operatorname{per}A$.
+
+\subsection{Cycle covers: a deterministic lower bound}
+
+\begin{theorem}[Gurvits \cite{Gurvits}; Gurvits--Samorodnitsky {\cite[Thm.~1.2]{GurvitsSamorodnitsky}}]\label{thm:GS}
+Let $A$ be a nonnegative $n\times n$ matrix and $P$ a doubly stochastic matrix. Then
+\[
+\log\operatorname{per}A\ \ge\ \sum_{i,j}\Bigl[p_{ij}\log\frac{a_{ij}}{p_{ij}}+(1-p_{ij})\log(1-p_{ij})\Bigr],
+\]
+with the conventions $0\log(\cdot/0)=0$ and $\log 0=-\infty$.
+\end{theorem}
+
+The maximum of the right-hand side over $P$ is the logarithm of the \emph{Bethe
+permanent} of $A$. The theorem is equivalent to Gurvits's inequality
+$\operatorname{per}A\ge\operatorname{Bethe}(A)$, which he derived from Schrijver's
+permanental inequality \cite{Schrijver}. For a $0/1$ matrix and $P$ supported on the ones
+of $A$, the right-hand side is
+\[
+F(P)=\sum_{i\sim j}\bigl[-p_{ij}\log p_{ij}+(1-p_{ij})\log(1-p_{ij})\bigr].
+\]
+
+\begin{corollary}\label{cor:bethe}
+For every doubly stochastic $P$ supported on the edges of $G(n)$ (each ordered pair
+counted once), $\log\operatorname{per}A_{G(n)}\ge F(P)$.
+\end{corollary}
+
+Nothing here is random. The only question is how good a $P$ we can exhibit. Take $P=S$,
+the symmetric Sinkhorn scaling $S=DAD$ of $A$, computed numerically to machine precision.
+This gives:
+
+\begin{center}
+\begin{tabular}{rcc}
+\toprule
+$n$ & $\bigl(F(S)-\frac n2\log n\bigr)/n$ & max.\ row-sum error of the ansatz \eqref{eq:ansatz}\\
+\midrule
+$1000$ & $-1.60375$ & $0.107$\ (rms $0.026$)\\
+$4000$ & $-1.61752$ & $0.067$\ (rms $0.013$)\\
+$16000$ & $-1.62498$ & $0.031$\ (rms $0.006$)\\
+$64000$ & $-1.62871$ & ---\\
+\midrule
+$\infty$ (continuum) & $C-1=-1.63254$ &\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The gap to $C-1$ halves each time $n$ is multiplied by $4$, so it decays like $n^{-1/2}$.
+Numerically, therefore,
+$\log\operatorname{per}A_{G(n)}\ge\frac n2\log n+(C-1)n-O(\sqrt n)$. This is a
+deterministic check that the residue structure of $G(n)$ does not change the constant
+at the level of cycle covers. In the other direction, Bregman's theorem \cite{Bregman}
+gives the proved bound
+\[
+\log\operatorname{per}A_{G(n)}\le\sum_i\frac{\log(d_i!)}{d_i}=\frac n2\log n+(B-1)n+o(n),
+\]
+exactly as in \cref{prop:bregman}.
+
+\subsection{Why the discrete scaling tracks the continuum}
+The scaling of $A$ is close to the continuum solution $a$ of \cref{sec:heuristic}
+because its row sums are sums of a fixed function over the squares in an interval. No
+congruence conditions enter.
+
+\begin{lemma}\label{lem:squaresum}
+Let $f$ have bounded variation on $[0,1]$, let $\delta>0$, and let $1\le i\le n$ with
+$x=i/n\ge\delta$. Then
+\[
+\sum_{k:\ i<k^2\le i+n} f\Bigl(\frac{k^2-i}{n}\Bigr)
+=\sqrt n\int_0^1 f(y)\,\kappa(x,y)\,dy+O_\delta\bigl(\|f\|_\infty+V(f)\bigr).
+\]
+\end{lemma}
+
+\begin{proof}
+Put $y_k=(k^2-i)/n$. Then $y_{k+1}-y_k=(2k+1)/n\le 3/\sqrt n$, and since
+$x+y_k=k^2/n$,
+\[
+\sqrt n\,\kappa(x,y_k)=\frac{n}{2k},\qquad
+f(y_k)=f(y_k)\,\sqrt n\,\kappa(x,y_k)\,(y_{k+1}-y_k)\Bigl(1+O\bigl(\tfrac1k\bigr)\Bigr).
+\]
+So the sum is a Riemann sum for $\int_0^1 f(y)\,\sqrt n\,\kappa(x,y)\,dy$. The weight $\sqrt n\,\kappa(x,\cdot)$ is
+monotone and bounded by $\sqrt n/(2\sqrt\delta)$. The mesh is $O(n^{-1/2})$, and there are
+$O(\sqrt n)$ terms each with relative error $O(1/k)=O(n^{-1/2})$. So the total error is
+$O_\delta(\|f\|_\infty+V(f))$.
+\end{proof}
+
+Applying this with $f=a$ (or rather a bounded-variation truncation of it near $0$) shows
+that the \emph{ansatz}
+\begin{equation}\label{eq:ansatz}
+\widetilde p_{ij}=\frac{a(i/n)\,a(j/n)}{\sqrt n}\qquad(i\sim j)
+\end{equation}
+has row and column sums $1+O_\delta(n^{-1/2})$ on rows with $i\ge\delta n$. This uses
+$a(x)\int_0^1 a\,\kappa(x,\cdot)=1$. The table above measures this error directly.
+Moreover (\cref{app:bethe}),
+$F(\widetilde p)=\frac n2\log n+(C-1)n+o(n)$. What remains is to correct $\widetilde p$
+to an exactly doubly stochastic matrix:
+
+\begin{problem}[L1]\label{prob:L1}
+Show that there is a doubly stochastic $P$ supported on $E(G(n))$ with
+$\sum_{ij}|p_{ij}-\widetilde p_{ij}|\,\log n=o(n)$. With \cref{cor:bethe} this would give
+\[
+\log\operatorname{per}A_{G(n)}\ \ge\ \frac n2\log n+(C-1)n-o(n),
+\]
+the lower bound of \cref{conj:asymp} for cycle covers (the upper bound being Bregman's,
+with $B$ in place of $C$).
+\end{problem}
+
+This is a flow problem on the bipartite double cover of $G(n)$: route the excess
+$O(n^{-1/2})$ per row along short paths. The quotient graphs on residue classes are
+connected (see \cref{subsec:merge}), so there is no arithmetic obstruction. Rows with
+$i<\delta n$ need separate treatment because of the singularity of $\kappa$ at the origin.
+
+\subsection{Few cycles}
+\begin{problem}[L2]\label{prob:L2}
+Show that for some $s=s(n)=o(n/\log n)$ the cycle covers of $G(n)$ with at most $s$
+cycles number at least $e^{-o(n)}\operatorname{per}A_{G(n)}$.
+\end{problem}
+In \cite{Krivelevich} this is done deterministically. A cover with at least $s$ cycles has
+at least $s/2$ cycles of length at most $2n/s$. One bounds the covers containing a
+prescribed family of short cycles by applying Bregman to the remaining matrix, and then
+sums over families. So the input is an upper bound on the number $N_L(n)$ of
+$L$-cycles of $G(n)$. Such a cycle $x_1\cdots x_L$ is a solution of
+$x_t+x_{t+1}=a_t^2$ ($t$ mod $L$). Eliminating the $x_t$, this means
+$\sum_t(-1)^ta_t^2=0$ for even $L$, and $2x_1=\sum_t(-1)^{t+1}a_t^2$ for odd $L$, together with
+ordering constraints. Counting these is classical Diophantine analysis, in which
+arithmetic enters only through logarithmic factors. (For $L=4$, $a^2+c^2=b^2+d^2$ has
+$\asymp N^2\log N$ solutions with $a,b,c,d\le N$.) A spectral variant: under the
+Gibbs measure on covers, the expected number of cycles is heuristically
+$\sum_L\operatorname{tr}(S^L)/L$. Only finitely many eigenvalues of $S$, coming from
+characters of small moduli, are of constant size, which suggests $O(\sqrt n)$ cycles.
+
+\subsection{Merging}\label{subsec:merge}
+\begin{problem}[L3]\label{prob:L3}
+Prove a residue-aware expansion property of $G(n)$ strong enough for the
+rotation--extension merging of \cite{Krivelevich,GlebovKrivelevich}.
+\end{problem}
+Here the arithmetic is essential. The class $1\bmod 3$ is independent, and there are no
+edges between the classes $0$ and $2\bmod 4$. The quotient graphs are nevertheless
+connected: modulo $4$ the class pairs that occur are
+$\{0,0\},\{0,1\},\{1,3\},\{2,2\},\{2,3\}$, and modulo $3$ they are
+$\{0,0\},\{0,1\},\{1,2\},\{2,2\}$. So a natural formulation is expansion
+\emph{relative to} the residue structure.
+
+\subsection{The upper bound}
+The deterministic upper bound (Bregman) has constant $B$, not $C$. Universal comparisons
+between the permanent and its Bethe approximation lose a factor exponential in $n$:
+$\operatorname{per}A\le 2^{n/2}\operatorname{Bethe}(A)$ \cite{AnariRezaei}, with
+improvements to $c^n$, $c<\sqrt2$, cited in \cite{DongJain}. Girth-dependent
+improvements \cite{DongJain} do not apply, since $G(n)$ contains triangles
+($6+19=25$, $19+30=49$, $30+6=36$). A sharp upper bound would need a ``large-degree
+Bethe-exactness'' theorem for deterministic matrices with all scaled entries $o(1)$.
+We do not know such a result. The realistic target is therefore the lower bound with
+constant $C$ together with the upper bound with constant $B$, a gap of $0.0175$ per vertex.
+
+\subsection{Barvinok's identity and a finite-$n$ predictor}\label{subsec:barvinok}
+Barvinok \cite[Lemma~4.2]{Barvinok} defines the \emph{Hamiltonian permanent}
+$\operatorname{hamp}A=\sum_{g}\prod_ia_{i,g(i)}$, the sum over permutations $g$ consisting of a
+single $n$-cycle, and proves
+$\operatorname{hamp}A=\frac1n[x_1\cdots x_n]\operatorname{Tr}(D(x)A)^n$ with
+$D(x)=\operatorname{diag}(x)$. The same argument for paths gives
+\[
+2\Ham(n)=[x_1\cdots x_n]\ \mathbf 1^{\!\top}(D(x)A)^{n-1}D(x)\mathbf 1,\qquad A=A_{G(n)} .
+\]
+Unlike $\operatorname{per}A=[x_1\cdots x_n]\prod_i(Ax)_i$, this coefficient sees only single
+paths. In principle it therefore bypasses \cref{prob:L2,prob:L3}.
+
+\emph{An exact identity.} Let $S=DAD$ be the symmetric Sinkhorn scaling, $D=\operatorname{diag}(d_j)$,
+and evaluate at $x_j=d_j^2$. A walk $v_1\cdots v_n$ then has weight
+$\prod_t d_{v_t}^2\prod_tA_{v_tv_{t+1}}=d_{v_1}d_{v_n}\prod_tS_{v_tv_{t+1}}$. Let $(X_t)$ be the stationary
+Markov chain with transition matrix $S$; its stationary law is uniform because $S$ is doubly
+stochastic. Then
+\begin{equation}\label{eq:markov}
+2\Ham(n)=n\Bigl(\prod_jd_j\Bigr)^{-2}\,\mathbb{E}\bigl[d_{X_1}d_{X_n};\ X_1,\dots,X_n\text{ distinct}\bigr].
+\end{equation}
+
+\emph{Zeroth order.} For i.i.d.\ uniform $X_t$, $\mathbb{P}(\text{distinct})=n!/n^n$.
+Using this value and decoupling the endpoints gives the predictor
+\[
+\widehat\Ham(n)=\frac n2\cdot\frac{n!}{n^n}\cdot\Bigl(\prod_jd_j\Bigr)^{-2}\Bigl(\frac1n\sum_jd_j\Bigr)^{2}.
+\]
+If $d_j\approx n^{-1/4}a(j/n)$ (\cref{prob:L1}), then
+$\log\widehat\Ham(n)=\log n!-\frac n2\log n+Cn+o(n)$, which is \cref{conj:asymp}. Unlike the formula
+of \cref{tab:resid}, $\widehat\Ham(n)$ uses the actual scaling of each $G(n)$.
+
+\emph{What fails.} Two natural refinements do not work at the sizes where we can test them.
+\begin{enumerate}
+\item A Gaussian saddle-point approximation of the torus integral is wrong at exponential order.
+The visit counts are lattice variables with mean $1$ and variance $\approx1$. Their local
+probability is $\approx e^{-1}$ (Poisson), not the Gaussian $(2\pi)^{-1/2}$. Already for
+$S=J/n$ this gives $(2\pi)^{-(n-1)/2}$ in place of $n!/n^n$, an error of about $0.081n$ in the
+logarithm. The correct baseline is the i.i.d.\ one used above.
+\item First-order ``loop'' corrections to the i.i.d.\ baseline are far too large.
+These are the pair-collision factor $\exp\bigl(-\sum_\ell(1-\ell/n)(\operatorname{tr}S^\ell-1)\bigr)$
+and the cycle-cover analogue $\det'(I-S)=\prod_{\lambda\ne1}(1-\lambda)$. For $31\le n\le75$ they
+change $\log\widehat\Ham$ by $-23$ to $-29$ and by $-8$ to $-10$ respectively, whereas the
+required correction is about $+2$. At these sizes the degrees are only $2$--$7$,
+$\|S\|_F^2-1\approx12$--$17$, and $S$ has eigenvalues down to $-0.95$, so the chain is far
+from the perturbative regime.
+\end{enumerate}
+
+\emph{What holds.} The zeroth-order predictor, by contrast, works remarkably well; see
+\cref{fig:predictor}. For $31\le n\le74$,
+$\log\Ham(n)-\log\widehat\Ham(n)$ lies in $[1.89,3.11]$, with standard deviation $0.23$. The
+constant-$C$ formula has standard deviation $0.72$. The new residual varies smoothly, changing
+by at most $0.6$ between consecutive $n$, and usually by less than $0.15$. In particular, the
+oscillations of the residual in \cref{tab:resid}, with dips near $n=40,58$--$60,70$, are
+explained entirely by the scaling vector, that is, by the capacity of $A_{G(n)}$. What remains
+is a slowly varying correction of size $\approx2$, consistent with $e^{o(n)}$. A least-squares
+fit $r\approx1.0+8.9/\sqrt n$ is empirical only. For $n\le30$ the Sinkhorn iteration
+degenerates (some entries of $S$ tend to $0$), because $A_{G(n)}$ lacks total support there.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\linewidth]{../figs/predictor.pdf}
+\caption{Residuals of $\log\Ham(n)$ against the constant-$C$ formula of \cref{tab:resid} and
+against the scaling predictor $\widehat\Ham(n)$, for $31\le n\le75$. The point at $n=75$ is
+the suspect value.}
+\label{fig:predictor}
+\end{figure}
+
+\emph{The value at $n=75$.} Against $\widehat\Ham$ the residual at $n=75$ is $+6.25$, a jump of
+$+4.3$ from a curve that otherwise moves by at most $0.6$ per step. This strengthens the case
+for rechecking $\Ham(75)$.
+
+In terms of \eqref{eq:markov}, everything beyond \cref{prob:L1} reduces to one probabilistic
+statement:
+\begin{problem}[L$^*$]\label{prob:Lstar}
+For the stationary chain with transition matrix $S$, the Sinkhorn scaling of $A_{G(n)}$, show that
+$\log\mathbb{P}(X_1,\dots,X_n\text{ distinct})=\log(n!/n^n)+o(n)$.
+\end{problem}
+Together with \cref{prob:L1}, a solution would prove \cref{conj:asymp} in full, for paths
+directly, without passing through cycle covers. The data suggest that the ratio to $n!/n^n$ is
+in fact $e^{O(1)}$ in this range.

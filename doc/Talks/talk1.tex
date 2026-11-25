@@ -1,0 +1,811 @@
+\documentclass[aspectratio=169,t]{beamer}
+
+\usetheme{default}
+\usecolortheme{default}
+
+\definecolor{darkblue}{RGB}{15,40,80}
+\definecolor{midblue}{RGB}{30,80,160}
+\definecolor{lightblue}{RGB}{200,220,245}
+\definecolor{accent}{RGB}{220,80,40}
+\definecolor{dkgreen}{RGB}{30,130,70}
+\definecolor{gold}{RGB}{180,140,0}
+\definecolor{lightgray}{RGB}{240,242,246}
+\definecolor{purple}{RGB}{120,40,160}
+
+\setbeamercolor{frametitle}{fg=white,bg=darkblue}
+\setbeamercolor{title}{fg=white}
+\setbeamercolor{subtitle}{fg=lightblue}
+\setbeamercolor{author}{fg=lightblue}
+\setbeamercolor{normal text}{fg=darkblue}
+\setbeamercolor{block title}{fg=white,bg=midblue}
+\setbeamercolor{block body}{fg=darkblue,bg=lightblue!40}
+\setbeamercolor{alerted text}{fg=accent}
+\setbeamercolor{example text}{fg=dkgreen}
+\setbeamercolor{structure}{fg=midblue}
+\setbeamercolor{itemize item}{fg=accent}
+\setbeamercolor{itemize subitem}{fg=midblue}
+\setbeamercolor{enumerate item}{fg=accent}
+
+\setbeamerfont{frametitle}{size=\large,series=\bfseries}
+\setbeamerfont{title}{size=\LARGE,series=\bfseries}
+\setbeamerfont{block title}{series=\bfseries}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{itemize item}{\small\raise0.5pt\hbox{$\bullet$}}
+\setbeamertemplate{itemize subitem}{\small\raise0.5pt\hbox{$\circ$}}
+\setbeamertemplate{frametitle}[default][center]
+\setbeamertemplate{footline}{%
+  \hfill\usebeamerfont{footline}\color{darkblue!50}%
+  \insertframenumber/\inserttotalframenumber\hspace{4pt}\vspace{4pt}}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,backgrounds,calc,decorations.pathreplacing}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.16}
+\usepackage{array}
+
+\newcommand{\pw}{\mathrm{pw}}
+\newcommand{\tw}{\mathrm{tw}}
+\newcommand{\Bell}{\mathrm{Bell}}
+\newcommand{\nb}{n_{\mathrm{back}}}
+\newcommand{\Gn}{G_n}
+
+\title{Counting Hamiltonian Paths\\in Square-Sum Graphs}
+\subtitle{Talk I: Algorithms and Combinatorics}
+\author{Victor S.\ Miller}
+\date{}
+
+\begin{document}
+
+% ==================== TITLE ====================
+{
+\setbeamercolor{background canvas}{bg=darkblue}
+\begin{frame}[plain]
+  \vspace{1.0cm}
+  \begin{center}
+    {\color{lightblue}\small\itshape Talk I of II}\\[0.5cm]
+    {\color{white}\LARGE\bfseries Counting Hamiltonian Paths\\[4pt]
+     in Square-Sum Graphs}\\[0.7cm]
+    {\color{lightblue}\large Algorithms and Combinatorics}\\[0.9cm]
+    {\color{white}\large Victor S.\ Miller}\\[0.3cm]
+    {\color{lightblue!70}\normalsize \today}
+  \end{center}
+\end{frame}
+}
+
+% ==================== OUTLINE ====================
+\begin{frame}{Talk Outline}
+\begin{columns}[t]
+\column{0.48\textwidth}
+\textbf{\color{midblue}The Problem}
+\begin{itemize}
+  \item Square-sum graphs
+  \item Hamiltonian paths: why hard?
+\end{itemize}
+\vspace{0.3cm}
+\textbf{\color{midblue}Classical DP Foundations}
+\begin{itemize}
+  \item Bellman (1962), Held-Karp (1962)
+  \item DP table structure
+  \item Why ordering matters
+\end{itemize}
+\vspace{0.3cm}
+\textbf{\color{midblue}Bell Numbers and Pathwidth}
+\begin{itemize}
+  \item Bell numbers and state counts
+  \item Vertex separation / pathwidth
+  \item Fixed-parameter tractability
+  \item Treewidth comparison
+\end{itemize}
+
+\column{0.48\textwidth}
+\textbf{\color{midblue}Computing the Best Ordering}
+\begin{itemize}
+  \item MaxSAT for exact pathwidth
+  \item Simulated annealing refinement
+  \item Multi-start enumeration
+\end{itemize}
+\vspace{0.3cm}
+\textbf{\color{midblue}Practical Computation}
+\begin{itemize}
+  \item The record-merging bottleneck
+  \item Competing approaches
+\end{itemize}
+\vspace{0.3cm}
+\textbf{\color{midblue}New Results}
+\begin{itemize}
+  \item $|\mathrm{Ham}(G_{61})|$ computed for the first time
+  \item What comes next
+\end{itemize}
+\end{columns}
+\end{frame}
+
+% ==================== PART I: PROBLEM ====================
+{
+\setbeamercolor{background canvas}{bg=darkblue}
+\begin{frame}[plain]
+  \vspace{2cm}
+  \begin{center}
+    {\color{lightblue}\small Part I}\\[0.4cm]
+    {\color{white}\LARGE\bfseries The Problem}
+  \end{center}
+\end{frame}
+}
+
+\begin{frame}{The Square-Sum Graph $G_n$}
+\small
+\begin{columns}[c]
+\column{0.55\textwidth}
+\begin{block}{Definition}
+$G_n$ has vertices $\{1,\ldots,n\}$. Edge $(i,j)$ iff $i+j$ is a perfect square.
+\end{block}
+
+\vspace{0.2cm}
+\begin{itemize}
+  \item Connected for all $n \ge 15$; sparse (max degree $\approx 6$)
+  \item Related to the recreational \emph{square-sum problem}
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Central question:}
+How many \alert{undirected Hamiltonian paths} does $G_n$ contain?
+
+\vspace{0.2cm}
+\begin{alertblock}{Hardness}
+Counting Hamiltonian paths is \textbf{\#P-complete} in general.\\
+Brute force for $n=61$: $61! \approx 10^{83}$ orderings to check.
+\end{alertblock}
+
+\column{0.42\textwidth}
+\begin{center}
+\begin{tabular}{rr}
+\toprule
+$n$ & $|\mathrm{Ham}(G_n)|$ \\
+\midrule
+15 & 1 \\
+17 & 1 \\
+18--20 & 0 \\
+25 & 10 \\
+35 & 17{,}175 \\
+45 & 12{,}220{,}138 \\
+57 & 68{,}092{,}497{,}615 \\
+\rowcolor{dkgreen!15}
+61 & 3{,}711{,}439{,}128{,}718 \\
+\bottomrule
+\end{tabular}
+\end{center}
+{\small\color{dkgreen} $n=61$: computed for the first time}
+\end{columns}
+\end{frame}
+
+% ==================== PART II: CLASSICAL DP ====================
+{
+\setbeamercolor{background canvas}{bg=darkblue}
+\begin{frame}[plain]
+  \vspace{2cm}
+  \begin{center}
+    {\color{lightblue}\small Part II}\\[0.4cm]
+    {\color{white}\LARGE\bfseries Classical DP Foundations}
+  \end{center}
+\end{frame}
+}
+
+\begin{frame}{Historical Context: Bellman (1962) and Held-Karp (1962)}
+\small
+\begin{columns}[t]
+\column{0.48\textwidth}
+\begin{block}{Bellman (1962)}
+  Dynamic programming for the Travelling Salesman Problem.
+  State: $(S, v)$ where $S \subseteq V$ is the set of visited
+  vertices and $v \in S$ is the current endpoint.\\[4pt]
+  Recurrence:
+  \[ C(S, v) = \min_{u \in S \setminus \{v\}} \bigl[C(S\setminus\{v\}, u) + d(u,v)\bigr] \]
+  Time: $O(2^n \cdot n^2)$.  Space: $O(2^n \cdot n)$.
+\end{block}
+
+\column{0.48\textwidth}
+\begin{block}{Held \& Karp (1962)}
+  Independent discovery of the same approach; simultaneously
+  showed that the DP dominates all previously known TSP algorithms
+  and established $O(2^n \cdot n^2)$ as the complexity.\\[4pt]
+  \textbf{Key insight:} the principle of optimality applies to
+  Hamiltonian paths — a subpath must itself be optimal for its
+  endpoint and visited set.
+\end{block}
+\end{columns}
+
+\vspace{0.15cm}
+\begin{center}
+\begin{tikzpicture}
+  \node[fill=midblue,rounded corners,text=white,inner sep=6pt,
+        font=\small,text width=11cm,align=center]{
+    Both papers: exponential in $n$, not any structural parameter.
+    For $n=61$: $2^{61}\approx 2.3\times10^{18}$ states — completely infeasible.};
+\end{tikzpicture}
+\end{center}
+\end{frame}
+
+\begin{frame}{The Held-Karp DP Table Structure}
+\begin{columns}[c]
+\column{0.52\textwidth}
+\textbf{State space} for Hamiltonian paths on $G_n$:
+\begin{itemize}
+  \item A state is a pair $(S, v)$: visited set $S \subseteq V$, current endpoint $v \in S$
+  \item $f(S, v)$ = number of Hamiltonian paths on $G[S]$ ending at $v$
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Recurrence:}
+\[
+  f(S, v) = \sum_{\substack{u \in S\setminus\{v\}\\(u,v)\in E}} f(S \setminus \{v\}, u)
+\]
+
+\textbf{Base case:} $f(\{v\}, v) = 1$ for all $v \in V$.
+
+\vspace{0.2cm}
+\textbf{Answer:}
+\[
+  |\mathrm{Ham}(G_n)| = \tfrac{1}{2}\sum_{v \in V} f(V, v)
+\]
+(divide by 2 since each path counted twice, once from each end)
+
+\column{0.44\textwidth}
+\begin{center}
+\begin{tikzpicture}[scale=0.85,
+  cell/.style={draw=midblue,fill=lightblue!20,minimum width=0.8cm,minimum height=0.5cm,font=\tiny},
+  hdr/.style={draw=darkblue,fill=darkblue,text=white,minimum width=0.8cm,minimum height=0.5cm,font=\tiny\bfseries}]
+  % Table header
+  \node[hdr,minimum width=1.2cm] at (0,2.5) {$S$};
+  \foreach \v/\x in {1/1.2, 2/2.0, 3/2.8, 4/3.6}{
+    \node[hdr] at (\x,2.5) {$v=\v$};}
+  % Rows
+  \foreach \s/\y/\lbl in {
+    0/2.0/{$\{1\}$}, 1/1.5/{$\{2\}$}, 2/1.0/{$\{1,2\}$},
+    3/0.5/{$\{1,3\}$}, 4/0.0/{$\cdots$}}{
+    \node[hdr,minimum width=1.2cm] at (0,\y) {\lbl};
+    \foreach \x in {1.2,2.0,2.8,3.6}{
+      \node[cell] at (\x,\y) {};}}
+  % Highlight base cases
+  \node[cell,fill=dkgreen!30] at (1.2,2.0) {\textbf{1}};
+  \node[cell,fill=dkgreen!30] at (2.0,1.5) {\textbf{1}};
+  \node[draw=accent,very thick,rounded corners,minimum width=0.8cm,minimum height=0.5cm] at (1.2,1.0) {};
+  \node[draw=accent,very thick,rounded corners,minimum width=0.8cm,minimum height=0.5cm] at (2.0,1.0) {};
+\end{tikzpicture}
+
+\vspace{0.3cm}
+\textbf{Table size:} $2^n \times n$ entries\\[3pt]
+\textbf{Iteration order:} by $|S|$ (increasing)\\[3pt]
+\textbf{Bottleneck:} $2^{61} \times 61 \approx 1.4 \times 10^{20}$ cells
+\end{center}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Why Ordering Matters: Frontier Width}
+\small
+\begin{columns}[c]
+\column{0.52\textwidth}
+\textbf{Key:} don't track $S$ — track connectivity on the frontier.
+
+\vspace{0.1cm}
+Process vertices in order $\sigma=(v_1,\ldots,v_n)$.
+At step $i$, the \textbf{frontier} is:
+\[
+  F_i = \{v_j : j \le i,\;\exists\,k > i,\;(v_j, v_k) \in E\}
+\]
+vertices introduced but still having future neighbours.
+
+\vspace{0.1cm}
+\begin{block}{State reduction}
+  Two configurations are \emph{equivalent} if they induce
+  the same connectivity pattern on the frontier.\\[2pt]
+  States at step $i$: at most $\Bell(|F_i|)$.
+\end{block}
+
+\column{0.44\textwidth}
+\centering
+\begin{tikzpicture}[scale=0.82,
+  done/.style={fill=darkblue!30,draw=darkblue,circle,inner sep=3pt},
+  front/.style={fill=accent!80,draw=accent,text=white,circle,inner sep=3pt},
+  future/.style={fill=lightgray,draw=midblue!40,circle,inner sep=3pt},
+  lbl/.style={font=\small}]
+  \foreach \x/\s in {0/done,1/done,2/done,3/front,4/front,5/front,6/future,7/future}{
+    \node[\s] (\x) at (\x*0.75,0) {};}
+  \draw[very thick,midblue!50] (0)--(1)--(2);
+  \draw[very thick,accent] (2)--(3) (3)--(4);
+  \draw[dashed,midblue!40] (4)--(5) (5)--(6) (6)--(7);
+  \node[lbl,above=4pt] at (0) {done};
+  \node[lbl,above=4pt] at (3.5*0.75,0.5) {\textbf{frontier}};
+  \node[lbl,above=4pt] at (7*0.75,0) {future};
+  \draw[decorate,decoration={brace,amplitude=5pt},thick,accent]
+    (2.4*0.75,-0.55) -- (5.6*0.75,-0.55) node[midway,below=5pt]{\small $|F_i| = 3$};
+\end{tikzpicture}
+
+\vspace{0.35cm}
+\textbf{Crucial:} the frontier width $|F_i|$ depends entirely on the ordering $\sigma$.\\[4pt]
+Choose $\sigma$ to \alert{minimise $\max_i |F_i|$}\\
+and the state space shrinks dramatically.
+\end{columns}
+\end{frame}
+
+% ==================== PART III: BELL / PATHWIDTH ====================
+{
+\setbeamercolor{background canvas}{bg=darkblue}
+\begin{frame}[plain]
+  \vspace{2cm}
+  \begin{center}
+    {\color{lightblue}\small Part III}\\[0.4cm]
+    {\color{white}\LARGE\bfseries Bell Numbers and Pathwidth}
+  \end{center}
+\end{frame}
+}
+
+\begin{frame}{Bell Numbers: Why They Determine Complexity}
+\small
+\begin{columns}[c]
+\column{0.50\textwidth}
+\begin{block}{Definition}
+$\Bell(w)$ = number of partitions of a set of $w$ elements.\\[3pt]
+Equivalently: number of distinct connectivity patterns
+on a frontier of width $w$ in a Hamiltonian path DP.
+\end{block}
+
+\vspace{0.2cm}
+\begin{center}
+\begin{tabular}{rr@{\hskip 8pt}l}
+\toprule
+$w$ & $\Bell(w)$ & note \\
+\midrule
+ 8 &          4{,}140 & \\
+ 9 &         21{,}147 & \\
+10 &        115{,}975 & $\pw(G_{57}) = 11$ \\
+11 &        678{,}570 & \\
+12 &      4{,}213{,}597 & $\pw(G_{58}) = 12$ \\
+13 &     27{,}644{,}437 & $\pw(G_{59,60}) = 13$ \\
+\rowcolor{accent!10}
+14 & 190{,}899{,}322 & $\pw(G_{61}) = 14$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\column{0.46\textwidth}
+\textbf{Super-exponential growth:}
+\[
+  \Bell(w+1) \approx \frac{w}{\ln w} \cdot \Bell(w)
+\]
+
+\vspace{0.1cm}
+\begin{center}
+\begin{tikzpicture}[scale=0.82]
+  \begin{axis}[
+    xlabel={Frontier width $w$},
+    ylabel={$\Bell(w)$},
+    ymode=log,
+    xtick={8,9,10,11,12,13,14},
+    xmin=7.5, xmax=14.5,
+    ymin=1000, ymax=500000000,
+    width=5.5cm, height=4.5cm,
+    grid=both, grid style={lightgray!50},
+    tick label style={font=\small},
+    label style={font=\small}]
+  \addplot[accent,mark=*,mark size=2pt,very thick] coordinates {
+    (8,4140)(9,21147)(10,115975)(11,678570)
+    (12,4213597)(13,27644437)(14,190899322)};
+  \end{axis}
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.1cm}
+{\small Each unit increase in $\pw$ multiplies the\\
+state count by $\approx 5$--$7\times$.\\
+$\pw = 13 \to 14$: \textbf{$6.9\times$ more states}.}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Vertex Separation and Pathwidth}
+\small
+\begin{columns}[c]
+\column{0.52\textwidth}
+\begin{block}{Pathwidth (Robertson-Seymour, 1983)}
+\[
+  \pw(G) = \min_{\sigma} \max_{i}\, |F_i(\sigma)|
+\]
+Min possible max frontier width over all orderings $\sigma$.
+\end{block}
+
+\vspace{0.1cm}
+\textbf{Vertex separation:} min vertices simultaneously
+``in play'' sweeping $G$ left to right.
+
+\vspace{0.1cm}
+\begin{exampleblock}{For square-sum graphs: $\pw(G_{57})=11$, $\pw(G_{58})=12$, $\pw(G_{59,60})=13$, $\pw(G_{61})=14$}
+\end{exampleblock}
+
+\column{0.44\textwidth}
+\textbf{Why does pathwidth matter so sharply?}
+
+\vspace{0.1cm}
+Total DP work $\le \sum_i \Bell(|F_i(\sigma)|)$.\\
+Under the optimal ordering:
+\[
+  \text{work} = O\bigl(\Bell(\pw(G)) \cdot n\bigr)
+\]
+
+\vspace{0.1cm}
+Compare to Held-Karp: $O(2^n \cdot n)$.\\
+For $n = 61$, $\pw = 14$:
+\begin{align*}
+  2^{61} &\approx 2.3 \times 10^{18} \\
+  \Bell(14) &\approx 1.9 \times 10^8
+\end{align*}
+
+\begin{center}
+\begin{tikzpicture}
+  \node[fill=accent,rounded corners,text=white,inner sep=6pt,font=\small\bfseries]{
+    $10^{10}$ reduction in state count};
+\end{tikzpicture}
+\end{center}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Fixed-Parameter Tractability}
+\small
+\begin{columns}[c]
+\column{0.52\textwidth}
+\begin{block}{FPT (Downey-Fellows, 1992)}
+Parameterised by $k$: solvable in $f(k)\cdot n^{O(1)}$ time,
+$f$ any computable function.\\[2pt]
+Combinatorial explosion \emph{confined to $k$};
+for fixed $k$: polynomial in $n$.
+\end{block}
+
+\vspace{0.1cm}
+\textbf{Ham.\ path counting is FPT} by pathwidth:
+\[
+  \text{time} = O\bigl(\underbrace{\Bell(\pw)}_{\text{f(k)}} \cdot \underbrace{n}_{\text{poly}}\bigr)
+\]
+
+\column{0.44\textwidth}
+\textbf{Treewidth as an alternative parameter:}
+
+\vspace{0.1cm}
+$\tw(G) \le \pw(G)$ always. For our graphs:\
+$\tw(G_{61}) \approx 11$--$12 \approx \pw - 2$.
+
+\vspace{0.15cm}
+\begin{alertblock}{Why not use treewidth?}
+\begin{itemize}\small
+  \item Join-node cost: $O(\Bell(\tw)^2)$ vs $O(\Bell(\pw))$ per step
+  \item $\tw=11$: $\Bell(11)^2 \approx 4.6 \times 10^{11}$;\quad $\pw=14$: $\Bell(14) \approx 1.9 \times 10^8$
+  \item Treewidth DP is \textbf{$2000\times$ worse} here
+  \item Exact treewidth also harder to compute for these graphs
+\end{itemize}
+\end{alertblock}
+\end{columns}
+\end{frame}
+
+% ==================== PART IV: ORDERING ====================
+{
+\setbeamercolor{background canvas}{bg=darkblue}
+\begin{frame}[plain]
+  \vspace{2cm}
+  \begin{center}
+    {\color{lightblue}\small Part IV}\\[0.4cm]
+    {\color{white}\LARGE\bfseries Computing the Best Ordering}
+  \end{center}
+\end{frame}
+}
+
+\begin{frame}{Finding the Optimal Ordering: MaxSAT}
+\small
+\begin{columns}[c]
+\column{0.52\textwidth}
+\textbf{Problem:} exact pathwidth is NP-hard in general,
+but tractable for graphs of this size.
+
+\vspace{0.15cm}
+\textbf{Vertex-separation encoding~[Coudert 2016]:}\\
+$x_{v,i}$: ``$v$ placed at position $\le i$''.\\
+Clauses: $v$ on frontier iff introduced and not yet eliminated.\\
+Minimise $\max|F_i|$.
+
+\vspace{0.1cm}
+\begin{block}{Output}
+Exact $\pw(G_n)$ and optimal ordering.
+Enumeration mode: generator over \textbf{all} optimal-pw
+orderings — enabling multi-start SA.
+\end{block}
+
+\column{0.44\textwidth}
+\textbf{Enumeration timing for $n=60$:}
+
+\vspace{0.1cm}
+{\small
+\begin{tabular}{rr}
+\toprule
+Solution & Time (s) \\
+\midrule
+1 (proves $\pw=13$) & 149.0 \\
+2 & 5.9 \\
+3 & 15.6 \\
+4 & 3.1 \\
+5--8 & 0.04--0.08 \\
+9--60+ & $\approx 0.034$ \\
+\bottomrule
+\end{tabular}}
+
+\vspace{0.2cm}
+Solutions 1--4 are \textbf{structurally distinct}
+(require genuine re-solving). Solutions 5+ are local
+variations reachable by unit propagation — and by SA.
+
+\vspace{0.2cm}
+\begin{exampleblock}{Practical rule: stop at 10 consecutive $<$40\,ms solutions}
+\end{exampleblock}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Simulated Annealing Refinement}
+\small
+\begin{columns}[c]
+\column{0.52\textwidth}
+\textbf{Motivation:} same $\pw(G)$, but DP costs differ by up to $50\%$.
+
+\vspace{0.15cm}
+\textbf{$G_{57}$, $\pw = 11$:}
+\begin{center}\small
+\begin{tabular}{lrr}
+\toprule
+Ordering & Time & Peak \\
+\midrule
+MaxSAT only & 42.7\,s & 4.6M \\
++ SA (V5) & $\approx$25\,s & 4.1M \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.1cm}
+\textbf{SA design:}
+\begin{itemize}
+  \item Start: MaxSAT-optimal ordering
+  \item Move: adjacent swap, only if $\max|F_i|$ unchanged
+  \item Cost (V5): $C(\sigma)=\sum_i \hat{s}_i\cdot 2^{\nb(i)}\cdot|F_i|$
+\end{itemize}
+
+\column{0.44\textwidth}
+\textbf{What SA can and cannot do:}
+
+\vspace{0.1cm}
+SA freely moves vertices that slide without changing $\max|F_i|$ — exactly the cheap ($\approx$34ms) MaxSAT solutions.
+
+\vspace{0.15cm}
+SA \textbf{cannot} cross between distinct topological skeletons without temporarily raising $\pw$.
+
+\vspace{0.1cm}
+\begin{block}{Multi-start strategy}
+  SA from each of $\sim$4--8 distinct MaxSAT solutions;
+  take lowest V5 cost.\\[2pt]
+  {\small $n=57$: $134$\,s $\to$ $25$\,s ($\mathbf{5.4\times}$)}
+\end{block}
+\end{columns}
+\end{frame}
+
+% ==================== PART V: PRACTICAL ====================
+{
+\setbeamercolor{background canvas}{bg=darkblue}
+\begin{frame}[plain]
+  \vspace{2cm}
+  \begin{center}
+    {\color{lightblue}\small Part V}\\[0.4cm]
+    {\color{white}\LARGE\bfseries Practical Computation}
+  \end{center}
+\end{frame}
+}
+
+\begin{frame}{The Record-Merging Bottleneck}
+\small
+\begin{columns}[c]
+\column{0.52\textwidth}
+At each DP step: large set of \textbf{(state, count)} pairs.
+
+\vspace{0.15cm}
+\textbf{Merging requirement:}\\
+Many source states $\to$ same output state.
+Counts must be \textbf{summed}:
+\[
+  \texttt{nxt}[k] \mathrel{+}= c_A + c_B + \cdots
+\]
+A \textbf{record-merging problem}: stream of (key, value) pairs,
+deduplicate and aggregate.
+
+\vspace{0.15cm}
+\textbf{Scale at $n=61$:}
+\begin{itemize}
+  \item Peak: $619$M output states
+  \item 24 bytes each (8B key + 16B count)
+  \item Peak table: $\approx 20$\,GB live
+\end{itemize}
+
+\column{0.44\textwidth}
+\begin{alertblock}{The engineering problem}
+  Requires attention to the \textbf{storage hierarchy}:
+  L1, L2, L3, DRAM, swap.\\[3pt]
+  \textbf{Subject of Talk II.}\\[3pt]
+  Short version: LP hash table (infeasible at $n=61$)
+  $\to$ extendible hashing + radix-sort locality +
+  OS page reclaim. Peak memory: $>80$\,GB $\to$ $<2$\,GB.
+\end{alertblock}
+
+\vspace{0.15cm}
+{\small $n=61$: 97\,min on M3 Pro.
+Without Talk II engineering: killed by OS.}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Competing Approaches}
+\small
+\begin{columns}[t]
+\column{0.30\textwidth}
+\begin{block}{ZDD / Graphillion}
+  Zero-suppressed BDDs represent path sets as DAGs.\\[3pt]
+  \textbf{Pro:} Elegant, general\\[2pt]
+  \textbf{Con:} ZDD size explodes; exhausted 16\,GB at $n \le 56$
+\end{block}
+
+\column{0.30\textwidth}
+\begin{block}{Held-Karp directly}
+  $O(2^n \cdot n)$ DP on the full visited-set table.\\[3pt]
+  \textbf{Pro:} Simple, optimal for general graphs\\[2pt]
+  \textbf{Con:} $2^{61}$ states $\approx 10^{18}$\\
+  — completely infeasible
+\end{block}
+
+\column{0.30\textwidth}
+\begin{block}{Inclusion-exclusion (Giscard)}
+  Sum over connected dominating sets.\\[3pt]
+  \textbf{Pro:} Theoretically clean\\[2pt]
+  \textbf{Con:} $|\text{CDS}(G_n)| \approx 3^n$;\\
+  $\approx 4 \times 10^{29}$ terms for $n = 61$
+\end{block}
+\end{columns}
+
+\vspace{0.15cm}
+\begin{center}
+\begin{tikzpicture}
+\node[fill=midblue!15,draw=midblue,rounded corners,inner sep=6pt,text width=11cm,align=center,font=\small]{
+  \textbf{Why frontier DP wins for $G_n$:} sparse graphs have small pathwidth ($\pw \ll n$),
+  so $O(\Bell(\pw) \cdot n)$ complexity far beats the alternatives.
+  The sparsity that makes ZDDs explode is exactly what keeps $\pw$ small.};
+\end{tikzpicture}
+\end{center}
+\end{frame}
+
+% ==================== RESULTS ====================
+{
+\setbeamercolor{background canvas}{bg=darkblue}
+\begin{frame}[plain]
+  \vspace{2cm}
+  \begin{center}
+    {\color{lightblue}\small Part VI}\\[0.4cm]
+    {\color{white}\LARGE\bfseries New Results}
+  \end{center}
+\end{frame}
+}
+
+\begin{frame}{New Values and Computation Summary}
+\begin{columns}[c]
+\column{0.52\textwidth}
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+$n$ & $\pw$ & $|\mathrm{Ham}(G_n)|$ & Time \\
+\midrule
+57 & 11 & 68{,}092{,}497{,}615 & 25\,s \\
+58 & 12 & (computed) & 117\,s \\
+59 & 13 & (computed) & 8.5\,min \\
+60 & 13 & (computed) & $\sim$20\,min \\
+\rowcolor{dkgreen!15}
+61 & 14 & \textbf{3{,}711{,}439{,}128{,}718} & 97\,min \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3cm}
+\textbf{n=61 DP structure:}\\
+Two separate peaks in the step profile:
+\begin{itemize}
+  \item Step 36: $619$M states (25\% of runtime)
+  \item Step 39: $466$M states (13\% of runtime)
+  \item Top 4 steps: 55\% of total runtime
+\end{itemize}
+
+\column{0.44\textwidth}
+\textbf{Algorithmic speedup chain:}
+
+\vspace{0.1cm}
+{\small
+\begin{tabular}{lr}
+Naive BFS ordering + byte states & 134\,s \\
++ Packed \texttt{u64} states & 71\,s \\
++ Fused B+C sweeps & 43\,s \\
++ MaxSAT ordering & 43\,s \\
++ SA refinement & 25\,s \\
+\end{tabular}}
+{\small\color{midblue} (all for $n=57$; $5.4\times$ total)}
+
+\vspace{0.3cm}
+\textbf{Storage engineering:}\\
+{\small
+\begin{tabular}{lr}
+LP hash table & 149\,s \\
++ Write-combining buffer & 117\,s \\
++ Extendible hashing & feasible \\
++ OS page reclaim & $<2$\,GB RAM \\
+\end{tabular}}
+{\small\color{midblue} (for $n=58$; enables $n=61$)}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Key Insight Cascade}
+\vspace{0.1cm}
+\begin{center}
+{\small
+\colorbox{lightblue!40}{\parbox{0.88\textwidth}{\centering\vspace{3pt}
+  \textbf{Counting Hamiltonian paths is \#P-complete.}\\[1pt]
+  But $G_n$ is sparse with small pathwidth $\pw \ll n$.
+\vspace{3pt}}}
+
+\vspace{1pt}{\color{midblue}$\downarrow$}\vspace{1pt}
+
+\colorbox{midblue!20}{\parbox{0.88\textwidth}{\centering\vspace{3pt}
+  \textbf{Frontier DP reduces Held-Karp's $O(2^n)$ to $O(\Bell(\pw))$ states.}\\[1pt]
+  Bell numbers grow super-exponentially: each unit of $\pw$ costs $6$--$7\times$.
+\vspace{3pt}}}
+
+\vspace{1pt}{\color{midblue}$\downarrow$}\vspace{1pt}
+
+\colorbox{accent!15}{\parbox{0.88\textwidth}{\centering\vspace{3pt}
+  \textbf{MaxSAT finds the exact optimal ordering; SA refines within it.}\\[1pt]
+  A small set of topologically distinct orderings covers the solution space.
+\vspace{3pt}}}
+
+\vspace{1pt}{\color{midblue}$\downarrow$}\vspace{1pt}
+
+\colorbox{dkgreen!15}{\parbox{0.88\textwidth}{\centering\vspace{3pt}
+  \textbf{At scale, the record-merging step dominates.}\\[1pt]
+  Storage-hierarchy-aware engineering enables $n=61$ in 97 minutes.\\[1pt]
+  Without it, the computation would exhaust RAM and never complete.
+\vspace{3pt}}}
+}
+\end{center}
+\end{frame}
+
+% ==================== FINAL ====================
+{
+\setbeamercolor{background canvas}{bg=darkblue}
+\begin{frame}[plain]
+  \vspace{0.5cm}
+  \begin{center}
+    {\color{white}\Large\bfseries Thank You}\\[0.5cm]
+    {\color{lightblue}Questions?}\\[0.6cm]
+
+    \begin{tikzpicture}
+    \node[fill=midblue,rounded corners,inner sep=10pt,text=white,
+          text width=9.5cm,align=center]{
+      \textbf{New result}\\[4pt]
+      $|\mathrm{Ham}(G_{61})| = 3{,}711{,}439{,}128{,}718$\\[6pt]
+      \textcolor{lightblue}{Talk II: The record-merging engineering problem —\\
+      extendible hashing, radix-sort locality, and storage-hierarchy design}};
+    \end{tikzpicture}
+
+    \vspace{0.5cm}
+    {\color{lightblue!70}\small
+    With thanks to Claude (Anthropic) for algorithm design, profiling, and implementation.}
+  \end{center}
+\end{frame}
+}
+
+\end{document}

@@ -1,0 +1,53 @@
+% Gluing in Gerbicz's x25 step, illustrated with the seed b in G(45)
+% (b = 1, 35, 29, 20, ..., 33, 3).  Requires TikZ.
+\begin{tikzpicture}[
+  x=1cm, y=1cm, >=stealth,
+  num/.style={font=\scriptsize, inner sep=1pt},
+  glue/.style={circle, draw, fill=yellow!30, inner sep=1.5pt, font=\scriptsize},
+  seg/.style={draw, rounded corners=2pt, fill=blue!8, minimum height=5mm, font=\scriptsize, inner xsep=3pt},
+  jn/.style={font=\tiny, text=red!70!black},
+  ws/.style={font=\tiny, text=blue!60!black}]
+% ---- schematic of the whole glued path ----
+\node[glue] (g1) at (0,0) {$1$};
+\node[seg, right=4mm of g1] (s1) {$T_{-10}:\ 15\cdots65$};
+\node[seg, right=5mm of s1] (s2) {$T_{10}:\ 35\cdots85$};
+\node[seg, right=5mm of s2] (s3) {$T_{11}:\ 36\cdots86$};
+\node[right=3mm of s3, font=\small] (dots) {$\cdots$};
+\node[seg, right=3mm of dots] (s4) {$\overline{T_{8}}:\ 83\cdots33$};
+\node[glue, right=4mm of s4] (g3) {$3$};
+\draw (g1) -- node[above, jn] {16} (s1);
+\draw (s1) -- node[above, jn] {100} (s2);
+\draw (s2) -- node[above, jn] {121} (s3);
+\draw (s3) -- (dots);
+\draw (dots) -- (s4);
+\draw (s4) -- node[above, jn] {36} (g3);
+% ---- zoom on T_{-10} and T_{10} ----
+\begin{scope}[yshift=-1.4cm]
+  \node[num, anchor=west] at (-0.3,0) {$T_{-10}$:};
+  \foreach \v/\x in {15/1.2, 885/2.4, 715/3.6, 510/4.8} \node[num] (a\v) at (\x,0) {$\v$};
+  \node[num] (adots) at (6.0,0) {$\cdots$};
+  \node[num] (a835) at (7.2,0) {$835$};
+  \node[num, draw=red!70!black, circle, inner sep=0.5pt] (a65) at (8.4,0) {$65$};
+  \draw[blue!60!black] (a15) -- node[above, ws] {$900$} (a885);
+  \draw[blue!60!black] (a885) -- node[above, ws] {$1600$} (a715);
+  \draw[blue!60!black] (a715) -- node[above, ws] {$1225$} (a510);
+  \draw[blue!60!black] (a510) -- (adots) -- (a835);
+  \draw[blue!60!black] (a835) -- node[above, ws] {$900$} (a65);
+\end{scope}
+\begin{scope}[yshift=-2.5cm]
+  \node[num, anchor=west] at (-0.3,0) {$T_{10}$:};
+  \node[num, draw=red!70!black, circle, inner sep=0.5pt] (b35) at (1.2,0) {$35$};
+  \foreach \v/\x in {865/2.4, 735/3.6, 490/4.8} \node[num] (b\v) at (\x,0) {$\v$};
+  \node[num] (bdots) at (6.0,0) {$\cdots$};
+  \node[num] (b815) at (7.2,0) {$815$};
+  \node[num] (b85) at (8.4,0) {$85$};
+  \draw[blue!60!black] (b35) -- node[below, ws] {$900$} (b865);
+  \draw[blue!60!black] (b865) -- node[below, ws] {$1600$} (b735);
+  \draw[blue!60!black] (b735) -- node[below, ws] {$1225$} (b490);
+  \draw[blue!60!black] (b490) -- (bdots) -- (b815);
+  \draw[blue!60!black] (b815) -- node[below, ws] {$900$} (b85);
+\end{scope}
+\draw[->, red!70!black, thick] (a65.south) .. controls (8.4,-2.05) and (1.2,-1.85) .. node[pos=0.5, fill=white, inner sep=1pt, font=\scriptsize] {junction: $65+35=10^2$} (b35.north);
+\node[font=\scriptsize, align=left, anchor=west] at (9.2,-1.95)
+  {inside a segment:\\ $25\times$(base sums)\\ $900=25\cdot(1+35)$\\ $1600=25\cdot(35+29)$\\ $1225=25\cdot(29+20)$};
+\end{tikzpicture}

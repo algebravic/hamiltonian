@@ -1,0 +1,29 @@
+* Sort/Merge
+
+The sort/merge approach to processing DP states is the following:
+
+There are a number of workers (threads), when they need a new piece of
+work it's derived as follows:
+
+1) Produce next step DP states from the current step.
+2) Distributing the new DP states via radix sort
+3) Processing a bucket of new radix sorted states, by using sorting
+   and some state merging.
+4) Mergeing all of the sort/merged buckets
+
+Note that the processing in (4) cannot be done until all of the
+earlier processes finish.
+
+Accordingly, one can think of having work queues from which an idle worker
+can pick up a new piece of work.
+
+There is a queue from (1) to (2) (though they may be interleaved).
+There is a queue from  (2) to (3).
+It is not necessary, nor desirable, that the queue of work for (4)
+remain in virtual memory. This implicitly defers to the OS paging
+policy, but we know that none of these buckets need be in memory until
+phase (4).
+
+Can you rearchitect the sort/merge to use this paradigm. What is the
+relative efficiency of directly writing and reading to external memory
+as opposed to allowed the OS to page?

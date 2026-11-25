@@ -1,0 +1,13 @@
+#+Title: Ideas for organizing the Hamiltonian Path Counting
+
+* Allow redundant states
+The major bottleneck in processing is the large merge that takes place
+at the end of each step. Right now we get some state merging by using
+the radix distribution of 8 bits, and sorting within a page. We then
+do a large merge on those reduced pages. If we didn't do the merge
+things would still be correct. I'd like to measure how much of
+reduction in the state space we get by doing the merge, as opposed to
+the in page sorting. In addition, it might make sense to using a
+variable number of bits for the radix distribution depending on the
+size of the state space. Can you instrument a version of ham_dp_c.c to
+find out how much of a reduction we get by doing the merge?
