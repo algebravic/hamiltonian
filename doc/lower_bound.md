@@ -1808,3 +1808,174 @@ Files are in `~/Programming/Combinatorics/hamiltonian`:
 - `hamiltonian/claude/tune_params.py`
 - `tests/test_sm_crt.py`
 - `doc/sm_overflow_plan.md`
+
+Question
+========
+Look at `data/linux/new_74_sm_new_instrumented.txt`
+
+Answer
+======
+The instrumented run gave the right answer in 684.6 s. Every step stayed in RAM; none spilled to SSD.
+
+**Correction:** the counts first wrapped at step 68, not the last step. The message only prints at the end. That's when the table had 48 M states. Its saved copy was 0.77 GB, under the 1 GiB limit, so only steps 68–73 were replayed mod 2⁶¹−1, which took 5.2 s (0.8% of the run).
+
+**Where the time went, against the best April run.** The April run is `profile_74new.txt` (MaxSAT ordering, old code). Compute and flush are summed per-step maxima across the 64 workers.
+
+| | April | now | per unit of work |
+|---|---|---|---|
+| total DP | 950 s | 679 s | |
+| work W = Σ states_in · 2^n_back | 131.4 G | 108.5 G | ordering: −17% |
+| compute (sweep) | 496 s | 295 s | 242 → 174 ns per subset·thread (−28%) |
+| flush (radix sort) | 289 s | 198 s | 364 → 258 ns per raw entry·thread (−29%) |
+| final merge | 237 s | 118 s | 4.65 → 2.40 ns per raw entry (−48%) |
+| unattributed | ~0 | 67 s | |
+
+How I read it:
+- **Ordering.** The kpw work ordering cuts the work by 17% (raw output is about the same, 49 G against 51 G entries).
+- **Merge.** A1 roughly halves the merge cost per entry. It is the only change aimed at that phase, but I can't separate it cleanly from other differences. In April every worker made a single run, so the serial per-worker merge (A0's target) cost nothing in either run. The gain is in the final merge and in how its output is allocated.
+- **Compute and flush.** Both got about 28% faster per unit of work, and none of my changes touch them. Likely causes:
+  - the smaller worker buffer that tune_params chose (32 M entries against, I believe, the 128 M in `n75_linux.yaml`), which means fewer page faults on large freshly allocated buffers;
+  - the other user who was on the machine in April.
+
+  I can't tell these apart from these two logs.
+
+**Memory.** The merge's peak was at most 56 GB (step 48) against a 752 GB budget. With that much headroom, A1 chose the largest release granule, 64 MB. That is bigger than each thread's slice of a run (about 5 MB), so it never released input early. The peak was therefore about R + the output, roughly 1.3 R. That's the intended behaviour: it only trades speed for memory when memory is tight. The predicted peak of about 2R is a deliberately loose upper bound. A1 will only really be exercised at n = 75.
+
+**What's left.** Compute is 43% of the time and is limited by arithmetic, not memory. Flush is 29% and is the radix sort, which the C redesign in the plan targets. Two cheap experiments would settle the attribution:
+1. Same kpw ordering and same new `machine.yaml`, but with `HAM_SM_MERGE=a0`. That reproduces the old merge path and isolates A1.
+2. Same ordering, but with the old hand-tuned yaml. That isolates the tuning effect on compute and flush.
+
+The instrumentation line now prints `n_runs=0` under A1, because the
+runs are freed before the line is printed. I'll fix that with whatever
+comes next.
+
+Question
+========
+I'm running n=75 now with the new code. It just finished step 43 in
+709 seconds up until then.
+
+Answer
+======
+That's a big improvement. The April n = 75 run (`profile_75log.txt`, MaxSAT ordering) had taken 1,929 s by the end of step 43, so the new code is 2.7× faster to that point.
+
+Step 43 doesn't mark the same amount of work in the two runs, though, because the orderings differ. In April, step 43 was only 33% of the way through the 5,851 s total. The run peaked at 3.8 G states at step 41, and the expensive steps ran from about 37 to 62. Most of the cost, including the RAM steps where the serial merge took about half the time, came after step 43. So I wouldn't extrapolate the total from this yet.
+
+Two things to look for when it finishes:
+
+- **Memory.** In the `[inst] ram_merge:` lines, compare `hwm` with `R` and `budget` on the large steps. At n = 74 A1 never needed to release input, because memory was ample. n = 75 is where the release granule G should shrink, and where the measured peak would show whether A1 stays near R.
+- **Overflow.** A wrap is very likely, since H(75) ≈ 6.5·10²⁰ > 2⁶⁴. One prime still certifies it: the Brégman bound is 2^116.3, below the 2^125 modulus. It will be cheap only if the first wrap happens at a step small enough to fit the 1 GiB snapshot (64 M states). Otherwise you'll see "full reruns" in the stderr note, which would double the run time.
+
+If that full rerun would be unwelcome, the snapshot limit can be
+raised with `crt_snap_bytes`. For example, 32 GB covers about 2 G
+states; RAM is not binding at these sizes. It can't be changed on the
+run already in progress, but you can still compare against the April
+step table now if you send me the output so far.
+
+Question
+========
+Look at `data/linux/new_75_sm_new.txt` for the partial run up until
+now.
+
+Answer
+======
+Up to step 44 the run looks good: 980 s against 2,190 s for the April run at the same step. That isn't a like-for-like comparison, because the kpw ordering produces bigger tables. The peak so far is 7.15 G states at step 44, against April's 3.8 G peak for the whole run.
+
+**Breakdown so far.** Of the 980 s, compute is 36%, flush 20% and merge 35%. 97 s is not attributed to any phase. The four steps that spilled to SSD (40, 41, 42 and 44) account for 694 s, or 71%.
+
+**A1 under real memory pressure (step 43).** This is the first step where A1 had to adapt:
+- R = 135 GB of runs; it picked a 31 MB release granule and the predicted peak was 272 GB.
+- The measured peak was 231 GB, about R plus the output, against a 752 GB budget.
+- It still released nothing early. With K = 320 runs, each thread's slice of a run is about 6.6 MB, smaller than the 31 MB granule, so release only happens when a thread finishes. That is consistent with the bound, and memory was nowhere near binding.
+- The merge took 18.4 s plus 13.5 s of copy, for 9.1 G raw entries.
+
+**The SSD spills look unnecessary.** The RAM-or-SSD test, `sm_should_use_ext`, decides before the sweep and assumes three things:
+- every one of the 2^n_back subsets of back edges is valid;
+- every worker fills a whole number of buffers;
+- the merge needs 2 × raw.
+
+The actual raw output is about a third of its estimate. For step 40 it estimates 412 GB of runs and an 824 GB merge, so it goes to SSD. What was really needed:
+
+| step | states_in | raw (actual) | RAM path peak: max(sweep, A1 merge) | decision |
+|---|---|---|---|---|
+| 40 | 3.09 G | 8.5 G (136 GB) | ≈ 248 GB | SSD |
+| 41 | 3.88 G | 9.7 G (156 GB) | ≈ 282 GB | SSD |
+| 42 | 5.33 G | 7.3 G (117 GB) | ≈ 267 GB | SSD |
+| 44 | 6.67 G | 19.4 G (310 GB) | ≈ 481 GB | SSD |
+
+Here the sweep peak is the input table plus 64 GB of worker buffers plus the runs, and the merge peak is about R + N. Every one of these would have fit in 752 GB.
+
+Judging by step 43, which stayed in RAM and took 83 s for 9.1 G raw entries, these four steps would have taken roughly 70–90 s each (step 44 around 170 s) instead of 115–271 s. That would have saved something like 300–350 s already, with more of these steps still to come. This is an extrapolation from one step, not a measurement.
+
+**What I'd propose next:** decide during the sweep, not before it. Every run starts in RAM. A shared counter tracks the bytes of RAM runs, and once a run would push the predicted A1 peak past the budget, that worker writes its remaining runs to SSD.
+- The merge then reads a mix of RAM and SSD runs. A1's merge already works on any array it can point to, and the SSD runs are memory-mapped, so it needs only a small generalisation.
+- It cannot run out of memory, because it is driven by measured sizes rather than an estimate, and it only spills when memory is genuinely short.
+- A step-level estimate based on the previous step's measured growth would be simpler, but it isn't safe: growth varies a lot from step to step.
+
+**About the CRT.** With 7 G states in the middle of the run, the first wrap is likely to come at a step much larger than the 1 GiB snapshot (64 M states). If so, recovery will be a full rerun mod 2⁶¹−1, which roughly doubles the time. On this machine `crt_snap_bytes` could safely be tens of GB. For future runs I'd add a `ham_count` option for it, or raise the default to RAM/16.
+
+Shall I write the design for the in-sweep spill decision, plus the
+snapshot option, before implementing?
+
+Question
+========
+Do the design for in-sweep spill plus snapshot. Right now n=75 just
+finished step 49 in time 1723 seconds.
+
+I've written the design to `doc/sm_spill_snapshot_design.md`; nothing is implemented yet. Step 49 at 1,723 s compares with 3,434 s for April's run, about 2× faster at that point.
+
+First, a correction: the "ext" steps never went to SSD. The ext store is anonymous memory, so RAM, or swap if the machine has any; it only falls back to a disk temp file if that memory can't be reserved. What makes ext steps slow is their older merge: about 6–7 ns per raw entry, against 3.5 ns for A1. My conclusion stands, though. Steps 40–44 took the slow path because an estimate made before the sweep was 3× too pessimistic.
+
+**The design:**
+1. **One run layout, decided while the sweep runs.** A shared counter tracks the bytes of runs held in RAM. When a worker flushes a run, it keeps it in RAM if the step still fits: input table + worker buffers + snapshot + 4 GiB reserve + the smallest merge plan. Otherwise it writes that one run to real disk. This rule bounds memory by construction, with no estimate of the step's output. The old pre-sweep decision (`sm_should_use_ext`) is retired; the old ext merge stays for one release behind `HAM_SM_LAYOUT=ext` for comparison.
+2. **Real disk spill.** Each worker gets one deleted-on-open file in `--spill-dir` (default `$TMPDIR`). A1 learns to read buffered file streams alongside RAM streams, and the page cache is dropped after each read. Spilling happens only when RAM is genuinely short.
+3. **Snapshots only where a wrap is possible.** Every count after step s is at most U_s = 2^n_back × (sum of the step's input counts). That sum is exact in 128 bits and costs one add per entry. So if U_s < 2⁶⁴, step s provably cannot wrap.
+   - **One anchor snapshot** at the first step where U_s ≥ 2⁶⁴. It's kept in RAM up to `--crt-snap-gb`, by default min(RAM/16, 64 GiB), which is 47 GB on the Linux machine. If bigger, it's written once to disk.
+   - **Smaller rolling snapshots** after that, as now, until the first actual wrap.
+   - **The cost:** a replay never costs more than a full rerun, and usually much less.
+4. **New per-step instrumentation:** RAM run bytes, spilled runs, U_s, the snapshot taken, and A1's RAM and file stream counts. It also fixes the bogus `n_runs=0` in the logs.
+
+There are tests for spill (none, partial, all), for the U_s inequality (exact under the 2^b test hook), and for the CRT with the anchor in RAM, on disk, and absent.
+
+From step 43's rate, the fast path would have saved roughly 300–350 s by step 44, with more on the later big steps; that's an extrapolation from one step. Out of scope: a step whose output table alone doesn't fit in RAM. It would now fail early with a clear message instead of swapping.
+
+Two questions:
+- Does the Linux machine have swap, and where does `TMPDIR` point? This matters for the default spill directory, and it might explain April's "running out of storage".
+- Should I go ahead with implementing this?
+
+Question
+========
+Go ahead and implement it. I just checked TMPDIR is not set. The temp files are ending up /tmp . I can see the compiled c files from the run there.
+
+Answer
+======
+The in-sweep spill and the new CRT snapshots are implemented and in the repo. The tests pass here and on the aarch64 Linux VM. Your n=75 run is unaffected: it is using the library it compiled at start-up.
+
+**The 100% CPU you saw.** In "ext" steps the merge itself runs in parallel. Before it, a serial loop sets up the buffers, and after it, one serial `memmove` packs the threads' outputs together. At step 44 that `memmove` moves about 110 GB, and that is the 100% phase. The new merge has neither; it writes per-thread chunks and copies them into place in parallel. A second serial phase happened on every path: freeing the input table, a single `munmap` of up to ~100 GB, which the kernel does on one core. Tables of 1 GiB or more are now released by all threads first.
+
+**What's new:**
+- **Spill decision during the sweep.** Every step keeps its runs in RAM and uses the new merge. When a worker finishes a run, it keeps it only if the step still fits its memory budget. Otherwise the run is appended to that worker's spill file, which is deleted as soon as it's created. The merge reads RAM and spilled runs together.
+  - The spill directory is `--spill-dir`, defaulting to `$TMPDIR` and then `/tmp`. If the directory is tmpfs (i.e. RAM), the code prints a warning. Please check whether `/tmp` on that machine is tmpfs.
+- **CRT snapshots** follow the rigorous bound from the design. The DP now sums each step's input counts exactly in 128 bits.
+  - The anchor snapshot is taken at the first step where a wrap becomes possible. It's kept in RAM up to `--crt-snap-gb`, by default min(RAM/16, 64 GiB), or about 47 GB on that machine. A larger one is written once to the spill directory.
+  - After that, rolling snapshots of up to 1 GiB follow until the first wrap.
+- **The old merge as fallback is gone.** Even the new merge's smallest plan peaks lower, and the old merge can't read spilled runs. This also fixed a crash: the old fallback aborted on a step with no runs at all.
+- **The old layout** is still available with `HAM_SM_LAYOUT=ext`, for comparison.
+- **Instrumentation** now shows per step: run counts with spilled runs and bytes, the spill limit, the snapshot taken, and the new merge's RAM and file stream counts. `n_runs` is now the total over all workers.
+
+**Tests:**
+- In `tests/test_sm_merge.py`, per-step state checksums are identical across all variants at n = 36 and 41: no spill, partial spill, everything spilled, the old layout, and nominal RAM so low that every run spills.
+- `tests/test_sm_crt.py` checks the CRT with the anchor in RAM and on disk. It also checks that the first wrap never comes before the first step where a wrap was possible. With 12-bit counts, for example, a wrap was first possible at step 12 and first happened at step 25.
+- At n = 47, per-step checksums match the unmodified code with and without spilling. With a 0.2 GB spill limit, 1,246 runs were spilled and peak memory dropped from 1,069 MB to 959 MB. That run took 41 s, against 66 s for the old code.
+
+The cost: the anchor can hold up to 47 GB of RAM for the rest of the run, and that is taken off every later step's budget. `--crt-snap-gb 0` sends it to disk instead.
+
+On the n = 75 run's remaining steps, I'd expect every step to stay in RAM with no spilling; `top` should show the merge phase near 6000%.
+
+Files are in `~/Programming/Combinatorics/hamiltonian`:
+- `hamiltonian/claude/ham_dp_c.c`
+- `hamiltonian/claude/ham_dp_c.py`
+- `hamiltonian/claude/ham_count.py`
+- `tests/test_sm_merge.py`
+- `tests/test_sm_crt.py`
+- `doc/sm_spill_snapshot_design.md`
+
