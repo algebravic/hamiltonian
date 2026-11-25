@@ -1,4 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
+#ifdef __linux__
+#  define _DEFAULT_SOURCE    /* expose madvise()/MADV_* (glibc hides them under
+                                strict POSIX; posix_madvise(DONTNEED) is a no-op) */
+#endif
 #ifdef __APPLE__
 #  define _DARWIN_C_SOURCE   /* expose MAP_ANON and other BSD extensions */
 #endif
@@ -539,7 +543,7 @@ static u128 *eh_lookup(EHT *t, u64 key) {
    - Periodic flush triggers at RSORT_FLUSH_THRESH total entries and after
      every sweep, preserving hash-order locality.
    - Fixed per-slot capacity: if a slot overflows, flush immediately.
-   - Total footprint: RSORT_FLAT_N × 24 B ≈ 480 MB (constant, no growth).
+   - Total footprint: RSORT_FLAT_N × 32 B ≈ 640 MB (WEntry = u64+u128, 16-aligned) (constant, no growth).
    ====================================================================== */
 #ifndef RSORT_BITS
 #define RSORT_BITS       10                     /* tuned at compile time     */
@@ -1280,7 +1284,7 @@ void count_ham_paths_peh(
    Buffer cap: sm_cfg.worker_cap entries per worker buf.  For large n where
    bpt = chunk*2^n_back would exceed this, the worker accumulates multiple
    sorted runs instead of one big allocation.  This bounds peak memory to
-       curr + P * 2 * sm_cfg.worker_cap * 24B
+       curr + P * 2 * sm_cfg.worker_cap * 16B
    regardless of state count, preventing the OOM seen at n=61 step 37+.
    ====================================================================== */
 
@@ -1415,9 +1419,9 @@ static size_t sm_merge(SMStream *S, int P, SMEntry *out) {
    Speedup ≈ sm_cfg.bb_buf = 32×.  On large steps this converts the merge
    from latency-stall-bound (7% CPU) to bandwidth-bound (80%+ CPU).
 
-   Buffer pool per call:  K × sm_cfg.bb_buf × 24B
-     K=6  (parallel merge):  6×32×24 =  4.6 KB  → L1
-     K=19 (ext merge runs): 19×32×24 = 14.6 KB  → L1
+   Buffer pool per call:  K × sm_cfg.bb_buf × 16B
+     K=6  (parallel merge):  6×32×16 =  3.1 KB  → L1
+     K=19 (ext merge runs): 19×32×16 =  9.7 KB  → L1
    Both fit in L1; no heap allocation needed for K≤512.        */
 
 
@@ -1754,20 +1758,31 @@ static void sm_introduce(SMTab *tab, int fs) {
 /* ── SM worker (capped buffer + run accumulation) ───────────────────── */
 
 /* Per-worker buffer cap (entries).  Bounds peak RAM to
-   curr + P * 2 * sm_cfg.worker_cap * 24B regardless of state count.
+   curr + P * 2 * sm_cfg.worker_cap * 16B regardless of state count.
    32M entries = 768 MB per worker buf; total 6*2*768MB = 9.2 GB.       */
 
 typedef struct { SMEntry *data; size_t len; size_t alloc_size; } SMRun;
 
-/* Align to cache line (128B on Apple Silicon, 64B on x86).
+/* Align per-thread mutable state to the false-sharing granularity.
    Without this, all workers share 2-3 cache lines, and mid-compute
    flushes by one worker invalidate neighbouring workers' buf_len fields,
-   causing 3-4× slowdown specifically at n_runs=2 steps.               */
-#if defined(__APPLE__) && defined(__aarch64__)
-#  define SM_CACHE_ALIGN __attribute__((aligned(128)))
-#else
-#  define SM_CACHE_ALIGN __attribute__((aligned(64)))
-#endif
+   causing 3-4x slowdown specifically at n_runs=2 steps.
+   128 B on every platform: Apple Silicon lines are 128 B, and on x86
+   (Intel, AMD Zen) the adjacent-line prefetcher pairs 64 B lines, so the
+   destructive-interference unit is 128 B there too.
+   The attribute only pads sizeof(); the arrays must also be allocated
+   with sm_aligned_calloc (calloc/malloc guarantee just 16 B).          */
+#define SM_ALIGN_BYTES 128
+#define SM_CACHE_ALIGN __attribute__((aligned(SM_ALIGN_BYTES)))
+
+static void *sm_aligned_calloc(size_t n, size_t size) {
+    void *p = NULL;
+    size_t bytes = n * size;
+    if (bytes == 0) bytes = SM_ALIGN_BYTES;
+    if (posix_memalign(&p, SM_ALIGN_BYTES, bytes) != 0) return NULL;
+    memset(p, 0, bytes);
+    return p;
+}
 
 typedef struct SM_CACHE_ALIGN {
     /* worker scratch (reused across runs) */
@@ -1888,7 +1903,7 @@ static void sm_ext_close(int fd, void *map, size_t capacity_bytes) {
 /* ── Streaming ext-mode merge ─────────────────────────────────────────
    Merges n_runs sorted runs (stored in a file or mmap) into a single
    sorted+deduped array, reading each run through a small buffer.
-   Peak extra RAM = n_runs × sm_cfg.ext_stream_buf × 24B (e.g. 31 × 24MB = 744MB)
+   Peak extra RAM = n_runs × sm_cfg.ext_stream_buf × 16B (e.g. 31 × 24MB = 744MB)
    vs loading all runs simultaneously (e.g. 2.7 GB for step 38).
    Large sequential reads → OS readahead → near-SSD-peak bandwidth.     */
 
@@ -1944,7 +1959,7 @@ typedef struct {
     size_t          mchunk;
 } SMWorkQueue;
 
-typedef struct {
+typedef struct SM_CACHE_ALIGN {
     const SMEntry   *in;
     size_t           lo, hi;
     int              fs, v_idx;
@@ -2034,6 +2049,37 @@ static size_t sm_bucket_lower(const SMEntry *a, size_t n, int b) {
     return lo;
 }
 
+/* ── A0: bucket-parallel merge of one worker's RAM runs ───────────── */
+typedef struct {
+    SMWorkerState *ws;
+    int            n_runs, NB;
+    const size_t  *bnd;       /* n_runs x (NB+1) bucket boundaries        */
+    size_t        *in_off;    /* NB+1 upper-bound output offsets          */
+    size_t        *out_cnt;   /* NB actual output counts                  */
+    SMEntry       *out;
+    volatile int   next;      /* next bucket to claim                     */
+} SMMrJob;
+
+static void *sm_mr_thread(void *arg) {
+    SMMrJob *j = (SMMrJob *)arg;
+    SMStream *S = (SMStream *)malloc((size_t)j->n_runs * sizeof(SMStream));
+    if (!S) SM_OOM((size_t)j->n_runs * sizeof(SMStream));
+    for (;;) {
+        int b = __sync_fetch_and_add(&j->next, 1);
+        if (b >= j->NB) break;
+        int active = 0;
+        for (int i = 0; i < j->n_runs; i++) {
+            size_t lo = j->bnd[(size_t)i*(j->NB+1)+b];
+            size_t hi = j->bnd[(size_t)i*(j->NB+1)+b+1];
+            S[i] = (SMStream){ j->ws->runs[i].data + lo, 0, hi - lo };
+            if (hi > lo) active++;
+        }
+        j->out_cnt[b] = active ? sm_merge(S, j->n_runs, j->out + j->in_off[b]) : 0;
+    }
+    free(S);
+    return NULL;
+}
+
 /* ── sm_merge_runs: merge all runs → single sorted+deduped array ───── */
 static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
     if (ws->buf_len > 0) sm_flush_run(ws);
@@ -2041,7 +2087,7 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
     if (ws->ext_runs) {
         /* ── Ext path: streaming heap merge ────────────────────────── */
         /* Each run is read through a SM_EXT_STREAM_BUF-entry buffer.
-           Peak extra RAM = n_runs × sm_cfg.ext_stream_buf × 24B (small).
+           Peak extra RAM = n_runs × sm_cfg.ext_stream_buf × 16B (small).
            MAP_ANON gives RAM bandwidth; sequential access + hardware
            prefetch makes this fast without bucketing.                  */
         if (ws->n_runs == 0) { *out_len = 0; return NULL; }
@@ -2116,40 +2162,62 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
         SMEntry  *out = (SMEntry *)sm_alloc(out_bytes);
         SM_ALLOC_CHECK(out, out_bytes);
 
-        /* For each run, find the 257 bucket boundary indices via
-           binary search.  bounds[i][b] = first index in run i with
-           top byte >= b.  This costs O(n_runs × 256 × log(run_size))
-           ≈ negligible.                                                */
-        size_t (*bounds)[257] = malloc(n_runs * sizeof(*bounds));
-        SM_ALLOC_CHECK(bounds, n_runs * sizeof(*bounds));
+        /* A0 (memory-neutral parallelism): split the runs into NB hash
+           buckets (bucket = top log2(NB) bits of eh_hash, so buckets are
+           contiguous in every run and never share a key), merge the buckets
+           with T threads, each writing bucket b at its upper-bound offset
+           in[b] = sum over c<b of the bucket-c input sizes, then compact in
+           bucket order.  Extra memory: O(NB * n_runs) indices only, so the
+           peak is the same as the serial merge (all runs + this out).     */
+        int T  = sm_cfg.nthreads > 0 ? sm_cfg.nthreads : 1;
+        if (total < sm_cfg.par_merge_thresh) T = 1;
+        int lg = 8;
+        while (lg < 12 && (1 << lg) < 16 * T) lg++;
+        int NB = 1 << lg;
+        size_t *bnd = (size_t *)malloc((size_t)n_runs * (NB + 1) * sizeof(size_t));
+        SM_ALLOC_CHECK(bnd, (size_t)n_runs * (NB + 1) * sizeof(size_t));
+#define RB(i,b) bnd[(size_t)(i)*(NB+1)+(b)]
         for (int i = 0; i < n_runs; i++) {
             const SMEntry *d = ws->runs[i].data;
             size_t len       = ws->runs[i].len;
-            bounds[i][0]     = 0;
-            for (int b = 1; b <= 256; b++)
-                bounds[i][b] = (b <= 255)
-                    ? sm_bucket_lower(d, len, b)
-                    : len;
+            RB(i, 0) = 0;
+            for (int b2 = 1; b2 < NB; b2++)
+                RB(i, b2) = sm_lower_bound(d, len, (u64)b2 << (64 - lg));
+            RB(i, NB) = len;
         }
-
-        /* Allocate stream descriptors (one per run); reused across buckets. */
-        SMStream *S = (SMStream *)malloc(n_runs * sizeof(SMStream));
-
+        SMMrJob job = { .ws = ws, .n_runs = n_runs, .NB = NB, .bnd = bnd,
+                        .out = out, .next = 0 };
+        job.in_off  = (size_t *)malloc((size_t)(NB + 1) * sizeof(size_t));
+        job.out_cnt = (size_t *)calloc((size_t)NB, sizeof(size_t));
+        SM_ALLOC_CHECK(job.in_off, (size_t)(NB + 1) * sizeof(size_t));
+        SM_ALLOC_CHECK(job.out_cnt, (size_t)NB * sizeof(size_t));
+        job.in_off[0] = 0;
+        for (int b2 = 0; b2 < NB; b2++) {
+            size_t c = 0;
+            for (int i = 0; i < n_runs; i++) c += RB(i, b2+1) - RB(i, b2);
+            job.in_off[b2+1] = job.in_off[b2] + c;
+        }
+#undef RB
+        if (T > NB) T = NB;
+        if (T <= 1) {
+            sm_mr_thread(&job);
+        } else {
+            pthread_t *th = (pthread_t *)malloc((size_t)T * sizeof(pthread_t));
+            SM_ALLOC_CHECK(th, (size_t)T * sizeof(pthread_t));
+            for (int t = 0; t < T; t++) pthread_create(&th[t], NULL, sm_mr_thread, &job);
+            for (int t = 0; t < T; t++) pthread_join(th[t], NULL);
+            free(th);
+        }
+        /* Compact in bucket order: destination <= source, so memmove in
+           increasing b never overwrites an unmoved bucket.               */
         size_t write_pos = 0;
-        for (int b = 0; b < 256; b++) {
-            /* Set each stream to its bucket-b slice. */
-            int active = 0;
-            for (int i = 0; i < n_runs; i++) {
-                size_t lo = bounds[i][b], hi = bounds[i][b+1];
-                S[i] = (SMStream){ ws->runs[i].data + lo, 0, hi - lo };
-                if (hi > lo) active++;
-            }
-            if (active == 0) continue;
-            /* Small N-way merge for this bucket. */
-            write_pos += sm_merge(S, n_runs, out + write_pos);
+        for (int b2 = 0; b2 < NB; b2++) {
+            size_t c = job.out_cnt[b2];
+            if (c && job.in_off[b2] != write_pos)
+                memmove(out + write_pos, out + job.in_off[b2], c * sizeof(SMEntry));
+            write_pos += c;
         }
-
-        free(S); free(bounds);
+        free(job.in_off); free(job.out_cnt); free(bnd);
         for (int i = 0; i < n_runs; i++)
             sm_free(ws->runs[i].data);
         *out_len = write_pos;
@@ -2674,7 +2742,7 @@ static size_t sm_global_ext_merge_par(SMWorkerState *WS, int P,
      Old: curr + W_all + T_pair + OS    e.g. n=61 step 39 → 60 GB → swap
      New: curr + nxt  + stream_bufs     e.g. n=61 step 39 → 29 GB → no swap
 
-   where stream_bufs = total_streams × sm_cfg.ext_stream_buf × 24B.
+   where stream_bufs = total_streams × sm_cfg.ext_stream_buf × 16B.
    For step 39: 258 streams × 2978 entries (sized to fill SLC) = 141 MB.
 
    Per-stream buffer sizing (the Aiken et al. capacity-boundary principle):
@@ -2708,7 +2776,7 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
     if (dyn_buf > (size_t)(1 << 20))         dyn_buf = (size_t)(1 << 20);
 
     /* Allocate nxt with a RAM-safe initial capacity and grow ×1.5 as needed.
-       We cannot use raw_total: at n=61 step 39, raw_total=2B × 24B = 48GB
+       We cannot use raw_total: at n=61 step 39, raw_total=2B × 16B = 32GB
        which exceeds the 36GB M3 Pro.  curr->data has already been freed by
        the caller (sm_fused_sweep) so the available RAM is ~32GB.
        Starting at 64M entries and growing ×1.5 reaches 677M in 6 reallocs;
@@ -2852,6 +2920,23 @@ static size_t sm_global_ext_merge(SMWorkerState *WS, int P,
    raw_total conservatively as n_runs × CAP × P (full runs, no dedup).
    Using 2× raw_total as the threshold catches the W_all+nxt peak that was
    causing OOM on large steps (e.g. n=75 step 51: W_all+nxt ≈ 535 GB).   */
+/* ── Test support: per-step digest of the state table ─────────────── */
+static int sm_cksum_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("HAM_SM_CKSUM"); v = (e && *e == '1'); }
+    return v;
+}
+static void sm_cksum_print(int step, const SMEntry *a, size_t n) {
+    u64 h = 0, vs = 0; int sorted = 1;
+    for (size_t i = 0; i < n; i++) {
+        h  += eh_hash(a[i].key ^ (a[i].val * UINT64_C(0x9e3779b97f4a7c15)));
+        vs += a[i].val;
+        if (i && !(eh_hash(a[i-1].key) < eh_hash(a[i].key))) sorted = 0;
+    }
+    fprintf(stderr, "[cksum] step=%d cnt=%zu h=%016llx vsum=%016llx sorted=%d\n",
+            step, n, (unsigned long long)h, (unsigned long long)vs, sorted);
+}
+
 static int sm_should_use_ext(size_t si, int nb, size_t ram_bytes) {
     size_t P   = sm_cfg.nthreads;
     size_t CAP = sm_cfg.worker_cap;
@@ -2867,6 +2952,363 @@ static int sm_should_use_ext(size_t si, int nb, size_t ram_bytes) {
     if (ram_bytes <= os_head + curr_bytes + bufs_bytes) return 1;
     size_t avail = ram_bytes - os_head - curr_bytes - bufs_bytes;
     return merge_peak > avail;
+}
+
+/* ======================================================================
+   A1: global RAM merge with streaming release (memory-budgeted)
+   ----------------------------------------------------------------------
+   Replaces "per-worker sm_merge_runs, then P-way merge" on the RAM path.
+   All K = sum(n_runs) sorted runs are split into T hash ranges by sampled
+   splitters; thread t merges its K sub-streams.  As a thread advances
+   through a run it returns the pages it has consumed to the OS
+   (madvise), and it writes its output into private chunks of C bytes.
+   Afterwards nxt is allocated at the exact deduplicated size and each
+   thread copies its chunks into place, freeing them as it goes.
+
+   Resident-memory bound (proved by construction, checked by the HWM
+   instrumentation):
+     merge phase:  R + T*K*(G + 2*page) + R_small + T*C
+     copy phase:   N + T*C + (pages straddling slice ends, freed first)
+   where R = bytes of all runs, N = bytes of nxt, G = release granule,
+   R_small = bytes of runs too small to release safely.  Today's RAM
+   path needs ~2R.  T and G are chosen from the memory budget; if no
+   T >= 1 fits, the caller falls back to A0 (serial workers, bucket-
+   parallel inside each) followed by the existing P-way merge.
+
+   Overrides for testing: HAM_SM_MERGE=a0|a1|auto,
+   HAM_SM_MERGE_BUDGET=<bytes> (replaces ram_bytes - 4 GB).
+   ====================================================================== */
+
+#ifdef __APPLE__
+#  define SM_RELEASE_MIN   ((size_t)SM_LARGE_THRESHOLD)  /* sm_alloc -> mmap */
+#  ifdef MADV_FREE_REUSABLE
+#    define SM_MADV_RELEASE MADV_FREE_REUSABLE
+#  else
+#    define SM_MADV_RELEASE MADV_FREE
+#  endif
+#else
+   /* glibc serves every request >= 32 MiB (DEFAULT_MMAP_THRESHOLD_MAX) with
+      its own mmap, so whole interior pages can be returned safely.        */
+#  define SM_RELEASE_MIN   ((size_t)32 << 20)
+#  define SM_MADV_RELEASE  MADV_DONTNEED
+#endif
+
+typedef struct {
+    int    T;            /* merge threads                                   */
+    size_t G;            /* release granule, bytes                          */
+    size_t C;            /* output chunk, bytes                             */
+    size_t R, R_small;   /* bytes of all runs / of non-releasable runs      */
+    size_t pred_peak;    /* predicted resident bound for the merge phase    */
+    size_t budget;       /* memory budget used                              */
+} SMA1Plan;
+
+static size_t sm_page_bytes(void) {
+    static size_t pg = 0;
+    if (!pg) { long v = sysconf(_SC_PAGESIZE); pg = v > 0 ? (size_t)v : 4096; }
+    return pg;
+}
+
+/* Returns 1 and fills *p if A1 should be used for this step. */
+static int sm_a1_plan(SMWorkerState *WS, int P, size_t ram_bytes, SMA1Plan *p) {
+    const char *mode = getenv("HAM_SM_MERGE");
+    if (mode && !strcmp(mode, "a0")) return 0;
+    int force = (mode && !strcmp(mode, "a1"));
+    size_t pg = sm_page_bytes();
+    size_t R = 0, R_small = 0; int K = 0;
+    for (int i = 0; i < P; i++)
+        for (int r = 0; r < WS[i].n_runs; r++) {
+            size_t b = WS[i].runs[r].len * sizeof(SMEntry);
+            R += b; K++;
+            if (WS[i].runs[r].alloc_size < SM_RELEASE_MIN) R_small += b;
+        }
+    if (K == 0) return 0;
+    size_t os_head = (size_t)4 << 30;
+    size_t B = ram_bytes > os_head ? ram_bytes - os_head : 0;
+    const char *bud = getenv("HAM_SM_MERGE_BUDGET");
+    if (bud && *bud) B = (size_t)strtoull(bud, NULL, 10);
+    size_t C = (size_t)32 << 20;                  /* output chunk           */
+    if (C > R / 8 + pg) C = (R / 8 + pg) & ~(pg - 1);
+    if (C < pg) C = pg;
+    int T = sm_cfg.nthreads > 0 ? sm_cfg.nthreads : 1;
+    if (R / sizeof(SMEntry) < sm_cfg.par_merge_thresh) T = 1;
+    size_t Gmin = (size_t)64 << 10, Gmax = (size_t)64 << 20;
+    if (Gmin < pg) Gmin = pg;
+    size_t G = 0;
+    for (; T >= 1; T = (T > 1 ? T / 2 : 0)) {
+        size_t fixed = R + R_small + (size_t)T * C;
+        if (B <= fixed) continue;
+        size_t H = B - fixed;                     /* left for release slack */
+        size_t per = H / ((size_t)T * (size_t)K);
+        if (per <= 2 * pg) continue;
+        G = per - 2 * pg;
+        if (G < Gmin) continue;
+        if (G > Gmax) G = Gmax;
+        G &= ~(pg - 1);
+        break;
+    }
+    if (T < 1) {
+        if (!force) return 0;
+        T = 1; G = Gmin;                          /* forced: smallest plan  */
+    }
+    p->T = T; p->G = G; p->C = C; p->R = R; p->R_small = R_small;
+    p->budget = B;
+    /* resident <= R + (consumed but unreleased) + partial chunks, and the
+       unreleased part is <= G + 2 pages per large sub-stream plus all of
+       the small runs, and never more than R.                             */
+    size_t unrel = (size_t)T * (size_t)K * (G + 2 * pg) + R_small;
+    if (unrel > R) unrel = R;
+    p->pred_peak = R + unrel + (size_t)T * C;
+    return 1;
+}
+
+typedef struct {
+    const SMEntry *buf;      /* slice base                                   */
+    size_t         pos, len; /* position and length within the slice          */
+    uintptr_t      rel;      /* released up to here (page aligned)            */
+    uintptr_t      rel_end;  /* never release at or beyond this               */
+    size_t         next_chk; /* pos at which to try the next release          */
+} SMRStream;
+
+static inline void sm_rs_release(SMRStream *s, size_t G_entries, size_t pg) {
+    uintptr_t end = ((uintptr_t)(s->buf + s->pos)) & ~(uintptr_t)(pg - 1);
+    if (end > s->rel_end) end = s->rel_end;
+    if (end > s->rel) {
+        madvise((void *)s->rel, end - s->rel, SM_MADV_RELEASE);
+        s->rel = end;
+    }
+    s->next_chk = s->pos + G_entries;
+}
+
+typedef struct SM_CACHE_ALIGN {
+    SMRStream *S; int K;
+    size_t     G_entries, C_entries, pg;
+    SMEntry  **chunks; int n_chunks, cap_chunks;
+    size_t     last_fill;     /* entries used in the last chunk              */
+    size_t     out_cnt;       /* total entries written                       */
+    size_t     dst_off;       /* exact offset in nxt (set before copy)       */
+    SMEntry   *dst;
+} SMA1Job;
+
+static inline SMEntry *sm_a1_slot(SMA1Job *j) {
+    if (j->n_chunks == 0 || j->last_fill == j->C_entries) {
+        if (j->n_chunks == j->cap_chunks) {
+            j->cap_chunks = j->cap_chunks ? 2 * j->cap_chunks : 16;
+            j->chunks = (SMEntry **)realloc(j->chunks, (size_t)j->cap_chunks * sizeof(SMEntry *));
+            if (!j->chunks) SM_OOM((size_t)j->cap_chunks * sizeof(SMEntry *));
+        }
+        SMEntry *c = (SMEntry *)sm_alloc(j->C_entries * sizeof(SMEntry));
+        SM_ALLOC_CHECK(c, j->C_entries * sizeof(SMEntry));
+        j->chunks[j->n_chunks++] = c;
+        j->last_fill = 0;
+    }
+    return &j->chunks[j->n_chunks - 1][j->last_fill++];
+}
+
+static inline void sm_a1_pop(SMA1Job *j, SMRStream *s) {
+    s->pos++;
+    if (s->pos >= s->next_chk) sm_rs_release(s, j->G_entries, j->pg);
+}
+
+static void *sm_a1_merge_thread(void *arg) {
+    SMA1Job *j = (SMA1Job *)arg;
+    SMRStream *S = j->S;
+    SMHEntry *h = (SMHEntry *)malloc((size_t)j->K * sizeof(SMHEntry));
+    if (!h) SM_OOM((size_t)j->K * sizeof(SMHEntry));
+    int hs = 0;
+    for (int i = 0; i < j->K; i++)
+        if (S[i].len > 0) { h[hs].key = S[i].buf[0].key; h[hs].s = i; hs++; }
+    for (int i = hs/2-1; i >= 0; i--) sm_heap_sift(h, hs, i);
+    size_t op = 0;
+    while (hs > 0) {
+        int s = h[0].s;
+        SMEntry cur = S[s].buf[S[s].pos];
+        sm_a1_pop(j, &S[s]);
+        if (S[s].pos < S[s].len) { h[0].key = S[s].buf[S[s].pos].key; sm_heap_sift(h, hs, 0); }
+        else { h[0] = h[--hs]; if (hs > 0) sm_heap_sift(h, hs, 0); }
+        while (hs > 0 && h[0].key == cur.key) {
+            int s2 = h[0].s;
+            cur.val = SM_VAL_ADD(cur.val, S[s2].buf[S[s2].pos].val);
+            sm_a1_pop(j, &S[s2]);
+            if (S[s2].pos < S[s2].len) { h[0].key = S[s2].buf[S[s2].pos].key; sm_heap_sift(h, hs, 0); }
+            else { h[0] = h[--hs]; if (hs > 0) sm_heap_sift(h, hs, 0); }
+        }
+        *sm_a1_slot(j) = cur;
+        op++;
+    }
+    for (int i = 0; i < j->K; i++) {             /* release the remainder   */
+        S[i].pos = S[i].len;
+        sm_rs_release(&S[i], j->G_entries, j->pg);
+    }
+    free(h);
+    j->out_cnt = op;
+    return NULL;
+}
+
+static void *sm_a1_copy_thread(void *arg) {
+    SMA1Job *j = (SMA1Job *)arg;
+    SMEntry *d = j->dst + j->dst_off;
+    for (int c = 0; c < j->n_chunks; c++) {
+        size_t n = (c == j->n_chunks - 1) ? j->last_fill : j->C_entries;
+        memcpy(d, j->chunks[c], n * sizeof(SMEntry));
+        d += n;
+        sm_free(j->chunks[c]); j->chunks[c] = NULL;
+    }
+    free(j->chunks); j->chunks = NULL;
+    return NULL;
+}
+
+static int sm_u64_cmp(const void *a, const void *b) {
+    u64 x = *(const u64 *)a, y = *(const u64 *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* Merge all RAM runs of all workers into nxt (exact size).  Frees the
+   runs.  Returns the number of entries; fills timings.                  */
+static size_t sm_global_ram_merge(SMWorkerState *WS, int P, SMTab *nxt,
+                                  const SMA1Plan *pl,
+                                  double *t_merge_ms, double *t_copy_ms) {
+    size_t pg = sm_page_bytes();
+    int K = 0;
+    for (int i = 0; i < P; i++) K += WS[i].n_runs;
+    const SMEntry **base = (const SMEntry **)malloc((size_t)K * sizeof(*base));
+    size_t *blen = (size_t *)malloc((size_t)K * sizeof(size_t));
+    int    *relok = (int *)malloc((size_t)K * sizeof(int));
+    SMRun  **runp = (SMRun **)malloc((size_t)K * sizeof(SMRun *));
+    SM_ALLOC_CHECK(base, (size_t)K * sizeof(*base));
+    SM_ALLOC_CHECK(blen, (size_t)K * sizeof(size_t));
+    SM_ALLOC_CHECK(relok, (size_t)K * sizeof(int));
+    SM_ALLOC_CHECK(runp, (size_t)K * sizeof(SMRun *));
+    { int k = 0;
+      for (int i = 0; i < P; i++)
+          for (int r = 0; r < WS[i].n_runs; r++, k++) {
+              runp[k] = &WS[i].runs[r];
+              base[k] = WS[i].runs[r].data; blen[k] = WS[i].runs[r].len;
+              relok[k] = WS[i].runs[r].alloc_size >= SM_RELEASE_MIN;
+          } }
+    int T = pl->T;
+
+    /* Splitters: SM_SAMPLES_PER_STREAM hash samples per run. */
+    u64 *spl = NULL;
+    if (T > 1) {
+        size_t ns = 0, cap = (size_t)K * SM_SAMPLES_PER_STREAM;
+        u64 *smp = (u64 *)malloc(cap * sizeof(u64));
+        SM_ALLOC_CHECK(smp, cap * sizeof(u64));
+        for (int k = 0; k < K; k++) {
+            if (!blen[k]) continue;
+            for (int q = 0; q < SM_SAMPLES_PER_STREAM; q++) {
+                size_t idx = (size_t)q * (blen[k] - 1) / (SM_SAMPLES_PER_STREAM - 1);
+                smp[ns++] = eh_hash(base[k][idx].key);
+            }
+        }
+        qsort(smp, ns, sizeof(u64), sm_u64_cmp);
+        spl = (u64 *)malloc((size_t)(T - 1) * sizeof(u64));
+        SM_ALLOC_CHECK(spl, (size_t)(T - 1) * sizeof(u64));
+        for (int t = 0; t < T - 1; t++) {
+            size_t idx = ns ? (size_t)(t + 1) * ns / T : 0;
+            if (idx >= ns) idx = ns ? ns - 1 : 0;
+            spl[t] = ns ? smp[idx] : 0;
+            if (t && spl[t] <= spl[t-1]) spl[t] = spl[t-1] + 1;
+        }
+        free(smp);
+    }
+
+    SMA1Job   *J  = (SMA1Job *)sm_aligned_calloc((size_t)T, sizeof(SMA1Job));
+    /* Each thread's K stream cursors are written on every pop: give every
+       thread its own 128 B-aligned block so no line is shared.          */
+    size_t s_blk = ((size_t)K * sizeof(SMRStream) + SM_ALIGN_BYTES - 1)
+                   / SM_ALIGN_BYTES * SM_ALIGN_BYTES;     /* bytes per thread */
+    char *AS = (char *)sm_aligned_calloc((size_t)T, s_blk);
+    SM_ALLOC_CHECK(AS, (size_t)T * s_blk);
+#define A1S(t) ((SMRStream *)(AS + (size_t)(t) * s_blk))
+    size_t G_entries = pl->G / sizeof(SMEntry); if (!G_entries) G_entries = 1;
+    for (int k = 0; k < K; k++) {
+        size_t lo = 0;
+        uintptr_t run_lo = ((uintptr_t)base[k] + pg - 1) & ~(uintptr_t)(pg - 1);
+        uintptr_t run_hi = ((uintptr_t)(base[k] + blen[k])) & ~(uintptr_t)(pg - 1);
+        for (int t = 0; t < T; t++) {
+            size_t hi = (t == T - 1) ? blen[k] : sm_lower_bound(base[k], blen[k], spl[t]);
+            if (hi < lo) hi = lo;
+            SMRStream *s = &A1S(t)[k];
+            s->buf = base[k] + lo; s->pos = 0; s->len = hi - lo;
+            /* Release only whole pages inside this slice of a large run. */
+            uintptr_t a = ((uintptr_t)s->buf + pg - 1) & ~(uintptr_t)(pg - 1);
+            uintptr_t b = ((uintptr_t)(s->buf + s->len)) & ~(uintptr_t)(pg - 1);
+            if (a < run_lo) a = run_lo;
+            if (b > run_hi) b = run_hi;
+            if (!relok[k] || b <= a) { a = b = 0; }
+            s->rel = a; s->rel_end = b;
+            s->next_chk = G_entries;
+            lo = hi;
+        }
+    }
+    free(spl);
+
+    double t0 = now_ms();
+    pthread_t *th = (pthread_t *)malloc((size_t)T * sizeof(pthread_t));
+    SM_ALLOC_CHECK(th, (size_t)T * sizeof(pthread_t));
+    for (int t = 0; t < T; t++) {
+        J[t].S = A1S(t); J[t].K = K;
+        J[t].G_entries = G_entries; J[t].pg = pg;
+        J[t].C_entries = pl->C / sizeof(SMEntry);
+        if (T > 1) pthread_create(&th[t], NULL, sm_a1_merge_thread, &J[t]);
+    }
+    if (T > 1) for (int t = 0; t < T; t++) pthread_join(th[t], NULL);
+    else sm_a1_merge_thread(&J[0]);
+    double t1 = now_ms();
+
+    /* Inputs fully consumed: free them (also frees straddling pages). */
+    for (int k = 0; k < K; k++) { sm_free(runp[k]->data); runp[k]->data = NULL; }
+#undef A1S
+    free(AS); free(base); free(blen); free(relok); free(runp);
+
+    size_t N = 0;
+    for (int t = 0; t < T; t++) { J[t].dst_off = N; N += J[t].out_cnt; }
+    if (nxt->cap < N || !nxt->data) {             /* exact-size table       */
+        size_t c = N ? N : 1;
+        sm_free(nxt->data);
+        nxt->data = (SMEntry *)sm_alloc(c * sizeof(SMEntry));
+        SM_ALLOC_CHECK(nxt->data, c * sizeof(SMEntry));
+        nxt->cap = c;
+    }
+    for (int t = 0; t < T; t++) J[t].dst = nxt->data;
+    if (T > 1) {
+        for (int t = 0; t < T; t++) pthread_create(&th[t], NULL, sm_a1_copy_thread, &J[t]);
+        for (int t = 0; t < T; t++) pthread_join(th[t], NULL);
+    } else sm_a1_copy_thread(&J[0]);
+    double t2 = now_ms();
+    free(th); free(J);
+    nxt->cnt = N;
+    *t_merge_ms = t1 - t0; *t_copy_ms = t2 - t1;
+    return N;
+}
+
+/* Per-step peak resident memory.  Linux: VmHWM after resetting it via
+   /proc/self/clear_refs ("5").  Elsewhere: lifetime ru_maxrss.         */
+#include <sys/resource.h>
+static void sm_hwm_reset(void) {
+#ifdef __linux__
+    int fd = open("/proc/self/clear_refs", O_WRONLY);
+    if (fd >= 0) { if (write(fd, "5", 1) < 0) {} close(fd); }
+#endif
+}
+static double sm_hwm_gb(int *is_lifetime) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/status", "r");
+    if (f) {
+        char line[256]; long kb = -1;
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "VmHWM:", 6)) { kb = strtol(line + 6, NULL, 10); break; }
+        fclose(f);
+        if (kb >= 0) { *is_lifetime = 0; return kb / 1048576.0; }
+    }
+#endif
+    struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+    *is_lifetime = 1;
+#ifdef __APPLE__
+    return ru.ru_maxrss / 1073741824.0;          /* bytes on macOS */
+#else
+    return ru.ru_maxrss / 1048576.0;             /* KiB on Linux   */
+#endif
 }
 
 static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
@@ -2894,8 +3336,10 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     size_t bpt_per_worker  = chunk * ((size_t)1 << n_back);
     size_t ext_cap_bytes   = bpt_per_worker * sizeof(SMEntry);
 
-    SMWorker      *W  = (SMWorker*)calloc(P, sizeof(SMWorker));
-    SMWorkerState *WS = (SMWorkerState*)calloc(P, sizeof(SMWorkerState));
+    SMWorker      *W  = (SMWorker*)sm_aligned_calloc(P, sizeof(SMWorker));
+    SMWorkerState *WS = (SMWorkerState*)sm_aligned_calloc(P, sizeof(SMWorkerState));
+    SM_ALLOC_CHECK(W,  (size_t)P * sizeof(SMWorker));
+    SM_ALLOC_CHECK(WS, (size_t)P * sizeof(SMWorkerState));
     pthread_t     *T  = (pthread_t*)malloc(P * sizeof(pthread_t));
     pthread_mutex_t mu;
     pthread_mutex_init(&mu, NULL);
@@ -2980,7 +3424,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
 
         /* Free worker scratch buffers before the merge: they held pre-flush
            data and are no longer needed now that all runs are on SSD.
-           This saves P×2×sm_cfg.worker_cap×24B (4.6–9.2GB) during the merge,
+           This saves P×2×sm_cfg.worker_cap×16B (3–6GB) during the merge,
            making the peak curr+nxt+stream_bufs+OS independent of CAP.    */
         for (int i = 0; i < P; i++) {
             sm_free(WS[i].buf); WS[i].buf = NULL;
@@ -3021,7 +3465,7 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
            Free curr->data now: all workers have finished reading it.
            This saves curr_gb (up to 140 GB at n=75 step 44) during
            the sm_merge_runs + parallel-merge phase, which itself
-           needs up to raw_out×24B of run data simultaneously.
+           needs up to raw_out×16B of run data simultaneously.
            curr->data = NULL makes the outer free() a no-op.          */
         sm_free(curr->data); curr->data = NULL; curr->cap = 0;
 
@@ -3030,6 +3474,33 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         for (int i = 0; i < P; i++)
             for (int r = 0; r < WS[i].n_runs; r++)
                 after_run_dedup_total += WS[i].runs[r].len;
+
+        SMA1Plan a1;
+        int use_a1 = sm_a1_plan(WS, P, ram_bytes, &a1);
+        if (instrument) sm_hwm_reset();
+        if (use_a1) {
+            /* A1: one global, memory-budgeted parallel merge (see above). */
+            merge_path = "global_ram_a1";
+            raw_total = after_run_dedup_total;
+            double tm = 0, tc = 0;
+            int Kr = 0;
+            for (int i = 0; i < P; i++) Kr += WS[i].n_runs;
+            t_par0 = now_ms();
+            sm_global_ram_merge(WS, P, nxt, &a1, &tm, &tc);
+            t_par_merge = now_ms() - t_par0;
+            for (int i = 0; i < P; i++) { free(WS[i].runs); WS[i].runs = NULL; WS[i].n_runs = 0; }
+            if (instrument) {
+                int life = 0; double hwm = sm_hwm_gb(&life);
+                fprintf(stderr,
+                    "  [inst]   ram_merge: mode=a1 T=%d K=%d G=%zuKB C=%zuMB "
+                    "R=%.2fGB R_small=%.2fGB budget=%.1fGB pred_peak=%.2fGB "
+                    "%s=%.2fGB merge=%.0fms copy=%.0fms\n",
+                    a1.T, Kr, a1.G >> 10, a1.C >> 20,
+                    a1.R / 1073741824.0, a1.R_small / 1073741824.0,
+                    a1.budget / 1073741824.0, a1.pred_peak / 1073741824.0,
+                    life ? "maxrss_lifetime" : "hwm", hwm, tm, tc);
+            }
+        } else {
         for (int i = 0; i < P; i++) {
             double tm0 = now_ms();
             W[i].out = sm_merge_runs(&WS[i], &W[i].out_len);
@@ -3072,6 +3543,12 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
         t_par_merge = now_ms() - t_par0;
         free(pw_arrs);
         free(pw_lens);
+        if (instrument) {
+            int life = 0; double hwm = sm_hwm_gb(&life);
+            fprintf(stderr, "  [inst]   ram_merge: mode=a0 %s=%.2fGB\n",
+                    life ? "maxrss_lifetime" : "hwm", hwm);
+        }
+        }  /* end A0 path */
 
         /* Shrink nxt->data to deduped size.
            smtab_ensure allocated at raw_total (e.g. 474 GB for ext step 60),
@@ -3245,6 +3722,11 @@ void count_ham_paths_sm(
            the RAM path does not, so this handles both: free(NULL) is a no-op. */
         sm_free(curr->data); curr->data = NULL; curr->cap = 0; curr->cnt = 0;
         { SMTab *t = curr; curr = nxt; nxt = t; }
+
+        /* Optional per-step checksum (HAM_SM_CKSUM=1): order-independent
+           digest of the state table plus a strict-sortedness check, used by
+           the tests to compare merge implementations step by step.        */
+        if (sm_cksum_enabled()) sm_cksum_print(step, curr->data, curr->cnt);
 
         /* Update frontier */
         for (int e = n_elim-1; e >= 0; e--) {

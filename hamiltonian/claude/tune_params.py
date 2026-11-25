@@ -30,10 +30,88 @@ import struct, subprocess, sys, tempfile, time
 ap = argparse.ArgumentParser()
 ap.add_argument('--quick',  action='store_true')
 ap.add_argument('--output', default=None)
+ap.add_argument('--no-probe',   action='store_true',
+                help='skip src/C/cacheprobe (cache geometry measurement)')
+ap.add_argument('--probe-only', action='store_true',
+                help='only run cacheprobe and merge its keys into the existing '
+                     'machine.yaml next to --output (or ./machine.yaml)')
 ARGS = ap.parse_args()
 QUICK = ARGS.quick
 
-ENTRY = 24   # sizeof(SMEntry) = 3 × u64
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache geometry probe (src/C/cacheprobe.c)
+# ─────────────────────────────────────────────────────────────────────────────
+def run_cacheprobe(quick=False):
+    """Compile and run src/C/cacheprobe.c; return machine.yaml keys.
+
+    OS-reported values are used where present; measured ways/sets fill gaps.
+    Every level records where its numbers came from ('os', 'measured',
+    'os+measured').  The raw probe output is kept under _cacheprobe.
+    """
+    import pathlib, yaml as _y
+    src = pathlib.Path(__file__).resolve().parents[2] / "src" / "C" / "cacheprobe.c"
+    if not src.exists():
+        print(f"  cacheprobe: {src} not found; skipped")
+        return {}
+    exe = pathlib.Path(tempfile.mkdtemp()) / "cacheprobe"
+    cc = "gcc-15" if subprocess.run(["which", "gcc-15"], capture_output=True).returncode == 0 else "cc"
+    r = subprocess.run([cc, "-O2", "-pthread", "-o", str(exe), str(src)],
+                       capture_output=True, text=True)
+    if r.returncode:
+        print("  cacheprobe: compile failed:\n" + r.stderr); return {}
+    print("  Running cacheprobe" + (" (quick)" if quick else "") + " ...", flush=True)
+    r = subprocess.run([str(exe)] + (["--quick"] if quick else []),
+                       capture_output=True, text=True)
+    if r.returncode:
+        print("  cacheprobe failed:\n" + r.stderr); return {}
+    raw = _y.safe_load(r.stdout)["cacheprobe"]
+    osd, ms = raw.get("os", {}), raw.get("measured", {})
+    cache = {}
+    for lvl in ("L1d", "L2", "L3"):
+        o = dict(osd.get(lvl) or {})
+        ent = {k: v for k, v in o.items() if isinstance(v, int) and v > 0}
+        src_ = "os" if ent else "none"
+        m = ms.get(lvl) or {}
+        mw = m.get("ways", -1)
+        if "ways" not in ent and isinstance(mw, int) and mw > 0:
+            ent["ways"] = mw; src_ = "os+measured" if src_ == "os" else "measured"
+            ent["ways_confidence"] = m.get("confidence")
+            if lvl == "L1d" and m.get("sets", -1) > 0 and "sets" not in ent:
+                ent["sets"] = m["sets"]
+        elif isinstance(mw, int) and mw > 0:
+            ent["measured_ways"] = mw            # kept beside the OS value;
+            ent["measured_confidence"] = m.get("confidence")   # OS value is used
+        ent["source"] = src_
+        cache[lvl] = ent
+    out = {
+        "_cache": cache,
+        "_page_bytes": raw.get("page_bytes"),
+        "_coherence_bytes": ms.get("coherence_bytes"),
+        "_dczva_bytes": ms.get("dczva_bytes"),
+        "_dtlb_knees_pages": ms.get("dtlb_knees_pages"),
+        "_latency_knees_bytes": ms.get("latency_knees_bytes"),
+        "_cacheprobe": raw,
+    }
+    for lvl, ent in cache.items():
+        print(f"    {lvl}: {ent}")
+    print(f"    coherence granularity: {out['_coherence_bytes']} B; "
+          f"page {out['_page_bytes']} B; DC ZVA {out['_dczva_bytes']}")
+    return out
+
+if ARGS.probe_only:
+    import pathlib, yaml as _yaml
+    _yp = (pathlib.Path(ARGS.output).parent if ARGS.output else pathlib.Path.cwd()) / "machine.yaml"
+    _old = {}
+    if _yp.exists():
+        with open(_yp) as _f: _old = _yaml.safe_load(_f) or {}
+    _old.update(run_cacheprobe(QUICK))
+    with open(_yp, "w") as _f:
+        _yaml.dump(_old, _f, default_flow_style=False, sort_keys=True)
+    print(f"Updated {_yp}")
+    sys.exit(0)
+
+
+ENTRY = 16   # sizeof(SMEntry) = {u64 key; u64 val} in ham_dp_c.c
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Compile benchmark library
@@ -47,8 +125,8 @@ BENCH_C = r"""
 #include <pthread.h>
 
 typedef uint64_t u64;
-/* Use three u64 fields instead of __int128 to stay portable */
-typedef struct { u64 key, v0, v1; } SME;   /* 24 bytes */
+/* Same layout as ham_dp_c.c's SMEntry */
+typedef struct { u64 key, val; } SME;      /* 16 bytes */
 
 static double now_s(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -253,6 +331,45 @@ print(f"  Cores:  {P_CORES} P-cores  {E_CORES} E-cores")
 print(f"  Cache:  L1={L1>>10}KB  L2={L2>>10}KB  SLC={SLC>>20}MB")
 print(f"  RAM:    {RAM>>30}GB")
 
+# Cache sharing → per-thread shares (B2 in doc/cache_geometry_plan.md).
+# SMT siblings share L1/L2 on x86; a cluster shares L2 on Apple Silicon.
+def _cpu_list_len(text):
+    n = 0
+    for part in text.strip().split(","):
+        if not part: continue
+        a_, _, b_ = part.partition("-")
+        n += (int(b_) - int(a_) + 1) if b_ else 1
+    return n
+
+SHARE = {"l1": 1, "l2": 1, "l3": 1}
+LOGICAL = os.cpu_count() or 1
+if SYS == "Darwin":
+    LOGICAL = P_CORES
+    SHARE["l2"] = _sysctl('hw.perflevel0.cpusperl2') or P_CORES
+    SHARE["l3"] = (_sysctl('hw.logicalcpu') or P_CORES)
+else:
+    _cb = '/sys/devices/system/cpu/cpu0/cache'
+    for _i in range(10):
+        _d = f'{_cb}/index{_i}'
+        if not os.path.isdir(_d): break
+        try:
+            _lv = int(open(f'{_d}/level').read())
+            if _lv == 1 and 'Instruction' in open(f'{_d}/type').read(): continue
+            SHARE[f'l{_lv}'] = _cpu_list_len(open(f'{_d}/shared_cpu_list').read())
+        except Exception:
+            pass
+
+def _share(size, sharers, nthreads=None):
+    nt = nthreads or P_CORES
+    if sharers <= 1: return size
+    k = max(1, min(sharers, -(-nt * sharers // LOGICAL)))
+    return size // k
+
+L1_T = _share(L1, SHARE["l1"])
+L2_T = _share(L2, SHARE["l2"])
+print(f"  Sharing: L1 by {SHARE['l1']}, L2 by {SHARE['l2']}, L3 by {SHARE['l3']} logical CPUs")
+print(f"  Per-thread shares with {P_CORES} threads: L1={L1_T>>10}KB  L2={L2_T>>10}KB")
+
 # Empirical bandwidth sweep to locate cache boundaries
 def bw_sweep():
     sizes, sz = [], 4096
@@ -287,7 +404,7 @@ def _fill_keys(buf, n):
     ba = memoryview(view).cast('B')
     for i in range(n):
         k = ((i*1234567891011)^(i>>7)) & 0xFFFFFFFFFFFFFFFF
-        struct.pack_into('<QQQ', ba, i*ENTRY, k, i, 0)
+        struct.pack_into('<QQ', ba, i*ENTRY, k, i)
 
 def _fill_sorted_streams(buf, stream_len, K):
     """Fill K sorted streams with interleaved keys."""
@@ -295,7 +412,7 @@ def _fill_sorted_streams(buf, stream_len, K):
     ba = memoryview(view).cast('B')
     for k in range(K):
         for i in range(stream_len):
-            struct.pack_into('<QQQ', ba, (k*stream_len+i)*ENTRY, K*i+k, 0, 0)
+            struct.pack_into('<QQ', ba, (k*stream_len+i)*ENTRY, K*i+k, 0)
 
 def _measure(fn, reps):
     """Return best throughput over reps runs."""
@@ -313,7 +430,7 @@ REPS = 2 if QUICK else 3
 print(f"\n{'='*62}")
 print("Stage 2a: SM_RBUF_SIZE  (radix scatter write-combining)")
 print(f"{'='*62}")
-print("  Constraint: 256 × SM_RBUF_SIZE × 24B ≤ L2")
+print("  Constraint: 256 × SM_RBUF_SIZE × 16B ≤ per-thread L2 share")
 print("  Paper: best value near capacity boundary → fill L2")
 
 N_A = max(2_000_000, min(10_000_000, L2*8//ENTRY))
@@ -333,14 +450,14 @@ print(f"  {'RBUF':>6}  {'pool KB':>8}  {'in L2':>6}  {'Mentry/s':>10}  {'GB/s':>
 res_A = []
 for val in cands_A:
     pool_kb = val*256*ENTRY/1024
-    fits    = pool_kb <= L2/1024
+    fits    = pool_kb <= L2_T/1024
     t = _measure(lambda v=val: lib.bench_rbuf(src_A,N_A,dst_A,v,256), REPS)
     res_A.append((val, t))
     mk = ' ←' if len(res_A)>1 and t>max(r[1] for r in res_A[:-1]) else ''
     print(f"  {val:>6}  {pool_kb:>8.0f}  {'yes' if fits else 'no':>6}  "
           f"{t/1e6:>10.1f}  {t*ENTRY/1e9:>6.2f}{mk}")
 
-in_l2_A = [(v,t) for v,t in res_A if v*256*ENTRY<=L2]
+in_l2_A = [(v,t) for v,t in res_A if v*256*ENTRY<=L2_T]
 rec_A = max(in_l2_A, key=lambda r:r[1])[0] if in_l2_A else res_A[0][0]
 print(f"\n  → Recommended SM_RBUF_SIZE = {rec_A}")
 
@@ -350,7 +467,7 @@ print(f"\n  → Recommended SM_RBUF_SIZE = {rec_A}")
 print(f"\n{'='*62}")
 print("Stage 2b: SM_BB_BUF  (block read-ahead in K-way merge)")
 print(f"{'='*62}")
-print("  Constraint: P × SM_BB_BUF × 24B ≤ L1")
+print("  Constraint: P × SM_BB_BUF × 16B ≤ per-thread L1 share")
 print("  Optimal: fill L1 (Aiken capacity-boundary principle).")
 print()
 print("  SM_BB_BUF is computed analytically, not measured.")
@@ -363,16 +480,16 @@ print()
 
 # Analytical formula: largest power-of-2 such that K × buf × ENTRY ≤ L1
 # K = rec_D (P-cores, already determined)
-_bb_raw = L1 // (P_CORES * ENTRY)         # max entries fitting in L1; K = P_CORES
+_bb_raw = L1_T // (P_CORES * ENTRY)       # max entries in this thread's L1 share; K = P_CORES streams
 rec_B = 1
 while rec_B * 2 <= _bb_raw: rec_B *= 2   # round down to power-of-2
 rec_B = max(16, min(rec_B, 4096))         # clamp: floor 16, ceil 4096
 
-print(f"  L1={L1>>10}KB  K={P_CORES} P-cores  ENTRY=24B")
-print(f"  Max pool: L1 / (K × 24) = {L1>>10}KB / ({P_CORES}×24) "
+print(f"  L1 share={L1_T>>10}KB  K={P_CORES} streams  ENTRY={ENTRY}B")
+print(f"  Max pool: L1share / (K × {ENTRY}) = {L1_T>>10}KB / ({P_CORES}×{ENTRY}) "
       f"= {_bb_raw} entries → rounded to {rec_B}")
-print(f"  Pool size: {P_CORES} × {rec_B} × 24 = {P_CORES*rec_B*24//1024}KB "
-      f"({'< L1 ✓' if P_CORES*rec_B*ENTRY <= L1 else '> L1 ✗'})")
+print(f"  Pool size: {P_CORES} × {rec_B} × {ENTRY} = {P_CORES*rec_B*ENTRY//1024}KB "
+      f"({'< L1 share ✓' if P_CORES*rec_B*ENTRY <= L1_T else '> L1 share ✗'})")
 
 # Verification benchmark (informational only — does not change rec_B)
 print()
@@ -399,7 +516,7 @@ for val in [16, 32, 64, 128, 256, rec_B]:
     print(f"  {val:>6}  {pool_kb:>7.1f}  {'yes' if fits else 'no':>6}  "
           f"{t/1e6:>10.1f}  {t/base_B:>7.1f}x{mk}")
 
-print(f"\n  → Recommended SM_BB_BUF = {rec_B}  (analytical: L1 / (P × 24), pow2)"      f"  SM_BB_KSTACK = {max(rec_B, 32)}")
+print(f"\n  → Recommended SM_BB_BUF = {rec_B}  (analytical: L1share / (P × {ENTRY}), pow2)"      f"  SM_BB_KSTACK = {max(rec_B, 32)}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Group C: SM_EXT_STREAM_BUF
@@ -443,7 +560,7 @@ for K in K_cases:
 mean_ratio = sum(ratios)/len(ratios)
 print(f"\n  Mean ratio empirical/formula = {mean_ratio:.2f}")
 adj = f" × {mean_ratio:.1f}" if abs(mean_ratio-1)>0.2 else ""
-print(f"  Dynamic formula: SM_EXT_STREAM_BUF = SLC_bytes{adj} / (K_total × 24)")
+print(f"  Dynamic formula: SM_EXT_STREAM_BUF = SLC_bytes{adj} / (K_total × {ENTRY})")
 
 # Fixed fallback for small K (early steps with few runs)
 rec_C = max(256, int(SLC * mean_ratio / (6 * ENTRY)))
@@ -451,7 +568,7 @@ rec_C = 2**round(math.log2(rec_C))
 print(f"  Fixed fallback (K≤6): {rec_C} entries  "
       f"= {rec_C*ENTRY//1024}KB each, {6*rec_C*ENTRY//1024}KB total")
 print(f"\n  → Recommended SM_EXT_STREAM_BUF (fixed) = {rec_C}")
-print(f"  → Dynamic formula: SLC_bytes / (P × n_runs × 24)")
+print(f"  → Dynamic formula: SLC_bytes / (P × n_runs × {ENTRY})")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Group D: SM_NTHREADS
@@ -520,7 +637,7 @@ print(f"{'='*62}")
 
 OS_MARGIN = 4<<30
 # Leave RAM for curr + nxt (≈ 40% of RAM for typical large step)
-# Worker bufs = P × 2 × CAP × 24B
+# Worker bufs = P × 2 × CAP × 16B
 avail = RAM - OS_MARGIN - int(0.4*RAM)
 cap_max = avail // (rec_D * 2 * ENTRY)
 cap_p2  = 1
@@ -566,7 +683,7 @@ print(f"""
   #define SM_RBUF_SIZE       {rec['SM_RBUF_SIZE']}
   #define SM_BB_BUF          {rec['SM_BB_BUF']}
   #define SM_BB_KSTACK       {rec['SM_BB_KSTACK']}
-  /* Fixed fallback; dynamic formula: SLC_bytes / (P*n_runs*24) */
+  /* Fixed fallback; dynamic formula: SLC_bytes / (P*n_runs*16) */
   #define SM_EXT_STREAM_BUF  {rec['SM_EXT_STREAM_BUF']}
   #define SM_SLC_BYTES       ({SLC})   /* {SLC>>20}MB */
 """)
@@ -593,6 +710,13 @@ if not changed:
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch file
 # ─────────────────────────────────────────────────────────────────────────────
+PROBE = {}
+if ARGS.output and not ARGS.no_probe:
+    print(f"\n{'='*62}")
+    print("Stage 4: cache geometry probe (src/C/cacheprobe.c)")
+    print(f"{'='*62}")
+    PROBE = run_cacheprobe(QUICK)
+
 if ARGS.output:
     # Write machine.yaml next to the specified file (or current dir).
     import pathlib, yaml as _yaml
@@ -616,7 +740,11 @@ if ARGS.output:
         "_l1_kb":  L1  >> 10,
         "_l2_kb":  L2  >> 10,
         "_slc_mb": SLC >> 20,
+        "_share":  {"l1": SHARE["l1"], "l2": SHARE["l2"], "l3": SHARE["l3"],
+                    "logical": LOGICAL},
     }
+    if PROBE:
+        yaml_data.update(PROBE)
     with open(yaml_path, "w") as _f:
         _yaml.dump(yaml_data, _f, default_flow_style=False, sort_keys=True)
     print(f"\n" + "="*62)

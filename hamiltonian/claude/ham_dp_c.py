@@ -77,8 +77,10 @@ def _detect_cache_sizes():
 
     sys_ = platform.system()
     if sys_ == "Darwin":
-        l1  = sysctl_int("hw.l1dcachesize")
-        l2  = sysctl_int("hw.l2cachesize")
+        # Apple Silicon: the unqualified keys may describe a different core
+        # type; the P-core values (perflevel0) are the ones the DP runs on.
+        l1  = sysctl_int("hw.perflevel0.l1dcachesize") or sysctl_int("hw.l1dcachesize")
+        l2  = sysctl_int("hw.perflevel0.l2cachesize") or sysctl_int("hw.l2cachesize")
         l3  = sysctl_int("hw.l3cachesize") or sysctl_int("hw.cachesize")
         cl  = sysctl_int("hw.cachelinesize")
         return (l1 or defaults[0], l2 or defaults[1],
@@ -114,6 +116,72 @@ def _detect_cache_sizes():
                 l3 or defaults[2], cl)
 
     return defaults
+
+
+def _parse_cpu_list(text: str) -> int:
+    """Number of CPUs in a sysfs cpu list such as '0-3,32-35'."""
+    n = 0
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            n += int(b) - int(a) + 1
+        else:
+            n += 1
+    return n
+
+
+def _detect_cache_sharing() -> dict:
+    """Return {'l1', 'l2', 'l3': logical CPUs sharing one instance,
+    'logical': logical CPUs the DP may use}.
+
+    Linux  — /sys/devices/system/cpu/cpu0/cache/index*/shared_cpu_list
+    macOS  — L1 private (no SMT); L2 shared by hw.perflevel0.cpusperl2;
+             the SLC is shared by the whole chip.
+    Unknown levels default to 1 (private), which reproduces the old
+    'each thread owns the cache' sizing.
+    """
+    import platform
+    share = {"l1": 1, "l2": 1, "l3": 1, "logical": os.cpu_count() or 1}
+    if platform.system() == "Linux":
+        base = "/sys/devices/system/cpu/cpu0/cache"
+        for idx in range(10):
+            d = f"{base}/index{idx}"
+            if not os.path.isdir(d):
+                break
+            try:
+                level = int(open(f"{d}/level").read())
+                ctype = open(f"{d}/type").read().strip()
+                if level == 1 and "Instruction" in ctype:
+                    continue
+                share[f"l{level}"] = _parse_cpu_list(open(f"{d}/shared_cpu_list").read())
+            except Exception:
+                continue
+    elif platform.system() == "Darwin":
+        def sysctl_int(key):
+            r = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True)
+            try: return int(r.stdout.strip()) if r.returncode == 0 else None
+            except ValueError: return None
+        p = sysctl_int("hw.perflevel0.logicalcpu") or sysctl_int("hw.logicalcpu") or 1
+        share["logical"] = p
+        share["l2"] = sysctl_int("hw.perflevel0.cpusperl2") or p
+        share["l3"] = sysctl_int("hw.logicalcpu") or p
+    return share
+
+
+def _per_thread_share(size: int, sharers: int, nthreads: int, logical: int) -> int:
+    """Bytes of one cache instance available to one DP thread.
+
+    With nthreads spread evenly over `logical` CPUs, an instance shared by
+    `sharers` CPUs hosts about ceil(nthreads * sharers / logical) of our
+    threads (at least 1, at most `sharers`).
+    """
+    if sharers <= 1 or logical <= 0:
+        return size
+    k = -(-nthreads * sharers // logical)
+    k = max(1, min(sharers, k))
+    return size // k
 
 
 def _detect_ram_and_threads():
@@ -190,9 +258,9 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
 
     SM_WORKER_CAP:
         Per-worker output buffer cap (entries).  Bounds peak RAM to:
-            curr_tab + SM_NTHREADS × 2 × SM_WORKER_CAP × 24B + headroom
+            curr_tab + SM_NTHREADS × 2 × SM_WORKER_CAP × 16B + headroom
         Solve for cap given available RAM, leaving OS_HEADROOM_GB free:
-            cap = (ram - os_headroom - curr_max) / (nthreads × 2 × 24)
+            cap = (ram - os_headroom - curr_max) / (nthreads × 2 × 16)
         curr_max is conservatively sized for a 700M-state table (n=61 peak).
         Result is rounded down to a power-of-2 multiple of 1M entries and
         clamped to [8M, 256M].
@@ -215,7 +283,7 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
     bits         = max(8, min(12, bits_raw))
 
     # ── SM constants ──────────────────────────────────────────────────
-    SM_ENTRY     = 24          # bytes per SMEntry
+    SM_ENTRY     = 16          # bytes per SMEntry {u64 key; u64 val}
     OS_HEADROOM  = 4 << 30     # 4 GB reserved for OS + misc
 
     # During the sweep compute phase the peak memory footprint is:
@@ -227,7 +295,7 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
     #
     # Total ≈ curr + P × cap × 24 × (2 + 2 + 0.5)  = curr + P×cap×24×2.5
     # Solve for cap given a target of (RAM - OS_HEADROOM - 2 GB slack):
-    curr_max_bytes = 553_000_000 * SM_ENTRY   # 13.3 GB
+    curr_max_bytes = 553_000_000 * SM_ENTRY   # 8.8 GB
 
     target = ram - OS_HEADROOM - (2 << 30)    # 30 GB on 36 GB machine
     cap_bytes = max(0, int((target - curr_max_bytes) / (n_threads * 2.5 * SM_ENTRY)))
@@ -267,18 +335,18 @@ def _derive_build_constants(l1d: int, l2: int, l3: int, cl: int) -> dict:
         return int(_tuned.get(key, default))
 
     # Defaults are derived analytically from hardware geometry.
-    # SM_RBUF_SIZE: fill L2 with RadixBuf (256 buckets × size × 24B ≤ L2)
+    # SM_RBUF_SIZE: fill L2 with RadixBuf (256 buckets × size × 16B ≤ L2)
     rbuf_default  = 1
-    while (rbuf_default * 2) * 256 * 24 <= l2: rbuf_default *= 2
+    while (rbuf_default * 2) * 256 * SM_ENTRY <= l2: rbuf_default *= 2
     rbuf_default  = min(rbuf_default, 128)   # practical cap
 
-    # SM_BB_BUF: fill L1 with block-merge buffers (P × size × 24B ≤ L1)
+    # SM_BB_BUF: fill L1 with block-merge buffers (P × size × 16B ≤ L1)
     bb_default    = 1
-    while (bb_default * 2) * n_threads * 24 <= l1d: bb_default *= 2
+    while (bb_default * 2) * n_threads * SM_ENTRY <= l1d: bb_default *= 2
     bb_default    = min(bb_default, 512)
 
     # SM_EXT_STREAM_BUF: floor; dynamic formula in C overrides per step
-    ext_default   = max(256, l3 // (100 * 24))   # rough: 1% of SLC each
+    ext_default   = max(256, l3 // (100 * SM_ENTRY))   # rough: 1% of SLC each
 
     # SM_SLC_BYTES: the SLC (L3) size itself
     slc_bytes     = l3
@@ -428,10 +496,21 @@ def _get_lib():
     _ram2, _nt2 = _detect_ram_and_threads()
     _l1_2, _l2_2, _l3_2, _ = _detect_cache_sizes()
     _nthreads_def  = _nt2
-    _wcap_def      = max(8, min(128, ((_ram2-(4<<30)-(_ram2>>1))//(_nt2*2*24))//(1<<20))) * (1<<20)
-    _rbuf_def      = min(128, max(1, 1 << (max(0, (_l2_2//(256*24)).bit_length()-1))))
-    _bb_def        = min(4096, max(16, 1 << (max(0, (_l1_2//(_nt2*24)).bit_length()-1))))
-    _ext_def       = max(256, _l3_2//(100*24))
+    _nthreads_run  = _rv("SM_NTHREADS", _nthreads_def)
+    # Per-thread cache shares: SMT siblings share L1/L2 on x86, a cluster
+    # shares L2 on Apple Silicon, a CCX/chip shares L3/SLC.
+    _sh = _detect_cache_sharing()
+    _l1_t = _per_thread_share(_l1_2, _sh["l1"], _nthreads_run, _sh["logical"])
+    _l2_t = _per_thread_share(_l2_2, _sh["l2"], _nthreads_run, _sh["logical"])
+    _E = 16                                  # sizeof(SMEntry) = {u64 key; u64 val}
+    _wcap_def      = max(8, min(128, ((_ram2-(4<<30)-(_ram2>>1))//(_nt2*2*_E))//(1<<20))) * (1<<20)
+    # 256 radix write buffers per thread within the thread's L2 share.
+    _rbuf_def      = min(128, max(1, 1 << (max(0, (_l2_t//(256*_E)).bit_length()-1))))
+    # K = P streams per merge thread, block buffers within its L1 share.
+    _bb_def        = min(4096, max(16, 1 << (max(0, (_l1_t//(_nt2*_E)).bit_length()-1))))
+    # SM_SLC_BYTES / SM_EXT_STREAM_BUF size the ext-merge read-ahead (I/O),
+    # not a cache budget; they keep the whole-LLC default.
+    _ext_def       = max(256, _l3_2//(100*_E))
 
     lib.sm_configure(
         _rv("SM_NTHREADS",         _nthreads_def),
@@ -604,6 +683,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 checkpoint_secs: float = 300.0,
                                 mem_reserve_gb: float = 0.0,
                                 count_cycles: bool = False,
+                                ram_bytes: int | None = None,
                                 **kwargs):
     """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
 
@@ -618,6 +698,9 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                      the backend to spill to disk (global_ext merge) sooner.
                      Useful to avoid OOM at peak steps on large graphs.
                      E.g. mem_reserve_gb=300 on a 768 GB machine plans for 468 GB.
+    ram_bytes      : use this instead of the detected physical RAM for the
+                     RAM/ext and merge-budget decisions (tests, what-if runs).
+                     mem_reserve_gb is applied on top of it.
     """
     import sys
     if checkpoint_path:
@@ -625,6 +708,8 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
               "checkpoint_path ignored.", file=sys.stderr)
     lib, ffi = _get_lib()
     ram, _ = _detect_ram_and_threads()
+    if ram_bytes:
+        ram = int(ram_bytes)
     if mem_reserve_gb > 0:
         reserve = int(mem_reserve_gb * (1 << 30))
         ram = max(int(4 << 30), ram - reserve)  # never go below 4 GB
