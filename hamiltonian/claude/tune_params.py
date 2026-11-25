@@ -41,6 +41,15 @@ QUICK = ARGS.quick
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache geometry probe (src/C/cacheprobe.c)
 # ─────────────────────────────────────────────────────────────────────────────
+def _no_alias_dumper():
+    """yaml Dumper that writes repeated objects out in full (no &id/*id)."""
+    import yaml as _y
+    class _D(_y.SafeDumper):
+        def ignore_aliases(self, data):
+            return True
+    return _D
+
+
 def run_cacheprobe(quick=False):
     """Compile and run src/C/cacheprobe.c; return machine.yaml keys.
 
@@ -106,7 +115,8 @@ if ARGS.probe_only:
         with open(_yp) as _f: _old = _yaml.safe_load(_f) or {}
     _old.update(run_cacheprobe(QUICK))
     with open(_yp, "w") as _f:
-        _yaml.dump(_old, _f, default_flow_style=False, sort_keys=True)
+        _yaml.dump(_old, _f, default_flow_style=False, sort_keys=True,
+                   Dumper=_no_alias_dumper())
     print(f"Updated {_yp}")
     sys.exit(0)
 
@@ -746,7 +756,8 @@ if ARGS.output:
     if PROBE:
         yaml_data.update(PROBE)
     with open(yaml_path, "w") as _f:
-        _yaml.dump(yaml_data, _f, default_flow_style=False, sort_keys=True)
+        _yaml.dump(yaml_data, _f, default_flow_style=False, sort_keys=True,
+                   Dumper=_no_alias_dumper())
     print(f"\n" + "="*62)
     print(f"Wrote {yaml_path}")
     print("="*62)

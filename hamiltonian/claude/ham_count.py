@@ -387,6 +387,12 @@ def parse_args():
                         "memory safety.  E.g. --mem-reserve-gb 300 on a 768 GB "
                         "machine makes the backend plan for 468 GB available. "
                         "Default: 0 (use all detected RAM).")
+    p.add_argument("--on-overflow", choices=["crt", "residue"], default="crt",
+                   help="(sort-merge only) If a 64-bit state count wraps: 'crt' "
+                        "(default) recovers the exact count by the Chinese "
+                        "remainder theorem (replays from the last snapshot before "
+                        "the wrap, or full reruns, mod primes < 2^62; certified by "
+                        "the Bregman bound); 'residue' stops with the count mod 2^64.")
     p.add_argument("--ram-gb", type=float, default=0.0, metavar="GB",
                    help="(SA ordering only) Physical RAM in GB.  When set, the SA "
                         "cost function adds a quadratic OOM penalty for any "
@@ -629,6 +635,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
             checkpoint_secs=args.checkpoint_interval,
             mem_reserve_gb=getattr(args, 'mem_reserve_gb', 0.0),
             count_cycles=_cc,
+            on_overflow=getattr(args, 'on_overflow', 'crt'),
         )
     else:
         result = count_hamiltonian_paths_c(

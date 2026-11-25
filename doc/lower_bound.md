@@ -1712,4 +1712,99 @@ Files are in `~/Programming/Combinatorics/hamiltonian`:
 - `tests/test_sm_merge.py`
 - `doc/cache_geometry_plan.md`
 
+Question
+========
+I ran tune_params on the linux machine and ran n=69 with the generated
+machine.yaml. It now took 410.119 seconds for n=69.
 
+Answer
+======
+That's a large gain: the only earlier n=69 run on that machine took 1465 s of DP time. But the logs I have can't say how much of the 3.6× comes from the new merge code.
+
+That earlier run is `data/linux/profile_69linux.txt`, from April 12. It differs from today's run in three ways besides the code changes:
+
+- **Ordering.** April used the MaxSAT ordering (pathwidth 14, profile 805). Your recent runs use the kpw work-model ordering, which by itself could account for a large factor.
+- **Parameters.** The `machine.yaml` that tune_params just generated is different from the hand-tuned one.
+- **Code.** Besides A0/A1/B1/B2, the code has changed since April 12. The n=75 log already shows a different instrumentation layout.
+
+A0 probably did nothing on this run. In April every worker produced a single run at every step, so the serial per-worker merge it parallelises had no work to do. A1 replaces the final merge, which was only 15% of that run. Much of the gap was in time the April instrumentation doesn't attribute: about half of each large step.
+
+Two things would settle it:
+
+1. **The new log and the generated `machine.yaml`** (drop them in `data/linux/`). From the `[inst]` lines I can split the 410 s by phase and compare with April step by step. The new `ram_merge:` lines also show the thread count, release size and predicted vs. measured peak memory on the real machine. Please also confirm the count came out as 6,697,388,275,608,246.
+2. **One A/B run.** Same ordering, same `machine.yaml`, with
+   `HAM_SM_MERGE=a0`. When each worker has a single run, the `a0` path
+   is exactly the old merge, so the difference isolates A1. If you
+   also want the tuning effect, run the old hand-tuned yaml with the
+   default merge.
+   
+Question
+========
+You can find `new_74_sm_new.txt linux.yaml new_69_sm_new.txt
+linux_work_model.json` in `data/linux` I didn't run them
+instrumented. Notice that 74 now dies at the very last step because of
+overflow 64 bits.
+
+Answer
+======
+The overflow looks real, and the run already contains a cheap check of that. I've written up a diagnosis and a proposed fix in `doc/sm_overflow_plan.md`; nothing is implemented yet.
+
+**Why it overflows.** Each state's count is stored as a 64-bit integer, and the comment saying that is safe for n ≤ ~110 is wrong. It reasons from the final answer. But a state's count is the number of partial path systems on the vertices processed so far, and H(n) doesn't bound that. Most of those partial systems are discarded only in the final eliminations.
+
+**Why it shows up now.** The kpw ordering narrows the tail of the run a lot:
+
+| step | states, kpw order (new run) | states, MaxSAT order (April) |
+|---|---|---|
+| 71 | 4,492 | 431,514 |
+| 72 | 57 | 245 |
+
+The same total count is packed into 4× fewer states at step 72, so each state's count is about 4× larger. H(74) ≈ 2.18·10¹⁸ is already within a factor of 8.5 of 2⁶⁴, so that is enough to wrap.
+
+**Why I don't think the new merge caused it.** The new merge never changes a count: in every test the per-step checksums, including the sum of all counts, matched the old code. Overflow is detected in the same place as before. The check only runs after the last step, so "dies at the very last step" means "is noticed then". The wrap itself was probably at steps 71–72.
+
+**The run is not wasted.** The DP only ever adds counts, so with wrapping arithmetic everything it computes is exact modulo 2⁶⁴. Your run computed H(74) mod 2⁶⁴, and the Python code throws that away when it raises the error. If that residue equals 2,176,025,661,130,535,741 (the earlier H(74), which is below 2⁶⁴), it confirms both that the wrap is genuine and that the new merge code is correct.
+
+**What I propose:**
+1. On overflow, report the residue mod 2⁶⁴ and the first step at which a count wrapped, instead of discarding the result.
+2. For exact results without wider entries, rerun with all counts reduced modulo the prime 2⁶¹−1 and combine the two residues by the Chinese remainder theorem.
+   - This leaves memory and speed per step unchanged, but costs a second run when the first one wrapped.
+   - It is exact only if X < 2⁶⁴·(2⁶¹−1) ≈ 2¹²⁵. I have no useful bound proving that; simple degree-product bounds for these graphs come out around 2²⁷⁰.
+   - So this needs your call: add a third modulus (≈2¹⁸⁶, still unproven but very comfortable, since H(75) ≈ 2⁶⁹), or certify X with a double-precision lane whose error can be rigorously bounded (more memory, or a third run).
+3. I'm not proposing 128-bit counts. They cost 1.5× memory and bandwidth on every step, and memory is what limits n ≥ 75.
+4. Separately, `tune_params.py` writes YAML aliases (`*id001`) into `machine.yaml`. They're harmless, but I'd turn them off.
+
+On speed, only totals are comparable, because the ordering, parameters and code all changed at once: n=69 took 410 s against 1465 s in April, and the n=74 DP took 733 s against the best April run's 945 s.
+
+Shall I implement 1, 2 and 4, and which way do you want the 2¹²⁵
+hypothesis handled?
+
+Question
+========
+Do 1 2 and 4. The Chinese Remainder sounds like a good idea.  It's too
+bad that the overflow happened at the very last step. Didn't we work
+out a rigorous upper bound, or is that too loose?
+
+Answer
+======
+Yes, we did work one out: the Brégman–Minc bound in `hamiltonian/bounds/bregman.py`. It is too loose to estimate H(n), but tight enough to make the CRT rigorous. Items 1, 2 and 4 are done, and the tests pass both here and on the aarch64 Linux VM.
+
+**Why the bound is enough.** For n = 74 it gives about 2^114, while H(74) is about 2^61. The CRT only needs a modulus above the bound. The 64-bit run plus one prime, 2⁶¹−1, gives a modulus of about 2^125. That certifies every n up to 79; two primes reach about n = 104. The code computes the bound from the graph's degrees and uses the fewest primes that clear it, with a one-bit margin. It also asserts that the result is below the bound.
+
+**The overflow at the last step should now be cheap to recover.** While the DP runs, it keeps a copy of the most recent state table that fits in min(1 GiB, RAM/64), until the first wrap. Any copy taken at or before the wrap step still has exact counts. So after the normal run, only the steps from that copy onward are rerun mod the prime. At n = 74 those last steps have between about 10⁴ and 10⁷ states, so the extra work should be seconds rather than another 733 s. That's an estimate, since I don't know your exact wrap step. If a wrap ever happens at a step too big to copy, the whole DP is rerun once per prime instead. Either way, stderr gets a one-line note saying what was done.
+
+**What changed:**
+- **Item 1:** `--on-overflow residue` stops with an `SMOverflow` exception that carries the count mod 2⁶⁴ and the first step that wrapped. `crt`, the default, recovers the exact count.
+- **Item 2:** the exact recovery above. The cycle count gets the same treatment.
+- **Item 4:** the wrong "safe for n ≤ ~110" comment is replaced, and `tune_params.py` no longer writes `*id001` aliases into `machine.yaml`.
+- **A bug fix:** the overflow flag was never reset, so in a run over several n, every n after the first overflow would have been reported as overflowed.
+- **Checks:** the step-by-step state tables are bit-identical to the previous code at n = 45 and 47. The new tests force early wraps by pretending counts are 12, 16 or 20 bits wide at n = 41. They check exact paths and cycles by both routes, the residue mode, combining three moduli, and the SSD-spill path.
+
+The memory cost is the saved copy, at most 1 GiB, plus one copy per small step. Simply rerunning your n = 74 job should give the exact count. Expect 2,176,025,661,130,535,741, and the stderr note will report where the wrap happened.
+
+Files are in `~/Programming/Combinatorics/hamiltonian`:
+- `hamiltonian/claude/ham_dp_c.c`
+- `hamiltonian/claude/ham_dp_c.py`
+- `hamiltonian/claude/ham_count.py`
+- `hamiltonian/claude/tune_params.py`
+- `tests/test_sm_crt.py`
+- `doc/sm_overflow_plan.md`

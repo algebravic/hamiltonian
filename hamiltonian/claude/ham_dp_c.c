@@ -40,13 +40,19 @@
 #include <malloc/malloc.h>   /* malloc_size() — macOS only */
 #endif
 
-/* Saturating-add with overflow detection for u64 sort-merge counts.
-   Sets sm_val_overflow flag if a + b would wrap.  Returns the wrapped
-   value (incorrect, but harmless since the flag signals bad results). */
+/* Addition of two sort-merge state counts.
+   sm_mod == 0: arithmetic mod 2^64 (wrapping).  A wrap is recorded
+                (sm_note_wrap: flag + first step), the wrapped value is kept:
+                the DP only adds counts, so every count and the result stay
+                exact modulo 2^64.
+   sm_mod == p: arithmetic mod a prime p < 2^62 (used for the CRT replays);
+                a, b < p, so a + b < 2^63 cannot wrap.                     */
 #define SM_VAL_ADD(a, b) __extension__({\
     u64 _a=(a), _b=(b), _r=_a+_b; \
-    if (__builtin_expect(_r < _a, 0)) \
-        __sync_fetch_and_or(&sm_val_overflow, 1); \
+    if (sm_mod) { if (_r >= sm_mod) _r -= sm_mod; } \
+    else if (__builtin_expect(sm_wbits != 64, 0)) { \
+        if (_r >> sm_wbits) { _r &= ((u64)1 << sm_wbits) - 1; sm_note_wrap(); } } \
+    else if (__builtin_expect(_r < _a, 0)) sm_note_wrap(); \
     _r; })
 
 #define SM_LARGE_THRESHOLD ((size_t)(1 << 20))   /* 1 MB */
@@ -141,13 +147,30 @@ typedef struct {
     size_t ext_stream_buf; size_t slc_bytes;
     size_t par_merge_thresh; int steal_factor; size_t rsort_thresh;
 } SMConfig;
-/* ── Sort-merge val overflow detection ─────────────────────────────────
-   SMEntry.val is u64. If the count for any single state exceeds 2^64
-   during deduplication, it wraps silently and the final answer is wrong.
-   sm_val_overflow is set atomically whenever (a + b) wraps: a+b < a.
-   Checked by count_ham_paths_sm and exposed via sm_overflow_detected(). */
+/* ── Sort-merge state counts: width, wrap detection, CRT ───────────────
+   SMEntry.val is u64.  A state's count is the number of partial path
+   systems on the processed vertices with that frontier state; nothing
+   bounds it by the final number of Hamiltonian paths (most partial systems
+   die in the last eliminations), so it can exceed 2^64 even when H(n) does
+   not -- this happened at n = 74 with the kpw ordering.
+   sm_val_overflow is set atomically whenever (a + b) wraps; sm_wrap_step
+   records the first step at which that happened.  Both are reset at the
+   start of every count_ham_paths_sm call.  With wrapping arithmetic the
+   result is still exact mod 2^64; the caller recovers the full value by
+   the Chinese remainder theorem from replays mod primes (sm_set_crt).  */
 static volatile int sm_val_overflow = 0;
+static volatile int sm_cur_step  = -1;
+static volatile int sm_wrap_step = -1;
+static u64          sm_mod       = 0;      /* 0 = mod 2^64 (wrapping) */
+static int          sm_wbits     = 64;     /* test hook: emulate 2^wbits words */
+void sm_set_word_bits(int b) { sm_wbits = (b >= 8 && b < 64) ? b : 64; }
 int sm_overflow_detected(void) { return sm_val_overflow; }
+int sm_overflow_step(void)     { return sm_wrap_step; }
+void sm_set_modulus(uint64_t p) { sm_mod = (u64)p; }
+static void sm_note_wrap(void) {
+    __sync_fetch_and_or(&sm_val_overflow, 1);
+    __sync_bool_compare_and_swap(&sm_wrap_step, -1, sm_cur_step);
+}
 
 static SMConfig sm_cfg = {
     .nthreads=6,.worker_cap=16*1024*1024,.rbuf_size=32,.bb_buf=32,
@@ -1290,7 +1313,7 @@ void count_ham_paths_peh(
 
 #include <pthread.h>
 
-typedef struct { u64 key; u64 val;  } SMEntry;  /* val: u64 safe for n<=~110 */
+typedef struct { u64 key; u64 val;  } SMEntry;  /* val: count mod 2^64 or mod sm_mod (see SM_VAL_ADD) */
 
 /* Fatal OOM handler — prints location and aborts cleanly.
    On macOS, malloc returns NULL under pressure rather than killing the
@@ -3634,6 +3657,198 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
 }
 
 /* ── Top-level SM entry point ───────────────────────────────────────── */
+/* ── Run state of the sort-merge DP (restartable for CRT replays) ───── */
+typedef struct {
+    int    frontier[MAX_FS_FAST + 2];
+    int   *fidx;                  /* n + 1 entries                          */
+    int    fs;
+    SMTab *curr, *nxt;
+    u128   total, cycles;
+} SMRunState;
+
+/* Snapshot of the state at the start of a step (before introduce).  Kept
+   for the latest step whose input fits in snap_bytes, until the first
+   wrap; any snapshot taken at or before the wrap step holds exact counts. */
+typedef struct {
+    int      valid, step, fs;
+    int      frontier[MAX_FS_FAST + 2];
+    int     *fidx;
+    SMEntry *data; size_t cnt, cap;
+    u128     total, cycles;
+} SMSnap;
+
+#define SM_CRT_MAX 4
+static u64    sm_crt_mod[SM_CRT_MAX];
+static int    sm_crt_k = 0;
+static size_t sm_crt_snap_bytes = 0;
+static int    sm_crt_from = -1;                 /* replay start, -1 = none */
+static u64    sm_crt_res[SM_CRT_MAX][2];        /* [i][0]=paths, [1]=cycles */
+
+/* Configure CRT replays for the next count_ham_paths_sm call: moduli are
+   primes < 2^62; snap_bytes bounds the snapshot kept for the replay.     */
+void sm_set_crt(const uint64_t *moduli, int k, uint64_t snap_bytes) {
+    if (k > SM_CRT_MAX) k = SM_CRT_MAX;
+    if (k < 0) k = 0;
+    for (int i = 0; i < k; i++) sm_crt_mod[i] = moduli[i];
+    sm_crt_k = k; sm_crt_snap_bytes = (size_t)snap_bytes;
+}
+int      sm_crt_replay_from(void) { return sm_crt_from; }
+uint64_t sm_crt_residue(int i, int which) {
+    return (i >= 0 && i < SM_CRT_MAX && (which == 0 || which == 1)) ? sm_crt_res[i][which] : 0;
+}
+
+static void sm_snap_take(SMSnap *sn, const SMRunState *R, int step, int n) {
+    size_t c = R->curr->cnt;
+    if (sn->cap < c) {
+        sm_free(sn->data);
+        sn->data = (SMEntry *)sm_alloc((c ? c : 1) * sizeof(SMEntry));
+        SM_ALLOC_CHECK(sn->data, (c ? c : 1) * sizeof(SMEntry));
+        sn->cap = c ? c : 1;
+    }
+    memcpy(sn->data, R->curr->data, c * sizeof(SMEntry));
+    sn->cnt = c;
+    if (!sn->fidx) { sn->fidx = (int *)malloc((size_t)(n + 1) * sizeof(int)); SM_ALLOC_CHECK(sn->fidx, (size_t)(n + 1) * sizeof(int)); }
+    memcpy(sn->fidx, R->fidx, (size_t)(n + 1) * sizeof(int));
+    memcpy(sn->frontier, R->frontier, sizeof sn->frontier);
+    sn->fs = R->fs; sn->total = R->total; sn->cycles = R->cycles;
+    sn->step = step; sn->valid = 1;
+}
+
+/* Restore a snapshot with all counts reduced mod p. */
+static void sm_snap_restore(const SMSnap *sn, SMRunState *R, int n, u64 p) {
+    smtab_free(R->curr); smtab_free(R->nxt);
+    R->curr = smtab_alloc(sn->cnt ? sn->cnt : 1);
+    R->nxt  = smtab_alloc(1024);
+    for (size_t i = 0; i < sn->cnt; i++) {
+        R->curr->data[i].key = sn->data[i].key;
+        R->curr->data[i].val = sn->data[i].val % p;
+    }
+    R->curr->cnt = sn->cnt;
+    memcpy(R->fidx, sn->fidx, (size_t)(n + 1) * sizeof(int));
+    memcpy(R->frontier, sn->frontier, sizeof R->frontier);
+    R->fs = sn->fs;
+    R->total = sn->total % p; R->cycles = sn->cycles % p;
+}
+
+/* Steps s0 .. n-1.  Returns 0, or -1 if the frontier exceeds MAX_FS_FAST. */
+static int sm_run_steps(SMRunState *R, int s0, int n,
+                        const int *order, const int *pos, const int *last_s,
+                        const int *adj_off, const int *adj_dat,
+                        int verbose, uint64_t ram_bytes, int instrument,
+                        int want_cycles, SMSnap *snap, const char *tag) {
+    double t_start = now_ms(), t_prev = t_start;
+    for (int step = s0; step < n; step++) {
+        sm_cur_step = step;
+        if (snap && sm_wrap_step < 0 && sm_crt_k > 0 &&
+            R->curr->cnt * sizeof(SMEntry) <= sm_crt_snap_bytes)
+            sm_snap_take(snap, R, step, n);
+        int v = order[step];
+        if (R->fs > MAX_FS_FAST) return -1;
+
+        /* A. Introduce: transform curr->data in-place.
+           introduce(key, fs) ORs enc_v(0)<<(4*fs) into each key — it only
+           touches bits at position fs and is independent per entry, so P
+           threads can do N/P entries each with no synchronisation.
+           In-place avoids allocating a separate nxt here, halving peak RAM:
+             Old (copy): curr(si) + nxt(si) = 2×si simultaneously
+             New (in-place): curr(si) only — nxt allocated later in sweep
+           At n=75 step 57 (13.3B states = 303GB) this saves 303GB.      */
+        double t_intro0 = now_ms();
+        sm_introduce(R->curr, R->fs);
+        double t_intro_ms = now_ms() - t_intro0;
+        if (instrument)
+            fprintf(stderr, "  [inst] introduce: si=%zuM  %.0fms\n",
+                    R->curr->cnt / 1000000, t_intro_ms);
+        /* curr->data now holds the introduced keys; pass directly to sweep.
+           No swap needed — curr IS the introduced table.                  */
+        R->frontier[R->fs] = v; R->fidx[v] = R->fs; R->fs++;
+
+        /* nxt is still empty (data=NULL from previous step's free or initial
+           state).  sm_fused_sweep will allocate it via smtab_ensure.      */
+
+        /* B+C. Fused sweep */
+        int v_idx = R->fs - 1;
+        size_t states_in = R->curr->cnt;
+        int n_back = 0, widxs[8];
+        for (int ai = adj_off[v]; ai < adj_off[v+1]; ai++) {
+            int w = adj_dat[ai];
+            if (R->fidx[w] >= 0 && pos[w] < pos[v] && n_back < 8)
+                widxs[n_back++] = R->fidx[w];
+        }
+        int elim_asc[MAX_FS_FAST+2], n_elim = 0;
+        for (int ei = 0; ei < R->fs; ei++)
+            if (last_s[R->frontier[ei]] <= step) elim_asc[n_elim++] = ei;
+        int elim_desc[MAX_FS_FAST+2];
+        for (int e = 0; e < n_elim; e++)
+            elim_desc[e] = elim_asc[n_elim-1-e];
+
+        /* resolve ram_bytes: use provided value or conservative 8 GB default */
+        size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
+
+        u128 *cyc_ptr = (want_cycles && step == n - 1) ? &R->cycles : NULL;
+        sm_fused_sweep(R->curr, R->nxt, R->fs, v_idx, widxs, n_back,
+                       elim_desc, n_elim, step, n, &R->total, ram, instrument,
+                       cyc_ptr);
+        /* Free curr->data (the in-place-introduced table workers just read).
+           The ext path already frees it inside sm_fused_sweep (sets to NULL);
+           the RAM path does not, so this handles both: free(NULL) is a no-op. */
+        sm_free(R->curr->data); R->curr->data = NULL; R->curr->cap = 0; R->curr->cnt = 0;
+        { SMTab *t = R->curr; R->curr = R->nxt; R->nxt = t; }
+
+        /* Optional per-step checksum (HAM_SM_CKSUM=1): order-independent
+           digest of the state table plus a strict-sortedness check, used by
+           the tests to compare merge implementations step by step.        */
+        if (sm_cksum_enabled()) sm_cksum_print(step, R->curr->data, R->curr->cnt);
+
+        /* Update frontier */
+        for (int e = n_elim-1; e >= 0; e--) {
+            int ei = elim_asc[e];
+            R->fidx[R->frontier[ei]] = -1;
+            for (int k = ei; k < R->fs-1; k++) {
+                R->frontier[k] = R->frontier[k+1]; R->fidx[R->frontier[k]] = k;
+            }
+            R->fs--;
+        }
+
+        if (verbose) {
+            /* Count intra-frontier edges (both endpoints in frontier) */
+            int e_bag = 0;
+            for (int fi = 0; fi < R->fs; fi++) {
+                int u = R->frontier[fi];
+                for (int ai = adj_off[u]; ai < adj_off[u+1]; ai++) {
+                    int w = adj_dat[ai];
+                    if (R->fidx[w] >= 0 && R->fidx[w] > fi)  /* count each edge once */
+                        e_bag++;
+                }
+            }
+            /* Print frontier vertex list as {v1,v2,...} */
+            char bag_buf[256];
+            int  bpos = 0;
+            bag_buf[bpos++] = '{';
+            for (int fi = 0; fi < R->fs && bpos < 230; fi++) {
+                if (fi > 0) bag_buf[bpos++] = ',';
+                bpos += snprintf(bag_buf + bpos, sizeof(bag_buf) - bpos - 2,
+                                 "%d", R->frontier[fi]);
+            }
+            bag_buf[bpos++] = '}';
+            bag_buf[bpos]   = '\0';
+
+            double t_now = now_ms();
+            size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
+            const char *mode = sm_should_use_ext(states_in, n_back, ram)
+                               ? "[ext]" : "[sm]";
+            fprintf(stderr,
+                "%s%4d  %6d  %2d  %6d  %5d  %9zu  %10zu  %8.1f  %8.1f  %-*s  %s\n",
+                tag, step, v, R->fs, n_back, e_bag,
+                states_in, R->curr->cnt,
+                t_now - t_prev, t_now - t_start,
+                (int)(2 + R->fs * 4), bag_buf, mode);
+            t_prev = t_now;
+        }
+        }
+    return 0;
+}
+
 void count_ham_paths_sm(
     int         n,
     const int  *order,
@@ -3649,140 +3864,62 @@ void count_ham_paths_sm(
     uint64_t   *cyc_lo,      /* out: cycle count low 64 bits (NULL = skip)  */
     uint64_t   *cyc_hi       /* out: cycle count high 64 bits               */
 ) {
-    int  frontier[MAX_FS_FAST + 2];
-    int *fidx = (int*)malloc((size_t)(n + 1) * sizeof(int));
-    int  fs   = 0;
-    for (int i = 0; i <= n; i++) fidx[i] = -1;
+    /* Counts are mod 2^64 (wrapping) unless sm_set_modulus chose a prime;
+       a wrap is recorded, and if sm_set_crt configured moduli, the steps
+       from the last snapshot before the wrap are replayed mod each prime
+       (sm_crt_replay_from / sm_crt_residue), so the caller can combine. */
+    sm_val_overflow = 0; sm_wrap_step = -1; sm_cur_step = -1; sm_crt_from = -1;
+    SMRunState R0 = {0}, *R = &R0;
+    R->fidx = (int*)malloc((size_t)(n + 1) * sizeof(int));
+    for (int i = 0; i <= n; i++) R->fidx[i] = -1;
+    R->curr = smtab_alloc(1024);
+    R->nxt  = smtab_alloc(1024);
+    R->curr->data[0].key = KEY_MARKER;
+    R->curr->data[0].val = (u64)1;
+    R->curr->cnt = 1;
 
-    SMTab *curr = smtab_alloc(1024);
-    SMTab *nxt  = smtab_alloc(1024);
-    u128 total  = (u128)0;
-    u128 cycles = (u128)0;
-
-    curr->data[0].key = KEY_MARKER;
-    curr->data[0].val = (u64)1;
-    curr->cnt = 1;
-
-    double t_start = now_ms(), t_prev = t_start;
     if (verbose)
         fprintf(stderr,
             "step  vertex  fs  n_back  e_bag  states_in  states_out"
             "  step_ms  cumul_ms  bag  [sm]\n");
 
-    for (int step = 0; step < n; step++) {
-        int v = order[step];
-        if (fs > MAX_FS_FAST) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
+    SMSnap snap = {0};
+    int use_snap = (sm_mod == 0 && sm_crt_k > 0);
+    int rc = sm_run_steps(R, 0, n, order, pos, last_s, adj_off, adj_dat,
+                          verbose, ram_bytes, instrument, cyc_lo != NULL,
+                          use_snap ? &snap : NULL, "");
+    if (rc < 0) { *res_lo = *res_hi = UINT64_MAX; goto cleanup; }
 
-        /* A. Introduce: transform curr->data in-place.
-           introduce(key, fs) ORs enc_v(0)<<(4*fs) into each key — it only
-           touches bits at position fs and is independent per entry, so P
-           threads can do N/P entries each with no synchronisation.
-           In-place avoids allocating a separate nxt here, halving peak RAM:
-             Old (copy): curr(si) + nxt(si) = 2×si simultaneously
-             New (in-place): curr(si) only — nxt allocated later in sweep
-           At n=75 step 57 (13.3B states = 303GB) this saves 303GB.      */
-        double t_intro0 = now_ms();
-        sm_introduce(curr, fs);
-        double t_intro_ms = now_ms() - t_intro0;
-        if (instrument)
-            fprintf(stderr, "  [inst] introduce: si=%zuM  %.0fms\n",
-                    curr->cnt / 1000000, t_intro_ms);
-        /* curr->data now holds the introduced keys; pass directly to sweep.
-           No swap needed — curr IS the introduced table.                  */
-        frontier[fs] = v; fidx[v] = fs; fs++;
-
-        /* nxt is still empty (data=NULL from previous step's free or initial
-           state).  sm_fused_sweep will allocate it via smtab_ensure.      */
-
-        /* B+C. Fused sweep */
-        int v_idx = fs - 1;
-        size_t states_in = curr->cnt;
-        int n_back = 0, widxs[8];
-        for (int ai = adj_off[v]; ai < adj_off[v+1]; ai++) {
-            int w = adj_dat[ai];
-            if (fidx[w] >= 0 && pos[w] < pos[v] && n_back < 8)
-                widxs[n_back++] = fidx[w];
-        }
-        int elim_asc[MAX_FS_FAST+2], n_elim = 0;
-        for (int ei = 0; ei < fs; ei++)
-            if (last_s[frontier[ei]] <= step) elim_asc[n_elim++] = ei;
-        int elim_desc[MAX_FS_FAST+2];
-        for (int e = 0; e < n_elim; e++)
-            elim_desc[e] = elim_asc[n_elim-1-e];
-
-        /* resolve ram_bytes: use provided value or conservative 8 GB default */
-        size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
-
-        u128 *cyc_ptr = (cyc_lo && step == n - 1) ? &cycles : NULL;
-        sm_fused_sweep(curr, nxt, fs, v_idx, widxs, n_back,
-                       elim_desc, n_elim, step, n, &total, ram, instrument,
-                       cyc_ptr);
-        /* Free curr->data (the in-place-introduced table workers just read).
-           The ext path already frees it inside sm_fused_sweep (sets to NULL);
-           the RAM path does not, so this handles both: free(NULL) is a no-op. */
-        sm_free(curr->data); curr->data = NULL; curr->cap = 0; curr->cnt = 0;
-        { SMTab *t = curr; curr = nxt; nxt = t; }
-
-        /* Optional per-step checksum (HAM_SM_CKSUM=1): order-independent
-           digest of the state table plus a strict-sortedness check, used by
-           the tests to compare merge implementations step by step.        */
-        if (sm_cksum_enabled()) sm_cksum_print(step, curr->data, curr->cnt);
-
-        /* Update frontier */
-        for (int e = n_elim-1; e >= 0; e--) {
-            int ei = elim_asc[e];
-            fidx[frontier[ei]] = -1;
-            for (int k = ei; k < fs-1; k++) {
-                frontier[k] = frontier[k+1]; fidx[frontier[k]] = k;
-            }
-            fs--;
-        }
-
-        if (verbose) {
-            /* Count intra-frontier edges (both endpoints in frontier) */
-            int e_bag = 0;
-            for (int fi = 0; fi < fs; fi++) {
-                int u = frontier[fi];
-                for (int ai = adj_off[u]; ai < adj_off[u+1]; ai++) {
-                    int w = adj_dat[ai];
-                    if (fidx[w] >= 0 && fidx[w] > fi)  /* count each edge once */
-                        e_bag++;
-                }
-            }
-            /* Print frontier vertex list as {v1,v2,...} */
-            char bag_buf[256];
-            int  bpos = 0;
-            bag_buf[bpos++] = '{';
-            for (int fi = 0; fi < fs && bpos < 230; fi++) {
-                if (fi > 0) bag_buf[bpos++] = ',';
-                bpos += snprintf(bag_buf + bpos, sizeof(bag_buf) - bpos - 2,
-                                 "%d", frontier[fi]);
-            }
-            bag_buf[bpos++] = '}';
-            bag_buf[bpos]   = '\0';
-
-            double t_now = now_ms();
-            size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
-            const char *mode = sm_should_use_ext(states_in, n_back, ram)
-                               ? "[ext]" : "[sm]";
-            fprintf(stderr,
-                "%4d  %6d  %2d  %6d  %5d  %9zu  %10zu  %8.1f  %8.1f  %-*s  %s\n",
-                step, v, fs, n_back, e_bag,
-                states_in, curr->cnt,
-                t_now - t_prev, t_now - t_start,
-                (int)(2 + fs * 4), bag_buf, mode);
-            t_prev = t_now;
-        }
+    *res_lo = (uint64_t) R->total;
+    *res_hi = (uint64_t)(R->total >> 64);
+    if (cyc_lo) {
+        *cyc_lo = (uint64_t) R->cycles;
+        *cyc_hi = (uint64_t)(R->cycles >> 64);
     }
 
-    *res_lo = (uint64_t) total;
-    *res_hi = (uint64_t)(total >> 64);
-    if (cyc_lo) {
-        *cyc_lo = (uint64_t) cycles;
-        *cyc_hi = (uint64_t)(cycles >> 64);
+    if (use_snap && sm_val_overflow && snap.valid && snap.step <= sm_wrap_step) {
+        int wrap = sm_wrap_step;
+        sm_crt_from = snap.step;
+        for (int i = 0; i < sm_crt_k; i++) {
+            u64 p = sm_crt_mod[i];
+            if (verbose)
+                fprintf(stderr, "# CRT replay mod %llu from step %d (first wrap at step %d, "
+                        "snapshot %zu states)\n", (unsigned long long)p, snap.step, wrap, snap.cnt);
+            sm_snap_restore(&snap, R, n, p);
+            sm_mod = p;
+            char tag[48]; snprintf(tag, sizeof tag, "[crt %d]", i);
+            sm_run_steps(R, snap.step, n, order, pos, last_s, adj_off, adj_dat,
+                         verbose, ram_bytes, instrument, cyc_lo != NULL, NULL, tag);
+            sm_mod = 0;
+            sm_crt_res[i][0] = (u64)(R->total % p);
+            sm_crt_res[i][1] = (u64)(R->cycles % p);
+        }
+        sm_wrap_step = wrap;           /* replays must not hide the wrap  */
+        sm_val_overflow = 1;
     }
 
 cleanup:
-    smtab_free(curr); smtab_free(nxt);
-    free(fidx);
+    sm_free(snap.data); free(snap.fidx);
+    smtab_free(R->curr); smtab_free(R->nxt);
+    free(R->fidx);
 }

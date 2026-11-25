@@ -46,7 +46,7 @@ count_hamiltonian_paths_c(n, order, adj)  ->  int
 _get_lib()                                ->  (lib, ffi)
 """
 
-import os, hashlib, subprocess, tempfile, cffi
+import os, hashlib, math, subprocess, tempfile, cffi
 
 import pathlib as _pathlib
 _HERE = _pathlib.Path(__file__).parent
@@ -464,6 +464,12 @@ def _get_lib():
             uint64_t *cyc_lo, uint64_t *cyc_hi);
 
         int  sm_overflow_detected(void);
+        int  sm_overflow_step(void);
+        void sm_set_modulus(uint64_t p);
+        void sm_set_word_bits(int b);
+        void sm_set_crt(const uint64_t *moduli, int k, uint64_t snap_bytes);
+        int  sm_crt_replay_from(void);
+        uint64_t sm_crt_residue(int i, int which);
 
         void count_ham_paths_sm(
             int n, const int *order, const int *pos, const int *last_s,
@@ -676,6 +682,89 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
     return paths
 
 
+# ---------------------------------------------------------------------------
+# 64-bit state counts: residues and the Chinese remainder theorem
+# ---------------------------------------------------------------------------
+# The sort-merge DP stores each state's count in a u64.  A state's count is
+# the number of partial path systems with that frontier state and is not
+# bounded by H(n), so it can wrap even when H(n) < 2^64 (n = 74, kpw
+# ordering).  The DP only adds counts, so with wrapping arithmetic the result
+# is exact mod 2^64; replays mod primes p_i < 2^62 give it mod p_i, and the
+# CRT recovers H(n) exactly provided H(n) < 2^64 * prod p_i.  That
+# hypothesis is certified by the Bregman-Minc bound (hamiltonian/bounds/
+# bregman.py): adding a vertex joined to everything turns each directed
+# Hamiltonian path into a cycle cover, so
+#     2 H <= per(A') <= prod_v ((d_v + 1)!)^(1/(d_v + 1)) * (n!)^(1/n),
+# and the number of Hamiltonian cycles is at most H / n <= H.
+
+class SMOverflow(OverflowError):
+    """State counts wrapped mod 2^64 and the CRT was not requested.
+
+    residue        : number of paths mod 2^64 (2^_word_bits in tests)
+    cycles_residue : number of cycles mod 2^64 (None unless counted)
+    step           : first step at which a count wrapped
+    """
+    def __init__(self, msg, residue, cycles_residue, step):
+        super().__init__(msg)
+        self.residue, self.cycles_residue, self.step = residue, cycles_residue, step
+
+
+def _is_prime(m: int) -> bool:
+    """Deterministic Miller-Rabin for m < 3.3e24 (first 12 prime bases)."""
+    if m < 2:
+        return False
+    small = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+    for q in small:
+        if m % q == 0:
+            return m == q
+    d, r = m - 1, 0
+    while d % 2 == 0:
+        d //= 2; r += 1
+    for a in small:
+        x = pow(a, d, m)
+        if x in (1, m - 1):
+            continue
+        for _ in range(r - 1):
+            x = x * x % m
+            if x == m - 1:
+                break
+        else:
+            return False
+    return True
+
+
+_CRT_PRIMES: list = []
+
+def crt_primes(k: int) -> list:
+    """The k largest primes <= 2^61 - 1 (a Mersenne prime first)."""
+    if len(_CRT_PRIMES) < k:
+        c = (1 << 61) - 1 if not _CRT_PRIMES else _CRT_PRIMES[-1] - 2
+        while len(_CRT_PRIMES) < k:
+            if _is_prime(c):
+                _CRT_PRIMES.append(c)
+            c -= 2
+    return _CRT_PRIMES[:k]
+
+
+def bregman_log2_bound(n: int, adj: dict) -> float:
+    """log2 of the Bregman-Minc upper bound for the number of (undirected)
+    Hamiltonian paths of the graph adj on vertices 1..n."""
+    from math import lgamma, log
+    s = sum(lgamma(len(adj[v]) + 2) / (len(adj[v]) + 1) for v in range(1, n + 1))
+    s += lgamma(n + 1) / n - log(2)
+    return s / log(2)
+
+
+def crt_combine(residues: list, moduli: list) -> int:
+    """The unique 0 <= x < prod(moduli) with x = r_i mod m_i (Garner)."""
+    x, m = 0, 1
+    for r, q in zip(residues, moduli):
+        t = ((r - x) * pow(m, -1, q)) % q
+        x += m * t
+        m *= q
+    return x
+
+
 def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 verbose: bool = False,
                                 instrument: bool = False,
@@ -684,6 +773,9 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 mem_reserve_gb: float = 0.0,
                                 count_cycles: bool = False,
                                 ram_bytes: int | None = None,
+                                on_overflow: str = "crt",
+                                crt_snap_bytes: int | None = None,
+                                _word_bits: int = 64,
                                 **kwargs):
     """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
 
@@ -701,6 +793,19 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     ram_bytes      : use this instead of the detected physical RAM for the
                      RAM/ext and merge-budget decisions (tests, what-if runs).
                      mem_reserve_gb is applied on top of it.
+    on_overflow    : what to do if a state count wraps mod 2^64.
+                     "crt"     (default) recover the exact value: replay the
+                               steps from the last snapshot before the first
+                               wrap mod enough primes p_i < 2^62 that
+                               2^64 * prod p_i exceeds the Bregman bound, or,
+                               if no snapshot was kept, rerun the whole DP
+                               mod each p_i; combine by the CRT.
+                     "residue" raise SMOverflow carrying the result mod 2^64
+                               and the first wrapping step.
+    crt_snap_bytes : largest state table kept as the replay snapshot
+                     (default min(1 GiB, RAM/64)).
+    _word_bits     : test hook only: emulate 2^b-bit counts (b < 64) so that
+                     wraps and the CRT path can be exercised at small n.
     """
     import sys
     if checkpoint_path:
@@ -743,26 +848,80 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     c_cyc_lo = ffi.new("uint64_t*") if count_cycles else ffi.NULL
     c_cyc_hi = ffi.new("uint64_t*") if count_cycles else ffi.NULL
 
-    lib.count_ham_paths_sm(
-        n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
-        c_res_lo, c_res_hi, int(verbose), ram, int(instrument),
-        c_cyc_lo, c_cyc_hi,
-    )
-    lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
-    if lo == hi == 0xFFFFFFFFFFFFFFFF:
-        raise RuntimeError(
-            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16)."
-        )
+    if on_overflow not in ("crt", "residue"):
+        raise ValueError(f"on_overflow must be 'crt' or 'residue', not {on_overflow!r}")
+    bound2 = bregman_log2_bound(n, adj)
+    k = 0
+    W = _word_bits if 8 <= _word_bits < 64 else 64
+    while W + sum(log2_p for log2_p in
+                   (math.log2(q) for q in crt_primes(k))) < bound2 + 1.0:
+        k += 1
+    primes = crt_primes(k)
+    snap = crt_snap_bytes if crt_snap_bytes is not None else min(1 << 30, ram // 64)
+
+    def _run(modulus=0, crt=()):
+        lib.sm_set_modulus(modulus)
+        c_mod = ffi.new("uint64_t[]", list(crt) or [0])
+        lib.sm_set_crt(c_mod, len(crt), snap if crt else 0)
+        try:
+            lib.count_ham_paths_sm(
+                n, c_order, c_pos, c_last_s, c_adj_off, c_adj_dat,
+                c_res_lo, c_res_hi, int(verbose), ram, int(instrument),
+                c_cyc_lo, c_cyc_hi,
+            )
+        finally:
+            lib.sm_set_modulus(0)
+            lib.sm_set_crt(c_mod, 0, 0)
+        lo_, hi_ = int(c_res_lo[0]), int(c_res_hi[0])
+        if lo_ == hi_ == 0xFFFFFFFFFFFFFFFF:
+            raise RuntimeError("Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16).")
+        cyc_ = ((int(c_cyc_hi[0]) << 64) | int(c_cyc_lo[0])) if count_cycles else None
+        return (hi_ << 64) | lo_, cyc_
+
+    lib.sm_set_word_bits(W)
+    try:
+        paths, cycles = _run(crt=primes if on_overflow == "crt" else ())
+    except BaseException:
+        lib.sm_set_word_bits(64); raise
     if lib.sm_overflow_detected():
-        raise OverflowError(
-            "Sort-merge DP: a state count exceeded 2^64 during deduplication. "
-            "The result is INCORRECT. Use the EH backend (drop --sort-merge) "
-            "or increase the field width. Individual state counts exceeded u64 max."
-        )
-    paths = (hi << 64) | lo
+        step = lib.sm_overflow_step()
+        r_paths = paths % (1 << W)
+        r_cyc = cycles % (1 << W) if count_cycles else None
+        if on_overflow == "residue":
+            lib.sm_set_word_bits(64)
+            raise SMOverflow(
+                f"Sort-merge DP: a state count wrapped mod 2^{W} (first at step {step}). "
+                f"Paths mod 2^{W} = {r_paths}"
+                + (f", cycles mod 2^{W} = {r_cyc}" if count_cycles else "")
+                + ". Use on_overflow='crt' for the exact value.",
+                r_paths, r_cyc, step)
+        frm = lib.sm_crt_replay_from()
+        if frm >= 0:
+            res_p = [int(lib.sm_crt_residue(i, 0)) for i in range(k)]
+            res_c = [int(lib.sm_crt_residue(i, 1)) for i in range(k)]
+            how = f"replayed steps {frm}..{n-1}"
+        else:
+            res_p, res_c = [], []
+            lib.sm_set_word_bits(64)          # mod-p runs never wrap
+            for q in primes:
+                pp, cc = _run(modulus=q)
+                res_p.append(pp % q)
+                res_c.append(cc % q if count_cycles else 0)
+            how = "full reruns (no snapshot before the wrap)"
+        mods = [1 << W] + primes
+        paths = crt_combine([r_paths] + res_p, mods)
+        if count_cycles:
+            cycles = crt_combine([r_cyc] + res_c, mods)
+        M2 = W + sum(math.log2(q) for q in primes)
+        # Certification: the true value is < 2^bound2 < prod(mods); the CRT
+        # value is the unique residue below prod(mods), so it is the count.
+        assert paths < 2.0 ** (bound2 + 1.0), "CRT result exceeds the Bregman bound"
+        print(f"# sort-merge: counts wrapped mod 2^{W} (first at step {step}); "
+              f"exact value by CRT with {k} prime(s) < 2^62 ({how}); "
+              f"Bregman bound 2^{bound2:.1f} < modulus 2^{M2:.1f}", file=sys.stderr)
+    lib.sm_set_word_bits(64)
     if count_cycles:
-        cyc_lo2, cyc_hi2 = int(c_cyc_lo[0]), int(c_cyc_hi[0])
-        return paths, (cyc_hi2 << 64) | cyc_lo2
+        return paths, cycles
     return paths
 
 
