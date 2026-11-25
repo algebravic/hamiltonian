@@ -15,6 +15,8 @@ dependencies = [
     "scipy>=1.17.1",
     "pandas>=3.0.2",
     "graph-families",
+    "kobayashi-pw",
+    "numpy",
 ]
 
 [project.scripts]
@@ -22,6 +24,7 @@ tours = "hamiltonian.run:run_tours"
 write = "hamiltonian.run:write_graph"
 count = "hamiltonian.claude.ham_count:main"
 analysis = "hamiltonian.claude.profile_analysis:main"
+fit-work-model = "hamiltonian.claude.work_model:main"
 
 [dependency-groups]
 dev = ["pytest>=5.2"]
@@ -32,6 +35,10 @@ dev = ["pytest>=5.2"]
 graphillion = { git = "https://github.com/takemaru/graphillion.git", rev = "v2.0rc0" }
 separation = { git = "https://github.com/algebravic/separation.git" }
 graph-families = { git = "https://github.com/algebravic/graph_families.git" }
+kobayashi-pw = { path = "../kobayashi-pw", editable = true }
+# Once kobayashi-pw is on GitHub, a pinned git source works the same way: its C
+# programs are compiled on first use (kobayashi_pw.native), so no build step is needed.
+# kobayashi-pw = { git = "https://github.com/algebravic/kobayashi-pw.git", rev = "<tag or commit>" }
 
 [build-system]
 requires = ["hatchling"]

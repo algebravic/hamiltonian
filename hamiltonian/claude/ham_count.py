@@ -21,15 +21,23 @@ Two modes of operation
 Pipeline
 --------
 1. Build/read the graph.
-2. Compute the optimal pathwidth vertex ordering via the `separation`
-   package (algebravic/separation on GitHub), which encodes the problem
-   as MaxSAT and solves it with RC2.
+2. Compute a pathwidth-optimal vertex ordering, by one of:
+   --ordering kpw     the kobayashi-pw DAG of pathwidth-optimal orderings
+                      (kpw/kpw2 -c), then the exact minimum of a secondary
+                      cost over it (ham_kpw.py; default cost: the fitted
+                      work model in work_model.py);
+   --ordering maxsat  the `separation` package (algebravic/separation),
+                      MaxSAT solved with RC2, then simulated annealing
+                      (the default, and the method used for n <= 75);
+   --ordering bfs     best BFS ordering (no optimality guarantee).
 3. Run the C frontier DP (ham_dp_c.py) with that ordering.
 
 Options
 -------
   --graph FILE     Read graph from a DIMACS file instead of building G_n.
-  --no-pw          Use best-BFS ordering instead of MaxSAT pathwidth.
+  --ordering M     maxsat (default), kpw, or bfs.
+  --kpw-cost C     (kpw) work (default), v7 or v2.
+  --no-pw          Alias for --ordering bfs.
   --no-refine      Skip the SA refinement step.
   --refine-iters N SA iterations (default: 100000).
   --bound K        Pathwidth upper bound hint for the MaxSAT solver.
@@ -63,6 +71,7 @@ import networkx as nx
 
 from .ham_dp_c import count_hamiltonian_paths_c, count_hamiltonian_paths_sm, _get_lib, set_machine_yaml
 from .ham_ordering import build_graph, best_bfs_order, frontier_stats, sa_refine_order, best_multistart_order, validate_multistart_orders
+from . import ham_kpw
 
 
 # ---------------------------------------------------------------------------
@@ -249,10 +258,49 @@ def parse_args():
                    help="Last n to compute in G_n mode (default: same as start_n).")
 
     # --- Ordering options ---
+    p.add_argument("--ordering", choices=["maxsat", "kpw", "bfs"], default="maxsat",
+                   help="How to compute the vertex ordering: maxsat (MaxSAT pathwidth via "
+                        "`separation`, then simulated annealing; default), kpw (exact "
+                        "pathwidth DAG from kobayashi-pw, then the exact optimum of "
+                        "--kpw-cost over it), or bfs (heuristic).")
     p.add_argument("--no-pw", action="store_true",
-                   help="Use BFS ordering instead of MaxSAT pathwidth.")
+                   help="Alias for --ordering bfs.")
+    p.add_argument("--kpw-cost", choices=list(ham_kpw.COSTS), default="work",
+                   help="(kpw) Secondary cost minimised exactly over the DAG: work = "
+                        "predicted DP work from the fitted model (default; falls back to "
+                        "v7 if --work-model is missing), v7 = _dp_cost, v2 = additive.")
+    p.add_argument("--work-model", default=None, metavar="PATH",
+                   help="(kpw) Fitted work model JSON (default: work_model.json next to "
+                        "work_model.py; make it with `fit-work-model`).")
+    p.add_argument("--kpw-bin", default=None, metavar="PATH",
+                   help="(kpw) kpw/kpw2 binary (default: kobayashi-pw's src/C, then PATH; "
+                        "kpw2 is needed for n > 64).  Without one the DAG is built in Python.")
+    p.add_argument("--kpw-threads", type=int, default=0, metavar="N",
+                   help="(kpw) Threads for kpw2 (default 0 = all cores).")
+    p.add_argument("--dag-cache", default=ham_kpw.DEFAULT_DAG_CACHE, metavar="DIR",
+                   help="(kpw) Directory for cached DAG files (default: data/dags). "
+                        "Use '' to disable caching.")
+    p.add_argument("--kpw-greedy2", action="store_true",
+                   help="(kpw) Second greedy rule: smaller DAG, usually worse orderings.")
+    p.add_argument("--kpw-max-labels", type=int, default=None, metavar="L",
+                   help="(kpw) Keep at most L Pareto labels per DAG node (bounds the "
+                        "optimiser's memory; the result may then be suboptimal).")
+    p.add_argument("--kpw-engine", choices=["kopt", "dsl"], default="kopt",
+                   help="(kpw) kopt: DAG from kpw/kpw2 (cached) optimised by kopt (default); "
+                        "dsl: kobayashi-pw's DSL (engine E2), same orderings, one process, no DAG file.")
+    p.add_argument("--kpw-python", action="store_true",
+                   help="(kpw) Optimise in Python even if the C optimiser kopt is built.")
+    p.add_argument("--kopt-bin", default=None, metavar="PATH",
+                   help="(kpw) kopt binary (default: kobayashi-pw's src/C, then PATH).")
+    p.add_argument("--kpw-polish", action="store_true",
+                   help="(kpw) Run the simulated annealing of --ordering maxsat from the "
+                        "DAG optimum (off by default).")
+    p.add_argument("--kpw-candidates", type=int, default=0, metavar="K",
+                   help="(kpw) Also generate the K best V2 orderings and the optima of the "
+                        "other costs, and choose among them by a partial DP over the first "
+                        "--multi-start-validate steps (default n//2).  0 = off.")
     p.add_argument("--no-refine", action="store_true",
-                   help="Skip the SA refinement of the MaxSAT ordering.")
+                   help="(maxsat) Skip the SA refinement of the MaxSAT ordering.")
     p.add_argument("--multi-start", action="store_true",
                    help="Run SA from all topologically distinct MaxSAT orderings "
                         "and pick the best.  Implies --refine.  Prints per-solution "
@@ -407,6 +455,59 @@ def parse_args():
     return p.parse_args()
 
 
+def _ordering_desc(args, use_pw: bool) -> str:
+    """Ordering method as printed in the header line."""
+    if not use_pw or args.ordering == "bfs":
+        return "BFS-heuristic"
+    if args.ordering == "kpw":
+        return f"kpw-dag({args.kpw_cost})"
+    return "MaxSAT-pathwidth"
+
+
+def _kpw_ordering(label, n_vertices, adj, args, eb, da):
+    """Pathwidth and ordering from the kobayashi-pw DAG (see ham_kpw.py)."""
+    import re
+    cache_label = re.sub(r"[^A-Za-z0-9._-]+", "", label.replace("n=", "G").replace("graph=", ""))
+    def get_dag():
+        return ham_kpw.load_dag(adj, cache_dir=args.dag_cache or None, kpw_bin=args.kpw_bin,
+                                threads=args.kpw_threads, greedy2=args.kpw_greedy2,
+                                label=cache_label or "G")
+    dag = None
+    if args.kpw_engine == "dsl":
+        if args.kpw_greedy2 or args.kpw_python:
+            print("  WARNING: --kpw-greedy2/--kpw-python apply to --kpw-engine kopt only", flush=True)
+        res = ham_kpw.kpw_order(adj, cost=args.kpw_cost, work_model=args.work_model,
+                                expand_base=eb, density_alpha=da,
+                                max_labels=args.kpw_max_labels, engine="dsl")
+    else:
+        dag = get_dag()
+        res = ham_kpw.kpw_order(adj, cost=args.kpw_cost, work_model=args.work_model,
+                                expand_base=eb, density_alpha=da,
+                                max_labels=args.kpw_max_labels, dag=dag,
+                                python=args.kpw_python, kopt_bin=args.kopt_bin)
+    if "fallback" in res.extra:
+        print(f"  WARNING: {res.extra['fallback']}", flush=True)
+    print(f"  {res.summary()}", flush=True)
+    order = res.order
+
+    if args.kpw_candidates > 0:
+        dag = dag or get_dag()
+        _, cands = ham_kpw.kpw_candidates(
+            adj, k=args.kpw_candidates, work_model=args.work_model,
+            expand_base=eb, density_alpha=da, max_labels=args.kpw_max_labels, dag=dag,
+            python=args.kpw_python, kopt_bin=args.kopt_bin)
+        k = args.multi_start_validate or n_vertices // 2
+        tags = {tuple(o): t for t, o in cands}
+        print(f"  kpw candidates: {len(cands)} distinct; ranking by partial DP "
+              f"({k} steps)", flush=True)
+        ranked = validate_multistart_orders([(0.0, o) for _, o in cands], adj, n_vertices,
+                                            step_limit=k, verbose=True)
+        order = list(ranked[0][2])
+        print(f"  kpw candidates: chose {tags[tuple(order)]} "
+              f"({ranked[0][0]:.0f} ms for {k} steps)", flush=True)
+    return res.pw, order
+
+
 def _run_one(label, n_vertices, G, adj, args, use_pw):
     """
     Run the full ordering + DP pipeline for a single graph.
@@ -427,8 +528,13 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
     # --- Vertex ordering ---
     t_ord = time.time()
     pw = None
+    method = args.ordering if use_pw else "bfs"
+    eb = getattr(args, 'expand_base', 1.55)
+    da = getattr(args, 'density_alpha', 0.25)
 
-    if use_pw:
+    if method == "kpw":
+        pw, order = _kpw_ordering(label, n_vertices, adj, args, eb, da)
+    elif method == "maxsat":
         try:
             pw, order = get_pathwidth_order(
                 G,
@@ -443,15 +549,14 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
             print(f"  WARNING: {e}\n  Falling back to BFS.", flush=True)
             use_pw = False
 
-    if not use_pw or pw is None:
+    if pw is None:
         order = best_bfs_order(adj, n_vertices)
 
-    # --- SA refinement ---
-    if pw is not None and not args.no_refine:
-        eb = getattr(args, 'expand_base', 1.55)
-        da = getattr(args, 'density_alpha', 0.25)
+    # --- SA refinement (maxsat; kpw only with --kpw-polish) ---
+    if pw is not None and ((method == "maxsat" and not args.no_refine)
+                           or (method == "kpw" and args.kpw_polish)):
         sp = getattr(args, 'spike_penalty', 0.0)
-        if getattr(args, 'multi_start', False):
+        if method == "maxsat" and getattr(args, 'multi_start', False):
             order, ms_cost, ms_candidates, ms_distinct, ms_total = best_multistart_order(
                 adj, n_vertices, G, pw,
                 n_iter=args.refine_iters,
@@ -556,7 +661,7 @@ def main():
     args = parse_args()
     # Apply machine-yaml override before the C library is compiled.
     set_machine_yaml(getattr(args, 'machine_yaml', None))
-    use_pw = not args.no_pw
+    use_pw = not args.no_pw and args.ordering != "bfs"
 
     print("# Compiling C library …", flush=True)
     _get_lib()
@@ -568,7 +673,7 @@ def main():
         # ---------------------------------------------------------------
         path = args.graph
         label = os.path.basename(path)
-        print(f"# Graph: {path}  ordering={'MaxSAT-pathwidth' if use_pw else 'BFS-heuristic'}",
+        print(f"# Graph: {path}  ordering={_ordering_desc(args, use_pw)}",
               flush=True)
 
         G = read_dimacs(path)
@@ -586,7 +691,7 @@ def main():
         end_n   = args.end_n if args.end_n is not None else start_n
 
         print(f"# n = {start_n}..{end_n}  "
-              f"ordering={'MaxSAT-pathwidth' if use_pw else 'BFS-heuristic'}",
+              f"ordering={_ordering_desc(args, use_pw)}",
               flush=True)
 
         for n in range(start_n, end_n + 1):

@@ -731,6 +731,7 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
         c_res_lo, c_res_hi, 0,      # verbose=False
         c_empty, ffi.cast("double", 0.0),
         ffi.cast("int", step_limit),
+        ffi.NULL, ffi.NULL,         # no cycle counting
     )
     # Decode result:
     #   res_hi == UINT64_MAX-1 : partial-run sentinel — res_lo holds elapsed ms
