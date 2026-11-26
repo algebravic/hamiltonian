@@ -22,20 +22,22 @@ Pipeline
 --------
 1. Build/read the graph.
 2. Compute a pathwidth-optimal vertex ordering, by one of:
-   --ordering kpw     the kobayashi-pw DAG of pathwidth-optimal orderings
-                      (kpw/kpw2 -c), then the exact minimum of a secondary
-                      cost over it (ham_kpw.py; default cost: the fitted
-                      work model in work_model.py);
+   --ordering kpw     (default) the pathwidth-optimal orderings of
+                      kobayashi-pw, then the exact minimum of a secondary
+                      cost over them (ham_kpw.py; default cost: the fitted
+                      work model in work_model.py; default engine: the DSL,
+                      --kpw-engine kopt for the kpw/kpw2 DAG + kopt);
    --ordering maxsat  the `separation` package (algebravic/separation),
                       MaxSAT solved with RC2, then simulated annealing
-                      (the default, and the method used for n <= 75);
+                      (the earlier default, used for the runs to n = 75);
    --ordering bfs     best BFS ordering (no optimality guarantee).
 3. Run the C frontier DP (ham_dp_c.py) with that ordering.
 
 Options
 -------
   --graph FILE     Read graph from a DIMACS file instead of building G_n.
-  --ordering M     maxsat (default), kpw, or bfs.
+  --ordering M     kpw (default), maxsat, or bfs.
+  --prune P        (sort-merge) drop (default), report or none.
   --kpw-cost C     (kpw) work (default), v7 or v2.
   --no-pw          Alias for --ordering bfs.
   --no-refine      Skip the SA refinement step.
@@ -259,11 +261,11 @@ def parse_args():
                    help="Last n to compute in G_n mode (default: same as start_n).")
 
     # --- Ordering options ---
-    p.add_argument("--ordering", choices=["maxsat", "kpw", "bfs"], default="maxsat",
-                   help="How to compute the vertex ordering: maxsat (MaxSAT pathwidth via "
-                        "`separation`, then simulated annealing; default), kpw (exact "
-                        "pathwidth DAG from kobayashi-pw, then the exact optimum of "
-                        "--kpw-cost over it), or bfs (heuristic).")
+    p.add_argument("--ordering", choices=["maxsat", "kpw", "bfs"], default="kpw",
+                   help="How to compute the vertex ordering: kpw (default; exact "
+                        "pathwidth-optimal orderings from kobayashi-pw, then the exact "
+                        "optimum of --kpw-cost over them), maxsat (MaxSAT pathwidth via "
+                        "`separation`, then simulated annealing), or bfs (heuristic).")
     p.add_argument("--no-pw", action="store_true",
                    help="Alias for --ordering bfs.")
     p.add_argument("--kpw-cost", choices=list(ham_kpw.COSTS), default="work",
@@ -286,9 +288,10 @@ def parse_args():
     p.add_argument("--kpw-max-labels", type=int, default=None, metavar="L",
                    help="(kpw) Keep at most L Pareto labels per DAG node (bounds the "
                         "optimiser's memory; the result may then be suboptimal).")
-    p.add_argument("--kpw-engine", choices=["kopt", "dsl"], default="kopt",
-                   help="(kpw) kopt: DAG from kpw/kpw2 (cached) optimised by kopt (default); "
-                        "dsl: kobayashi-pw's DSL (engine E2), same orderings, one process, no DAG file.")
+    p.add_argument("--kpw-engine", choices=["kopt", "dsl"], default="dsl",
+                   help="(kpw) dsl: kobayashi-pw's DSL (engine E2), one process, no DAG "
+                        "file (default); kopt: DAG from kpw/kpw2 (cached) optimised by "
+                        "kopt, same orderings.")
     p.add_argument("--kpw-python", action="store_true",
                    help="(kpw) Optimise in Python even if the C optimiser kopt is built.")
     p.add_argument("--kopt-bin", default=None, metavar="PATH",
@@ -373,6 +376,12 @@ def parse_args():
                    help="Use sort-merge DP backend instead of EH+rsort. "
                         "Run storage (RAM vs file-backed) is chosen automatically "
                         "per step based on available physical RAM.")
+    p.add_argument("--prune", choices=["drop", "report", "none"], default="drop",
+                   help="(sort-merge only) Completability pruning after each step "
+                        "(doc/sm_prune_design.md): drop (default) discards states that "
+                        "can no longer become a Hamiltonian path; report keeps them and "
+                        "prints the number of dead states per step (diagnostic, slower "
+                        "than none); none turns it off.  The count is the same.")
     p.add_argument("--cycles", action="store_true",
                    help="Also count Hamiltonian cycles and report alongside paths.")
     p.add_argument("--instrument", action="store_true",
@@ -656,6 +665,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
             count_cycles=_cc,
             on_overflow=getattr(args, 'on_overflow', 'crt'),
             spill_dir=getattr(args, 'spill_dir', None),
+            prune=getattr(args, 'prune', 'drop'),
             crt_snap_bytes=(None if getattr(args, 'crt_snap_gb', None) is None
                             else int(args.crt_snap_gb * (1 << 30))),
         )

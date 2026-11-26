@@ -111,7 +111,8 @@ def test_no_wrap_before_risky_step(setup):
             m.set_machine_yaml({str(m._MACHINE_YAML_PATH)!r})
             adj = build_graph({N}); order = best_bfs_order(adj, {N})
             m.count_hamiltonian_paths_sm({N}, order, adj, ram_bytes={RAM},
-                                         _word_bits={bits}, instrument=True)
+                                         _word_bits={bits}, instrument=True,
+                                         prune="none")  # wraps calibrated unpruned
         """)
         p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                            cwd=str(__import__("pathlib").Path(__file__).resolve().parents[1]))

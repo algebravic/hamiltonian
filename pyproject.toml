@@ -35,10 +35,11 @@ dev = ["pytest>=5.2"]
 graphillion = { git = "https://github.com/takemaru/graphillion.git", rev = "v2.0rc0" }
 separation = { git = "https://github.com/algebravic/separation.git" }
 graph-families = { git = "https://github.com/algebravic/graph_families.git" }
-kobayashi-pw = { path = "../kobayashi-pw", editable = true }
-# Once kobayashi-pw is on GitHub, a pinned git source works the same way: its C
-# programs are compiled on first use (kobayashi_pw.native), so no build step is needed.
-# kobayashi-pw = { git = "https://github.com/algebravic/kobayashi-pw.git", rev = "<tag or commit>" }
+# Pinned to a commit; its C programs are compiled on first use
+# (kobayashi_pw.native), so no build step is needed.  To work on kobayashi-pw
+# alongside, use instead:
+#   kobayashi-pw = { path = "../kobayashi-pw", editable = true }
+kobayashi-pw = { git = "https://github.com/algebravic/kobayashi-pw.git", rev = "5f528634c3271a224ec39eeaebeb780750220216" }
 
 [build-system]
 requires = ["hatchling"]

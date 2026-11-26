@@ -41,7 +41,8 @@ CHILD = textwrap.dedent("""
     kw = {"ram_bytes": 16 << 30}
     if reserve > 0:
         kw["mem_reserve_gb"] = reserve
-    r = m.count_hamiltonian_paths_sm(n, order, adj, instrument=True, **kw)
+    # prune="none": the spill limits below are calibrated on unpruned tables.
+    r = m.count_hamiltonian_paths_sm(n, order, adj, instrument=True, prune="none", **kw)
     print("PATHS", r)
     if len(sys.argv) > 4:
         print("EH", m.count_hamiltonian_paths_c(n, order, adj))

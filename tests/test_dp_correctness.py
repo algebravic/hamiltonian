@@ -93,7 +93,9 @@ def _graphs(seed, count, hk, n_lo=16, n_hi=19):
 @pytest.mark.parametrize("seed", [1, 2])
 def test_many_back_edges(hk, seed):
     for n, adj, order, ref in _graphs(seed, 2, hk):
-        assert m.count_hamiltonian_paths_sm(n, order, adj, ram_bytes=RAM) == ref
+        for prune in ("drop", "none"):
+            assert m.count_hamiltonian_paths_sm(n, order, adj, ram_bytes=RAM,
+                                                prune=prune) == ref
         assert m.count_hamiltonian_paths_c(n, order, adj) == ref
 
 
@@ -162,6 +164,8 @@ def test_width_16_random_graphs(hk):
         if m.in_step_width(order, adjl) != 16:
             continue
         ref = hk(n, adjl)
-        assert m.count_hamiltonian_paths_sm(n, order, adjl, ram_bytes=RAM) == ref
+        for prune in ("drop", "none"):
+            assert m.count_hamiltonian_paths_sm(n, order, adjl, ram_bytes=RAM,
+                                                prune=prune) == ref
         assert m.count_hamiltonian_paths_c(n, order, adjl) == ref
         done += 1
