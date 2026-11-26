@@ -404,57 +404,190 @@ def set_machine_yaml(path: str | None) -> None:
 
 _LIB_CACHE: dict = {}
 
+# ---------------------------------------------------------------------------
+# Build cache.  The compiled library is keyed by a SHA-256 over everything
+# that determines the binary: the C source, the variant, the compiler's
+# resolved path and `--version`, every flag and -D constant, and the
+# platform.  Builds go to a persistent cache directory, under a file lock,
+# and are renamed into place only when complete.
+#   cache dir : $HAM_DP_CACHE, else $XDG_CACHE_HOME/hamiltonian/ham_dp_c,
+#               else ~/.cache/hamiltonian/ham_dp_c
+#   compiler  : set_compiler(path) / $HAM_DP_CC, else gcc-15 if on PATH,
+#               else gcc
+#   CLI       : python -m hamiltonian.claude.ham_dp_c --list-cache
+#               python -m hamiltonian.claude.ham_dp_c --clear-cache
+# ---------------------------------------------------------------------------
+_CC_OVERRIDE: str | None = None
+_FORCE_REBUILD = False
+_CC_IDENT: dict = {}
+
+
+def set_compiler(path: str | None) -> None:
+    """Use this C compiler (None: $HAM_DP_CC, else gcc-15, else gcc)."""
+    global _CC_OVERRIDE, _LIB_CACHE
+    _CC_OVERRIDE = path
+    _LIB_CACHE = {}
+
+
+def force_rebuild(flag: bool = True) -> None:
+    """Recompile on the next use even if a cached build exists."""
+    global _FORCE_REBUILD, _LIB_CACHE
+    _FORCE_REBUILD = flag
+    _LIB_CACHE = {}
+
+
+def cache_dir() -> str:
+    d = os.environ.get("HAM_DP_CACHE")
+    if not d:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+        d = os.path.join(base, "hamiltonian", "ham_dp_c")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _compiler() -> str:
+    import shutil
+    cc = _CC_OVERRIDE or os.environ.get("HAM_DP_CC")
+    if not cc:
+        cc = "gcc-15" if shutil.which("gcc-15") else "gcc"
+    return cc
+
+
+def _compiler_ident(cc: str) -> tuple:
+    """(resolved path, first line of --version, full --version text)."""
+    if cc not in _CC_IDENT:
+        import shutil
+        path = shutil.which(cc) or cc
+        real = os.path.realpath(path)
+        try:
+            v = subprocess.run([path, "--version"], capture_output=True, text=True).stdout
+        except OSError:
+            v = ""
+        _CC_IDENT[cc] = (real, (v.splitlines() or ["?"])[0].strip(), v)
+    return _CC_IDENT[cc]
+
+
+def _build_flags(consts: dict) -> list:
+    import platform
+    rt_flag = [] if platform.system() == "Darwin" else ["-lrt"]
+    return (["-O3", "-march=native", "-shared", "-fPIC", "-std=c11",
+             "-D_POSIX_C_SOURCE=200809L"]
+            + [f"-D{k}={v}" for k, v in sorted(consts.items())]
+            + ["-lpthread"] + rt_flag)
+
+
+def _build_key(cc: str, flags: list) -> tuple:
+    import json, platform
+    real, first, full = _compiler_ident(cc)
+    inputs = {
+        "source_sha256": hashlib.sha256(C_SOURCE.encode()).hexdigest(),
+        "variant": _C_VARIANT,
+        "compiler": real, "compiler_version": full,
+        "flags": flags,
+        "system": platform.system(), "machine": platform.machine(),
+        "release": platform.release() if platform.system() == "Darwin" else "",
+    }
+    key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:20]
+    meta = dict(inputs, compiler_version=first, cc=cc)
+    return key, meta
+
+
+def list_cache() -> list:
+    """[(key, meta dict, size bytes, mtime)] of the cached builds."""
+    import json
+    out = []
+    d = cache_dir()
+    for k in sorted(os.listdir(d)):
+        sub = os.path.join(d, k)
+        so = os.path.join(sub, "ham_dp.so")
+        if not os.path.isfile(so):
+            continue
+        try:
+            meta = json.load(open(os.path.join(sub, "meta.json")))
+        except Exception:
+            meta = {}
+        st = os.stat(so)
+        out.append((k, meta, st.st_size, st.st_mtime))
+    return out
+
+
+def clear_cache() -> int:
+    """Delete every cached build; returns the number removed."""
+    import shutil
+    d = cache_dir(); n = 0
+    for k in os.listdir(d):
+        p = os.path.join(d, k)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True); n += 1
+    # Builds of the old scheme (before 2026-11-26): $TMPDIR/ham_dp_c_<md5>_<consts>
+    import glob
+    for p in glob.glob(os.path.join(tempfile.gettempdir(), "ham_dp_c_*")):
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True); n += 1
+    global _LIB_CACHE
+    _LIB_CACHE = {}
+    return n
+
+
 def _get_lib():
+    global _FORCE_REBUILD
     # Detect cache sizes once; derive -D flags; fold both into the cache key
     # so that recompilation happens automatically on a different machine.
     l1d, l2, l3, cl = _detect_cache_sizes()
     consts = _derive_build_constants(l1d, l2, l3, cl)
 
-    src_hash = hashlib.md5(C_SOURCE.encode()).hexdigest()[:12]
-    # Cache key: C source hash + only the two compile-time params.
-    # Runtime params (SM_WORKER_CAP, SM_BB_BUF, etc.) no longer affect the binary;
-    # changing machine.yaml does not trigger recompilation.
-    const_sig = f"EH{consts['EH_BKT_CAP']}_RB{consts['RSORT_BITS']}"
-    cache_key = f"{src_hash}_{const_sig}"
-    if cache_key in _LIB_CACHE:
+    cc = _compiler()
+    flags = _build_flags(consts)
+    cache_key, meta = _build_key(cc, flags)
+    if cache_key in _LIB_CACHE and not _FORCE_REBUILD:
         return _LIB_CACHE[cache_key]
 
-    build_dir = os.path.join(tempfile.gettempdir(), f"ham_dp_c_{cache_key}")
+    build_dir = os.path.join(cache_dir(), cache_key)
     os.makedirs(build_dir, exist_ok=True)
     c_path  = os.path.join(build_dir, "ham_dp.c")
     so_path = os.path.join(build_dir, "ham_dp.so")
 
-    if not os.path.exists(so_path):
-        # Report which machine.yaml was used (or that defaults were applied)
-        # Re-derive just to get _yaml_used; _derive_build_constants already ran above
-        import pathlib as _pl2
-        _here2 = _pl2.Path(__file__).parent
-        _cands2 = []
-        if _MACHINE_YAML_PATH is not None:
-            _cands2.append(_pl2.Path(_MACHINE_YAML_PATH))
-        _cands2.append(_here2 / "machine.yaml")
-        _cands2.append(_pl2.Path.cwd() / "machine.yaml")
-        _yaml_report = next((str(p) for p in _cands2 if p.exists()), None)
-        if _yaml_report:
-            print(f"# machine.yaml: {_yaml_report}", flush=True)
-        else:
-            print("# machine.yaml: not found — using analytical defaults", flush=True)
-        with open(c_path, "w") as f:
-            f.write(C_SOURCE)
-        d_flags = [f"-D{k}={v}" for k, v in consts.items()]
-        import shutil, platform
-        compiler = "gcc-15" if shutil.which("gcc-15") else "gcc"
-        # Linux needs -lrt for shm_open; macOS has it in libc
-        rt_flag = [] if platform.system() == "Darwin" else ["-lrt"]
-        result = subprocess.run(
-            [compiler, "-O3", "-march=native", "-shared", "-fPIC", "-std=c11",
-             "-D_POSIX_C_SOURCE=200809L"]
-            + d_flags
-            + ["-o", so_path, c_path, "-lpthread"] + rt_flag,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"gcc failed:\n{result.stderr.decode()}")
+    # Report which machine.yaml was used (or that defaults were applied).
+    import pathlib as _pl2
+    _here2 = _pl2.Path(__file__).parent
+    _cands2 = []
+    if _MACHINE_YAML_PATH is not None:
+        _cands2.append(_pl2.Path(_MACHINE_YAML_PATH))
+    _cands2.append(_here2 / "machine.yaml")
+    _cands2.append(_pl2.Path.cwd() / "machine.yaml")
+    _yaml_report = next((str(p) for p in _cands2 if p.exists()), None)
+    print(f"# machine.yaml: {_yaml_report or 'not found — using analytical defaults'}",
+          flush=True)
+
+    import fcntl, json
+    with open(os.path.join(build_dir, "build.lock"), "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)          # one builder per key
+        status = "cached"
+        if _FORCE_REBUILD or not os.path.exists(so_path):
+            tmp_c = os.path.join(build_dir, f"ham_dp.{os.getpid()}.tmp.c")
+            tmp_so = os.path.join(build_dir, f"ham_dp.{os.getpid()}.tmp.so")
+            with open(tmp_c, "w") as f:
+                f.write(C_SOURCE)
+            # flags = compile flags + link libs; put -o and the source before libs
+            libs = [f for f in flags if f.startswith("-l")]
+            cflags = [f for f in flags if not f.startswith("-l")]
+            cmd = [cc] + cflags + ["-o", tmp_so, tmp_c] + libs
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode != 0:
+                for t in (tmp_c, tmp_so):
+                    try: os.unlink(t)
+                    except OSError: pass
+                raise RuntimeError(f"{cc} failed:\n{result.stderr.decode()}")
+            os.replace(tmp_c, c_path)
+            os.replace(tmp_so, so_path)               # atomic: never half-built
+            with open(os.path.join(build_dir, "meta.json"), "w") as f:
+                json.dump(meta, f, indent=1, sort_keys=True)
+            status = "compiled"
+        fcntl.flock(lockf, fcntl.LOCK_UN)
+    _FORCE_REBUILD = False                        # a forced rebuild happens once
+    print(f"# ham_dp_c: {status} variant={_C_VARIANT} key={cache_key} "
+          f"cc={meta['compiler']} ({meta['compiler_version']}) "
+          f"flags={' '.join(f for f in flags if not f.startswith('-l'))}", flush=True)
 
     ffi = cffi.FFI()
     ffi.cdef("""
@@ -548,6 +681,11 @@ def _get_lib():
         _rv("SM_STEAL_FACTOR",     32),
         _rv("RSORT_THRESH",        1 << 19),
     )
+    print(f"# ham_dp_c: SM_NTHREADS={_rv('SM_NTHREADS', _nthreads_def)} "
+          f"SM_WORKER_CAP={_rv('SM_WORKER_CAP', _wcap_def)} "
+          f"SM_RBUF_SIZE={_rv('SM_RBUF_SIZE', _rbuf_def)} "
+          f"SM_BB_BUF={_rv('SM_BB_BUF', _bb_def)} "
+          f"SM_PAR_MERGE_THRESH={_rv('SM_PAR_MERGE_THRESH', 50_000_000)}", flush=True)
 
     _LIB_CACHE[cache_key] = (lib, ffi)
     return lib, ffi
@@ -1088,3 +1226,35 @@ def partial_dp_time_c(n: int, order: list, adj: dict,
         adj=build_graph(n); order=best_bfs_order(adj,n); mx,_=frontier_stats(adj,order)
         t0=time.time(); count=count_hamiltonian_paths_c(n,order,adj,verbose=True)
         print(f"n={n:3d}  max_fw={mx:2d}  ham_paths={count}  ({time.time()-t0:.3f}s)", flush=True)
+
+
+def _cache_main(argv=None) -> int:
+    import argparse, time
+    ap = argparse.ArgumentParser(prog="python -m hamiltonian.claude.ham_dp_c",
+                                 description="Manage the compiled ham_dp_c libraries.")
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--list-cache", action="store_true", help="list cached builds")
+    g.add_argument("--clear-cache", action="store_true", help="delete all cached builds")
+    g.add_argument("--build", action="store_true",
+                   help="build (or report the cached build of) the current configuration")
+    ap.add_argument("--cc", default=None, help="compiler for --build")
+    ap.add_argument("--variant", default=None, choices=sorted(_C_VARIANTS))
+    a = ap.parse_args(argv)
+    if a.list_cache:
+        print(f"cache directory: {cache_dir()}")
+        for k, meta, size, mt in list_cache():
+            print(f"{k}  {time.strftime('%Y-%m-%d %H:%M', time.localtime(mt))}  "
+                  f"{size/1e3:7.0f} kB  variant={meta.get('variant','?')}  "
+                  f"cc={meta.get('compiler','?')} ({meta.get('compiler_version','?')})")
+    elif a.clear_cache:
+        print(f"removed {clear_cache()} build(s) from {cache_dir()}")
+    else:
+        if a.cc: set_compiler(a.cc)
+        if a.variant: set_c_variant(a.variant)
+        _get_lib()
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_cache_main())

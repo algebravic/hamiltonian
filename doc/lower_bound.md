@@ -2065,3 +2065,81 @@ Files are in `~/Programming/Combinatorics/hamiltonian`:
 - `tests/test_dp_correctness.py`
 - `doc/frontier16_findings.md`
 
+Question
+========
+One striking thing. I ran n=58 on my iMac which has an M3, and on an
+older laptop which has an M2. The older laptop has 12 cores, and the
+iMac 6, but the iMac takes around 122 seconds, and the M2 29. I would
+have expected a speedup of about 2x but not 4x. You can see the
+`machine.yaml` and `work_model.json` in the main directory. There are
+two others I copies from the M2 machine prefixed with `sri` but using
+those on the M3 made no difference.
+
+Could the m3 have been reusing the old compiled files? How do you
+decide whether to recompile or not? Should there be CLI to delete the
+files. I would think that you should key them via a hash of the
+relevant inputs. That would be the safest way.
+
+Answer
+======
+The M3 couldn't have picked up a binary built from an older version of `ham_dp_c.c`. It could, though, be running a binary built by a different compiler than you think, and the compiler choice is the likeliest cause of the 4×. The interrupted VM run isn't still going; I checked, and only my own shells were left.
+
+**How it decides today** (`_get_lib` in `ham_dp_c.py`):
+- The cache key is `md5(ham_dp_c.c)[:12]` plus the two compile-time constants (`EH_BKT_CAP`, `RSORT_BITS`).
+- The library is stored as `ham_dp.so` in `$TMPDIR/ham_dp_c_<key>/`. On macOS that's a per-user `/var/folders/...` directory, so the two Macs never share builds.
+- If that file already exists, it is loaded without recompiling.
+
+So any edit to the C source gives a new key and a fresh build. But the key leaves out several things that affect the binary:
+- **Which compiler.** It uses `gcc-15` if that's on `PATH` and plain `gcc` otherwise. On a Mac, plain `gcc` is Apple clang. If the M2 laptop has Homebrew's gcc-15 and the iMac doesn't, the two machines run differently compiled code. Clang and gcc can differ a lot on this kind of code (`__int128` arithmetic, the label loops in `canon`). That fits a ratio beyond the 2× you'd expect from 4 versus 8 P-cores. Nothing is printed to say which compiler was used, so the log can't settle it. `which gcc-15` on each machine would.
+- **The compiler's version and the flags.** An upgraded gcc-15 or a change to `-O3 -march=native` would silently reuse the old `.so`.
+- **Incomplete or concurrent builds.** If gcc is interrupted it can leave a partial `.so` that later fails to load, and two processes building the same key at once can collide.
+
+On `sri-machine.yaml`: it holds only the probe's informational keys (written by `--probe-only`) and no `SM_*` tuning values. So on the iMac those runs used the iMac's own defaults, which is why it made no difference. Separately, the probe's L1 measurement fails natively on Apple Silicon (k\* = 2 at every stride, reported as null), so that needs a look too.
+
+**What I'd change.** This is your hash-of-all-inputs idea; kobayashi-pw's `native.py` already does it this way.
+- **Key:** sha256 over the C source, the compiler's resolved path and `--version` output, all flags and `-D` constants, the C variant (`key16` or `legacy15`), and the platform and machine type.
+- **Storage:** a persistent cache directory, `$HAM_DP_CACHE` or `~/.cache/hamiltonian/ham_dp_c/<key>/`. Builds happen under a file lock and are renamed into place only once complete, so a half-built file can never be loaded.
+- **Log line:** each run prints `# ham_dp_c: compiled` or `cached`, with the key, compiler, version and flags.
+- **Commands:**
+  - `python -m hamiltonian.claude.ham_dp_c --list-cache` and `--clear-cache`;
+  - `ham_count --rebuild` to force a fresh build;
+  - `--cc PATH` (or `HAM_DP_CC`) to choose the compiler explicitly, so you can compare clang and gcc-15 on the same machine.
+
+Shall I implement that? Then an instrumented n = 58 run on each Mac
+(`--instrument`, a couple of minutes) would show the compiler in the
+log and split the time into compute, sort and merge, so the 4× can be
+attributed properly.
+
+Question
+========
+Yes, implement that.
+
+Answer
+======
+The build cache is in and committed, with tests passing here and on the Linux VM. To your question: no, it doesn't look at `$CC`.
+
+**How it picks the compiler**, first match wins:
+1. `ham_count --cc PATH`, or `set_compiler(path)` from Python;
+2. the environment variable `$HAM_DP_CC`;
+3. `gcc-15`, if it is on `PATH`;
+4. otherwise plain `gcc`. On a Mac without Homebrew gcc, that is Apple clang.
+
+I left `$CC` out because it is often set for other builds, for example by conda or Homebrew, and it would silently change which compiler this uses. Now that the compiler is part of the cache key and printed on every run, honouring it would be safe. If you'd like that, I'd put `$CC` between steps 2 and 3.
+
+**How the cache works now:**
+- **Key:** a SHA-256 over the C source and variant (`key16` or `legacy15`), the compiler's resolved path and full `--version` output, every flag and `-D` constant, and the OS and CPU type. Changing any of these gives a new build.
+- **Storage:** `$HAM_DP_CACHE`, defaulting to `~/.cache/hamiltonian/ham_dp_c/<key>/`, with a `meta.json` recording those inputs. It no longer uses `$TMPDIR`.
+- **Builds:** done under a file lock and moved into place only when complete, so a half-built library can never be loaded, and a forced rebuild happens only once per run.
+- **Log:** every run prints whether the library was compiled or cached, the key, the compiler and version, and the flags. It also prints the settings in effect: `SM_NTHREADS`, `SM_WORKER_CAP`, `SM_RBUF_SIZE`, `SM_BB_BUF`, `SM_PAR_MERGE_THRESH`.
+- **Commands:**
+  - `python -m hamiltonian.claude.ham_dp_c --list-cache`
+  - `python -m hamiltonian.claude.ham_dp_c --clear-cache`, which also removes old-style `$TMPDIR/ham_dp_c_*` builds
+  - `python -m hamiltonian.claude.ham_dp_c --build [--cc …] [--variant …]`
+  - `ham_count --rebuild`, `--cc PATH` and `--dp-variant {key16,legacy15}`
+
+**For the M3 against M2 question:** run n = 58 once on each machine with `--instrument`. The header lines will show which compiler each machine really used, and the thread count. To compare compilers on the iMac, add `--cc gcc-15` (if it's installed) or `--cc clang`. Each compiler gets its own cached build, so you can switch back and forth without rebuilding.
+
+Files are in `~/Programming/Combinatorics/hamiltonian`:
+- `hamiltonian/claude/ham_dp_c.py`
+- `hamiltonian/claude/ham_count.py`
+- `tests/test_build_cache.py`

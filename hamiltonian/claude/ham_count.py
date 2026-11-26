@@ -70,6 +70,7 @@ from math import isqrt
 import networkx as nx
 
 from .ham_dp_c import count_hamiltonian_paths_c, count_hamiltonian_paths_sm, _get_lib, set_machine_yaml
+from . import ham_dp_c as _ham_dp_c
 from .ham_ordering import build_graph, best_bfs_order, frontier_stats, sa_refine_order, best_multistart_order, validate_multistart_orders
 from . import ham_kpw
 
@@ -424,6 +425,16 @@ def parse_args():
                         "Higher values reduce memory usage at the cost of more "
                         "hash probes per insert.  85 is recommended on machines "
                         "where peak two-table memory exceeds available RAM.")
+    p.add_argument("--cc", default=None, metavar="PATH",
+                   help="C compiler for the DP library (default: $HAM_DP_CC, else "
+                        "gcc-15 if on PATH, else gcc).  Part of the build-cache key.")
+    p.add_argument("--rebuild", action="store_true",
+                   help="Recompile the DP library even if a cached build exists. "
+                        "(List / clear the cache: python -m hamiltonian.claude.ham_dp_c "
+                        "--list-cache / --clear-cache.)")
+    p.add_argument("--dp-variant", choices=["key16", "legacy15"], default=None,
+                   help="State-key implementation: key16 (default, 16 frontier slots) "
+                        "or legacy15 (the original 15-slot key with flag bits).")
     p.add_argument("--machine-yaml", default=None, metavar="PATH",
                    help="Path to machine.yaml produced by tune_params.py "
                         "(e.g. machine_m3pro.yaml). Overrides the default "
@@ -679,6 +690,12 @@ def main():
     args = parse_args()
     # Apply machine-yaml override before the C library is compiled.
     set_machine_yaml(getattr(args, 'machine_yaml', None))
+    if getattr(args, 'dp_variant', None):
+        _ham_dp_c.set_c_variant(args.dp_variant)
+    if getattr(args, 'cc', None):
+        _ham_dp_c.set_compiler(args.cc)
+    if getattr(args, 'rebuild', False):
+        _ham_dp_c.force_rebuild()
     use_pw = not args.no_pw and args.ordering != "bfs"
 
     print("# Compiling C library …", flush=True)
