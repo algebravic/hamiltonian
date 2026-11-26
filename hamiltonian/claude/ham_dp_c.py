@@ -560,6 +560,7 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
         print("# Note: EH backend ignores --load-factor and --mem-reserve "
               "(memory is proportional to actual entry count)", file=sys.stderr)
 
+    _check_width(order, adj)
     lib, ffi = _get_lib()
 
     pos = [0] * (n + 1)
@@ -599,7 +600,7 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
-            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16). "
+            "Frontier exceeded the 15 slots of the 64-bit state key (vertex separation / pathwidth >= 15). "
             "The packed uint64 state encoding is limited to 15 frontier slots."
         )
     paths = (hi << 64) | lo
@@ -635,6 +636,7 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
     checkpoint_path : path for checkpoint file ('' = disabled)
     checkpoint_secs : checkpoint interval in seconds
     """
+    _check_width(order, adj)
     lib, ffi = _get_lib()
 
     pos = [0] * (n + 1)
@@ -674,7 +676,7 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
-            "Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16)."
+            "Frontier exceeded the 15 slots of the 64-bit state key (an introduced vertex would be slot 16: vertex separation / pathwidth >= 15)."
         )
     paths = (hi << 64) | lo
     if count_cycles:
@@ -697,6 +699,36 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
 # Hamiltonian path into a cycle cover, so
 #     2 H <= per(A') <= prod_v ((d_v + 1)!)^(1/(d_v + 1)) * (n!)^(1/n),
 # and the number of Hamiltonian cycles is at most H / n <= H.
+
+MAX_STATE_SLOTS = 15   # frontier slots of the 64-bit state key (MAX_FS_FAST in C)
+
+
+def in_step_width(order: list, adj: dict) -> int:
+    """Largest frontier during a step: the vertices still waiting for a later
+    neighbour plus the vertex being introduced.  This is what must fit in the
+    state key; it is one more than the vertex separation of the ordering
+    (max_fw / pw as reported by ham_count) whenever the maximum is followed
+    by an introduction."""
+    pos = {v: i for i, v in enumerate(order)}
+    last = {v: max([pos[w] for w in adj[v]] + [pos[v]]) for v in order}
+    live, best = 0, 0
+    ends = {}
+    for i, v in enumerate(order):
+        live += 1
+        best = max(best, live)
+        ends[last[v]] = ends.get(last[v], 0) + 1
+        live -= ends.pop(i, 0)
+    return best
+
+
+def _check_width(order: list, adj: dict) -> None:
+    w = in_step_width(order, adj)
+    if w > MAX_STATE_SLOTS:
+        raise RuntimeError(
+            f"This ordering needs {w} frontier slots during a step (vertex "
+            f"separation {w - 1}); the 64-bit state key holds {MAX_STATE_SLOTS}. "
+            "Use an ordering of vertex separation <= 14.")
+
 
 class SMOverflow(OverflowError):
     """State counts wrapped mod 2^64 and the CRT was not requested.
@@ -818,6 +850,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     if checkpoint_path:
         print("# Warning: sort-merge backend does not yet support checkpointing; "
               "checkpoint_path ignored.", file=sys.stderr)
+    _check_width(order, adj)
     lib, ffi = _get_lib()
     ram, _ = _detect_ram_and_threads()
     if ram_bytes:
@@ -882,7 +915,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
             lib.sm_set_crt(c_mod, 0, 0)
         lo_, hi_ = int(c_res_lo[0]), int(c_res_hi[0])
         if lo_ == hi_ == 0xFFFFFFFFFFFFFFFF:
-            raise RuntimeError("Frontier size exceeded MAX_FS_FAST=15 (pathwidth >= 16).")
+            raise RuntimeError("Frontier exceeded the 15 slots of the 64-bit state key (an introduced vertex would be slot 16: vertex separation / pathwidth >= 15).")
         cyc_ = ((int(c_cyc_hi[0]) << 64) | int(c_cyc_lo[0])) if count_cycles else None
         return (hi_ << 64) | lo_, cyc_
 

@@ -1979,3 +1979,45 @@ Files are in `~/Programming/Combinatorics/hamiltonian`:
 - `tests/test_sm_crt.py`
 - `doc/sm_spill_snapshot_design.md`
 
+Question
+========
+Look at `data/linux/new_75_sm_new.txt`. It crashed (OOM?) after
+step 57. I didn't see any status code.
+
+Answer
+======
+The crash is almost certainly the OOM killer, but the more important finding is that this n = 75 run would have given a wrong count anyway, and so did the April n = 75 run. I found two counting bugs while investigating; both are now fixed or guarded, and the details are in `doc/frontier16_findings.md`.
+
+**The crash.** The log stops inside step 58, right after `introduce: si=9311M`: a 149 GB input table, with no traceback and no C message. That is what a SIGKILL from the Linux OOM killer looks like. `dmesg -T | grep -iE "killed process|out of memory"` on the machine would confirm it. The run used the binary it compiled at start-up, from before the spill rule.
+
+**Bug 1: back-edges after the 8th were silently dropped.**
+- The code kept at most 8 back-edges per vertex and silently dropped the rest. I found it by comparing against an independent Held-Karp count on random graphs.
+- It's now fixed: up to 16 back-edges, with a hard error beyond that.
+- No logged run reached 8 back-edges (G_n peaks at 5–6), so none of your results are affected.
+
+**Bug 2: an in-step frontier of 16 corrupts the state key.**
+- The 64-bit key holds 15 frontier slots plus two flag bits (bits 62–63). The guard let a frontier of 15 through before introducing the next vertex. That vertex then went into a 16th slot that overlaps the flags.
+- During a step the frontier is one more than the pw/`max_fw` that `ham_count` prints. So every pw = 15 ordering hits this.
+- The evidence is conclusive:
+  - With an in-step frontier of at most 15, all 45 random test graphs agree with Held-Karp, as do all 12 perturbed orderings of G_36, G_38 and G_40.
+  - At a frontier of exactly 16, 7 of 15 random graphs and all 9 G_n orderings are wrong. For example, G_36 gave 1728, 105 and 61 instead of 12,960.
+- n ≤ 74 is unaffected, since those orderings have pw ≤ 14. Both n = 74 runs agree.
+- **But n = 75 used pw = 15 orderings in both runs, so the April value 652,211,775,281,872,067,084 should be treated as withdrawn, not just caveated.** That affects `talk2.tex` and the papers.
+
+**What I committed:**
+- Orderings that need a 16-slot frontier are now refused up front with a clear message, and the C loops check it too.
+- A new `tests/test_dp_correctness.py` checks against Held-Karp. The old code fails all four of its back-edge graphs; the new code passes, alongside the existing merge and CRT tests.
+
+**Proposal, not implemented.** I think the 16th slot fits in the same 64-bit key, with no memory cost, which would make n = 75 possible again:
+- The NC flag only matters within the last step. A chain that closes at an earlier step can never be extended into a Hamiltonian path, so that state can be dropped immediately. At the last step the closure is counted directly.
+- The MARKER bit only keeps the initial key non-zero. A sentinel value of `UINT64_MAX` can replace it, because that is never a valid key: a label occurs at most twice.
+
+This changes the state semantics, so I'd like you to check that argument before I touch the encoding. Pathwidth 16, which will presumably come at some n > 75, would still need 128-bit keys, at 1.5–2× the memory.
+
+Files are in `~/Programming/Combinatorics/hamiltonian`:
+- `hamiltonian/claude/ham_dp_c.c`
+- `hamiltonian/claude/ham_dp_c.py`
+- `tests/test_dp_correctness.py`
+- `doc/frontier16_findings.md`
+
+

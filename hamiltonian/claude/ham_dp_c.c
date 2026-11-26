@@ -192,6 +192,10 @@ void sm_configure(int nthreads,size_t worker_cap,int rbuf_size,
 #define KEY_NC_BIT  ((u64)1 << 62)
 /* 4 bits per frontier slot + 2 flag bits → max 15 slots in 64 bits. */
 #define MAX_FS_FAST 15
+/* Most back-edges of one vertex (edges to earlier frontier vertices); the
+   sweep enumerates 2^n_back subsets.  Exceeding it is a hard error: the
+   old silent cap at 8 dropped edges and gave wrong counts.              */
+#define MAX_NBACK 16
 
 /* ======================================================================
    State encoding helpers (unchanged from LP version)
@@ -1009,7 +1013,13 @@ void count_ham_paths_c(
     for (int step = start_step; step < n; step++) {
         int v = order[step];
 
-        if (fs > MAX_FS_FAST) {
+        /* The state key holds MAX_FS_FAST slots INCLUDING the vertex about
+           to be introduced (4 bits each; bits 60-63 hold the flags), so the
+           frontier before introduce must have at most MAX_FS_FAST - 1
+           vertices.  (Previously fs == MAX_FS_FAST passed this test, and the
+           16th slot overlapped the flag bits: wrong counts for orderings of
+           vertex separation 15.)                                          */
+        if (fs + 1 > MAX_FS_FAST) {
             *res_lo = *res_hi = UINT64_MAX;
             goto cleanup;
         }
@@ -1038,12 +1048,17 @@ void count_ham_paths_c(
         int    v_idx     = fs - 1;
         size_t states_in = curr->cnt;
         int    n_back    = 0;
-        int    widxs[8];
+        int    widxs[MAX_NBACK];
 
         for (int ai = adj_off[v]; ai < adj_off[v + 1]; ai++) {
             int w = adj_dat[ai];
-            if (fidx[w] >= 0 && pos[w] < pos[v] && n_back < 8)
+            if (fidx[w] >= 0 && pos[w] < pos[v]) {
+                if (n_back >= MAX_NBACK) {
+                    fprintf(stderr, "FATAL: vertex %d has more than %d back-edges\n", v, MAX_NBACK);
+                    abort();
+                }
                 widxs[n_back++] = fidx[w];
+            }
         }
 
         int elim_idxs_asc[MAX_FS_FAST + 2], n_elim = 0;
@@ -4092,7 +4107,7 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
     for (int step = s0; step < n; step++) {
         sm_cur_step = step;
         int v = order[step];
-        if (R->fs > MAX_FS_FAST) return -1;
+        if (R->fs + 1 > MAX_FS_FAST) return -1;   /* see count_ham_paths_c */
         int skip_intro = (resume && step == s0);
 
         /* A. Introduce: transform curr->data in-place.
@@ -4120,11 +4135,16 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
         /* B+C. Fused sweep */
         int v_idx = R->fs - 1;
         size_t states_in = R->curr->cnt;
-        int n_back = 0, widxs[8];
+        int n_back = 0, widxs[MAX_NBACK];
         for (int ai = adj_off[v]; ai < adj_off[v+1]; ai++) {
             int w = adj_dat[ai];
-            if (R->fidx[w] >= 0 && pos[w] < pos[v] && n_back < 8)
+            if (R->fidx[w] >= 0 && pos[w] < pos[v]) {
+                if (n_back >= MAX_NBACK) {
+                    fprintf(stderr, "FATAL: vertex %d has more than %d back-edges\n", v, MAX_NBACK);
+                    abort();
+                }
                 widxs[n_back++] = R->fidx[w];
+            }
         }
         int elim_asc[MAX_FS_FAST+2], n_elim = 0;
         for (int ei = 0; ei < R->fs; ei++)
