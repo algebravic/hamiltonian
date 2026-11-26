@@ -2143,3 +2143,85 @@ Files are in `~/Programming/Combinatorics/hamiltonian`:
 - `hamiltonian/claude/ham_dp_c.py`
 - `hamiltonian/claude/ham_count.py`
 - `tests/test_build_cache.py`
+
+Question
+========
+There are two C++ programs in `/Users/victorsmiller/Programming/Combinatorics/hamiltonian/doc/contrib` which calculate the number of Hamiltonian paths for the square graph written by others. They both use the Held-Karp DP but it's not clear what vertex ordering they use. Can you look at them and write a markdown doc which analyzes them, and points out possible shortcomings?
+
+Answer
+======
+I've written `doc/contrib_analysis.md`. Neither program actually uses Held-Karp, and `A071984_opt.cpp` counts Hamiltonian cycles, not paths. I compiled both and ran them in the Linux VM with 4 threads; the timings below are single runs.
+
+**`A071984_opt.cpp` (Dobbelaere)** is a plain backtracking search with no memoization.
+- It counts each cycle once by forcing it to start through a vertex that has only two neighbours (for example 14–50–31 when 50 ≤ N ≤ 70). I checked the degrees and the trick is sound.
+- Its only pruning is a degree check on the vertices left behind.
+- There is no real vertex ordering, just the order the search happens to extend the path.
+- Limits: it stops at N = 70 and runs on one thread. Turning it into a path counter would break the start-vertex trick and most of the pruning.
+- It reproduced its own commented values for N = 32–52 in about 2 minutes. The time grows about 2.3× per step in N.
+
+**`path4.cpp` (no author named)** is a frontier DP whose state is the same kind as ours: the endpoint pairs of path fragments, plus a bitmask of vertices that already have two edges.
+- **Ordering:** fixed, N, N−1, …, 1. Its frontier peaks at about 0.7·N, which is 40 at N = 58. Our ordering gives pathwidth 12 there.
+- **Endpoints:** it adds a pseudo-edge between the two path endpoints and starts with all N(N−1)/2 endpoint pairs as separate states. That multiplies the state count, because pairs of small vertices survive almost to the end.
+- **The DP is only used at the top:** states are merged for the first 7 vertices only. After that it is an unmemoized search. I tried running the merged DP all the way down, and that was slower (N = 42 didn't finish in 40 s, against 11.5 s for the original).
+- **Speed:** it matches `data/b071983.txt` for N ≤ 44. N = 42 took 11.5 s and N = 44 took 131 s, so N = 58 is out of reach.
+- **Other costs and limits:** it stores states in a `std::map` and rebuilds a union-find for every new state. It only works for N ≤ 62 with 64-bit `long`, and fails for N ≥ 32 on Windows, where `long` is 32 bits. One of its pruning tests is weaker than it could be.
+- **Correctness:** I found no bug, but I haven't proved its pair-list update routines correct line by line; agreement with the reference data is evidence, not proof.
+
+`path4` has one idea we don't use: pruning states whose remaining graph is disconnected, and forcing an edge when an endpoint has only one option left. With our much smaller frontier it's unclear whether that would pay off. It could be measured cheaply by counting how many of our new states would fail the connectivity check.
+
+Question
+========
+The author of `path4.cpp` is Zhao Hui Du, a frequent contribution of
+OEIS. It's worthwhile to test his idea about disconnected graphs.
+
+Answer
+======
+I'll write a short design note first, then add the check to the key16 code behind an environment variable that is off by default, and measure it.
+
+Pruned and unpruned counts agree with `b071983.txt` for every n from 15 to 50. Next, timing at n = 58:
+
+While that runs, I'll put Zhao Hui Du's name into the contrib analysis.
+
+Pruning gives n = 58 in 130 s in the VM; without it the run had only reached step 37 after 158 s. Now the test suite, with pruning on and off:
+
+Connectivity never removed a state that the endpoint budget had kept; the budget alone accounts for all of the 55% at n = 52. I'll write the results into the design note and commit.
+
+Du's idea pays off, but not through connectivity. A simpler test that comes with it, an "endpoint budget", does all the work. With it on, the counts are unchanged and n = 57 and 58 run about 2.3× faster in the Linux VM.
+
+**What I added.** The check is in the key16 C file, turned on by `HAM_SM_PRUNE`; it is off by default. `HAM_SM_PRUNE=1` only reports how many states are dead, `HAM_SM_PRUNE=2` drops them. I wrote the design note before the code; it's `doc/sm_prune_design.md`, with the results added at the end. After each step, two necessary conditions for a state to be completable are checked:
+- **(D) Endpoint budget:** a Hamiltonian path has only two ends. Some vertices are already forced to be ends: the far end of a chain that has left the frontier, an untouched frontier vertex with only one later neighbour, and a later vertex with only one usable neighbour. If more than two are forced, the state is dead.
+- **(C) Connectivity:** the unfinished frontier vertices, the vertices not yet processed, and the existing chains must form one connected graph. This is Du's test.
+
+Our DP had neither check. A dead state, such as one with three dangling chains, was carried and multiplied to the very last step before it died.
+
+**Correctness (VM, 4 threads):**
+- **Counts:** with pruning on, path counts are unchanged and match `b071983.txt` for every n from 15 to 50, and for 53 and 55–58. Cycle counts match for n = 32–48, including Dobbelaere's values.
+- **Tests:** the full correctness suite passes, including the random width-16 graphs checked against Held-Karp. Two other tests fail with pruning on: one expects a 12-bit overflow and the other expects spills, and pruning makes the counts and tables too small for either to happen. Both pass with pruning off.
+
+**What it finds.** About 55% of all states at n = 52 are dead, and 25–75% per step at n = 40. Every one of them fails the endpoint budget; connectivity never removes a state the budget would have kept.
+
+**Speed:**
+
+| n | Unpruned | Pruned |
+|---|---|---|
+| 55 | 9.4 s | 5.2 s |
+| 56 | 16.6 s | 11.2 s |
+| 57 | 68.2 s | 29.4 s |
+| 58 | not finished: step 37 after 158 s | 130 s total (step 37 at 65 s) |
+
+At n = 58, the table at step 37 shrinks from 24.5 M states to 7.5 M. These are single runs each, and the VM's orderings differ from the Mac's.
+
+**Still to do:**
+- find out which part of the endpoint budget fires;
+- probably drop the connectivity test, which costs time and removes nothing extra;
+- prune before generating each state's successors, not only after;
+- run it at n = 69 or 74 on your machines, e.g. `HAM_SM_PRUNE=2 ham_count 69 …`, before making it the default.
+
+I also added Zhao Hui Du's name to `doc/contrib_analysis.md`.
+
+My `git commit` failed: the VM has no git identity, and deleting files
+in the folder isn't allowed. The three files are staged in your index
+but not committed. That step also left a couple of stray temporary
+files under `.git/objects`, which are harmless.
+
+

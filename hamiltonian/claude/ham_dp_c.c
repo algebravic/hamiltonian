@@ -2374,6 +2374,157 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
 }
 
 /* Atomically claim the next micro-chunk. */
+/* ======================================================================
+   Completability pruning (HAM_SM_PRUNE; doc/sm_prune_design.md).
+   After step s < n-1 every edge not touching U = {order[s+1..]} is
+   decided.  A key is dead if (D) more than two vertices are forced to be
+   path endpoints, or some w in U has no usable neighbour, or (C) the graph
+   H on the non-interior slots N and U (edges of G inside U and between N
+   and U, plus one link per two-slot chain) is disconnected.  Both are
+   necessary conditions for completion, so dropping dead keys never
+   changes the count.  Mode 0: off (default).  1: classify the merged
+   table and report.  2: drop dead keys in the workers.
+   ====================================================================== */
+#define SMP_MAXW 512
+typedef struct {
+    int      active, all_dead, fs, conn, nw, e_fixed;
+    u64      allcomp;
+    u64      cmask[MAX_FS_FAST];
+    int      fdeg[MAX_FS_FAST];
+    int      udeg[SMP_MAXW];
+    uint32_t amask[SMP_MAXW];
+} SMPrune;
+static SMPrune sm_prune;
+static int sm_prune_mode = -1;
+static volatile size_t sm_prune_dropped = 0;
+static int sm_prune_mode_get(void) {
+    if (sm_prune_mode < 0) {
+        const char *e = getenv("HAM_SM_PRUNE");
+        sm_prune_mode = e ? atoi(e) : 0;
+    }
+    return sm_prune_mode;
+}
+
+/* 0 = live, 1 = dead by (D), 2 = dead by (C). */
+static inline int sm_prune_classify(u64 key) {
+    const SMPrune *P = &sm_prune;
+    if (P->all_dead) return 1;
+    int fs = P->fs;
+    uint32_t nonint = 0, labm[16] = {0};
+    int8_t lab[MAX_FS_FAST];
+    int forced = P->e_fixed;
+    for (int k = 0; k < fs; k++) {
+        int8_t v = slot_get(key, k);
+        lab[k] = v;
+        if (v == -1) continue;
+        nonint |= (uint32_t)1 << k;
+        if (v == 0) { if (P->fdeg[k] == 1) forced++; }
+        else labm[v] |= (uint32_t)1 << k;
+    }
+    for (int L = 1; L < 16; L++)
+        if (labm[L] && !(labm[L] & (labm[L] - 1))) forced++;   /* dangling */
+    if (forced > 2) return 1;
+    for (int j = 0; j < P->nw; j++) {
+        int h = P->udeg[j] + __builtin_popcount(P->amask[j] & nonint);
+        if (h == 0) return 1;
+        if (h == 1 && ++forced > 2) return 1;
+    }
+    if (!nonint) return 2;
+    if (!P->conn) return 0;
+    uint32_t S = nonint & (~nonint + 1u);
+    u64 C = 0;
+    for (;;) {
+        u64 C2 = C;
+        for (uint32_t m = S; m; m &= m - 1) C2 |= P->cmask[__builtin_ctz(m)];
+        uint32_t S2 = S;
+        for (uint32_t m = nonint & ~S; m; m &= m - 1) {
+            int k = __builtin_ctz(m);
+            if (P->cmask[k] & C2) S2 |= (uint32_t)1 << k;
+        }
+        for (uint32_t m = S2; m; m &= m - 1) {
+            int k = __builtin_ctz(m);
+            if (lab[k] > 0) S2 |= labm[lab[k]];
+        }
+        if (S2 == S && C2 == C) break;
+        S = S2; C = C2;
+    }
+    return (S == nonint && C == P->allcomp) ? 0 : 2;
+}
+
+static int sm_uf_find(int *par, int x) {
+    while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; }
+    return x;
+}
+
+/* Per-step tables.  fr/fs: frontier after introduce (before elimination);
+   elim_asc: slots eliminated at this step.                              */
+static void sm_prune_setup(const int *fr, int fs_pre, const int *elim_asc,
+                           int n_elim, int step, int n, const int *order,
+                           const int *pos, const int *adj_off,
+                           const int *adj_dat) {
+    SMPrune *P = &sm_prune;
+    memset(P, 0, sizeof *P);
+    if (sm_prune_mode_get() <= 0 || step >= n - 1) return;
+    int V = 0;                                /* vertex ids are < V */
+    for (int t = 0; t < n; t++) if (order[t] + 1 > V) V = order[t] + 1;
+    int *sidx = (int*)malloc((size_t)V * sizeof(int));
+    int *par  = (int*)malloc((size_t)V * sizeof(int));
+    int *cid  = (int*)malloc((size_t)V * sizeof(int));
+    for (int x = 0; x < V; x++) { sidx[x] = -1; par[x] = x; cid[x] = -1; }
+    int fs = 0;
+    for (int ei = 0, e = 0; ei < fs_pre; ei++) {
+        if (e < n_elim && elim_asc[e] == ei) { e++; continue; }
+        sidx[fr[ei]] = fs++;
+    }
+    for (int t = step + 1; t < n; t++) {
+        int u = order[t];
+        for (int a = adj_off[u]; a < adj_off[u+1]; a++) {
+            int x = adj_dat[a];
+            if (pos[x] > step) {
+                int ru = sm_uf_find(par, u), rx = sm_uf_find(par, x);
+                if (ru != rx) par[ru] = rx;
+            }
+        }
+    }
+    int ncomp = 0;
+    for (int t = step + 1; t < n; t++) {
+        int r = sm_uf_find(par, order[t]);
+        if (cid[r] < 0) cid[r] = ncomp++;
+    }
+    P->conn = ncomp <= 64;
+    P->allcomp = ncomp >= 64 ? ~(u64)0 : (((u64)1 << ncomp) - 1);
+    for (int ei = 0; ei < fs_pre; ei++) {
+        int k = sidx[fr[ei]];
+        if (k < 0) continue;
+        int u = fr[ei];
+        for (int a = adj_off[u]; a < adj_off[u+1]; a++) {
+            int x = adj_dat[a];
+            if (pos[x] > step) {
+                P->fdeg[k]++;
+                if (P->conn) P->cmask[k] |= (u64)1 << cid[sm_uf_find(par, x)];
+            }
+        }
+    }
+    for (int t = step + 1; t < n; t++) {
+        int w = order[t], ud = 0;
+        uint32_t am = 0;
+        for (int a = adj_off[w]; a < adj_off[w+1]; a++) {
+            int x = adj_dat[a];
+            if (pos[x] > step) ud++;
+            else if (sidx[x] >= 0) am |= (uint32_t)1 << sidx[x];
+        }
+        if (am) {
+            if (P->nw == SMP_MAXW) { memset(P, 0, sizeof *P); goto done; }
+            P->udeg[P->nw] = ud; P->amask[P->nw] = am; P->nw++;
+        } else if (ud == 0) P->all_dead = 1;
+        else if (ud == 1) P->e_fixed++;
+    }
+    P->fs = fs;
+    P->active = 1;
+done:
+    free(sidx); free(par); free(cid);
+}
+
 static size_t sm_wq_claim(SMWorkQueue *wq) {
     return __sync_fetch_and_add(&wq->next, 1);
 }
@@ -2383,7 +2534,7 @@ static void *sm_worker_runs(void *arg) {
     SMWorkerState *ws = w->ws;
     int n_subsets = 1 << w->n_back;
     u128 local_total = 0;
-    size_t raw_out = 0;
+    size_t raw_out = 0, pruned = 0;
 
     double t0 = now_ms(), t_flush_acc = 0.0;
 
@@ -2429,6 +2580,10 @@ static void *sm_worker_runs(void *arg) {
                                     w->step, w->n, cnt, &local_total);
                 if (!nk) continue;
             }
+            if (sm_prune_mode == 2 && sm_prune.active && sm_prune_classify(nk)) {
+                pruned++;
+                continue;
+            }
             ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
             raw_out++;
             if (ws->buf_len == sm_cfg.worker_cap) {
@@ -2448,6 +2603,7 @@ static void *sm_worker_runs(void *arg) {
     w->t_compute_ms = (t1 - t0) - t_flush_acc;
     w->t_flush_ms   = t_flush_acc;
     w->raw_out      = raw_out;
+    if (pruned) __sync_fetch_and_add(&sm_prune_dropped, pruned);
 
     sm_free(ws->buf); ws->buf = NULL;
     sm_free(ws->tmp); ws->tmp = NULL;
@@ -4202,6 +4358,9 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
             }
         }
 
+        sm_prune_setup(R->frontier, R->fs, elim_asc, n_elim, step, n, order,
+                       pos, adj_off, adj_dat);
+        sm_prune_dropped = 0;
         u128 *cyc_ptr = (want_cycles && step == n - 1) ? &R->cycles : NULL;
         sm_fused_sweep(R->curr, R->nxt, R->fs, v_idx, widxs, n_back,
                        elim_desc, n_elim, step, n, &R->total, ram, instrument,
@@ -4216,6 +4375,23 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
            digest of the state table plus a strict-sortedness check, used by
            the tests to compare merge implementations step by step.        */
         if (sm_cksum_enabled()) sm_cksum_print(step, R->curr->data, R->curr->cnt);
+
+        if (sm_prune.active) {
+            if (sm_prune_mode == 1) {
+                size_t nd = 0, nc = 0;
+                for (size_t i = 0; i < R->curr->cnt; i++) {
+                    int c = sm_prune_classify(R->curr->data[i].key);
+                    nd += c == 1; nc += c == 2;
+                }
+                fprintf(stderr, "%s  [prune] step=%d states=%zu deadD=%zu deadC=%zu"
+                        " live=%.1f%%\n", tag, step, R->curr->cnt, nd, nc,
+                        R->curr->cnt ? 100.0 * (double)(R->curr->cnt - nd - nc)
+                                       / (double)R->curr->cnt : 100.0);
+            } else if (sm_prune_mode == 2) {
+                fprintf(stderr, "%s  [prune] step=%d states=%zu dropped_raw=%zu\n",
+                        tag, step, R->curr->cnt, (size_t)sm_prune_dropped);
+            }
+        }
 
         /* Update frontier */
         for (int e = n_elim-1; e >= 0; e--) {
