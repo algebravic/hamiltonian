@@ -619,6 +619,7 @@ def _get_lib():
         void sm_set_modulus(uint64_t p);
         void sm_set_word_bits(int b);
         void sm_set_spill_dir(const char *dir);
+        void sm_set_prune_mode(int m);
         void sm_set_crt(const uint64_t *moduli, int k, uint64_t snap_bytes);
         int  sm_crt_replay_from(void);
         uint64_t sm_crt_residue(int i, int which);
@@ -966,6 +967,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 on_overflow: str = "crt",
                                 crt_snap_bytes: int | None = None,
                                 spill_dir: str | None = None,
+                                prune: str = "drop",
                                 _word_bits: int = 64,
                                 **kwargs):
     """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
@@ -1000,6 +1002,12 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     spill_dir      : directory for runs that do not fit in RAM and for disk
                      snapshots (default $TMPDIR, else /tmp).  The files are
                      unlinked at creation, so nothing is left behind.
+    prune          : completability pruning after each step
+                     (doc/sm_prune_design.md).  "drop" (default) discards
+                     states that can no longer become a Hamiltonian path;
+                     "report" keeps them and prints how many are dead per
+                     step (diagnostic, slower than "none"); "none" is off.
+                     The count is the same in every mode.
     _word_bits     : test hook only: emulate 2^b-bit counts (b < 64) so that
                      wraps and the CRT path can be exercised at small n.
     """
@@ -1056,6 +1064,17 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
     primes = crt_primes(k)
     snap = crt_snap_bytes if crt_snap_bytes is not None else min(64 << 30, ram // 16)
     lib.sm_set_spill_dir((spill_dir or "").encode())
+    _PRUNE_MODES = {"none": 0, "report": 1, "drop": 2}
+    if prune not in _PRUNE_MODES:
+        raise ValueError(f"prune must be one of {sorted(_PRUNE_MODES)}, not {prune!r}")
+    try:
+        lib.sm_set_prune_mode(_PRUNE_MODES[prune])
+    except AttributeError:               # legacy15 variant: no pruning
+        if prune != "none":
+            print(f"# prune={prune} ignored: the {_C_VARIANT} variant has no pruning",
+                  file=sys.stderr)
+    if verbose or instrument:
+        print(f"# sort-merge: prune={prune}", file=sys.stderr)
 
     def _run(modulus=0, crt=()):
         lib.sm_set_modulus(modulus)

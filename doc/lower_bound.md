@@ -2224,4 +2224,44 @@ in the folder isn't allowed. The three files are staged in your index
 but not committed. That step also left a couple of stray temporary
 files under `.git/objects`, which are harmless.
 
+Question
+========
+Look at `count_58_sm_pruned2.txt` and `count_58_sm_newest.txt` in the
+main directory. The first uses HAM_SM_PRUNE=1 and the latter
+doesn't. On the positive side there are a lot of pruned states, but
+it's 40% slower. This is rather puzzling.
+
+Answer
+======
+The slowdown is expected: mode 1 doesn't prune anything. That's my naming at fault. `HAM_SM_PRUNE=1` is report-only: it keeps every state, so the DP does the same work as an unpruned run. On top of that, after each step's merge it classifies the whole merged table on one thread, purely to print the `[prune] … deadD=… live=…` line. At steps 30–42 that means scanning 10–15 M states per step serially, which adds up to the extra time you saw. The mode that drops dead states is `HAM_SM_PRUNE=2`.
+
+There is a second, smaller confound: the two runs used different orderings, so even mode 2 against `count_58_sm_newest.txt` wouldn't be a clean comparison.
+
+| | `count_58_sm_newest.txt` | `count_58_sm_pruned2.txt` |
+|---|---|---|
+| machine yaml | `sri-machine.yaml` | `machine.yaml` |
+| kpw ordering | labels=318, value 4.974e9 | labels=200, value 7.818e8 |
+
+The orderings differ in places, for example at step 32, where the newest run has 12.46 M output states and the pruned2 run 10.12 M.
+
+For a clean A/B, run both with the same yaml:
+```
+HAM_SM_PRUNE=2 ham_count 58 … --machine-yaml machine.yaml
+HAM_SM_PRUNE=0 ham_count 58 … --machine-yaml machine.yaml
+```
+
+Your run does confirm the potential. At steps 40–42, between 36% and 47% of the states are live. With mode 2 those dead states are never written, so their successors at the next step are never generated either.
+
+To avoid the same confusion later, I'd like to replace the numbers
+with names, `HAM_SM_PRUNE=report` and `HAM_SM_PRUNE=drop`, and make
+the report pass multithreaded. Should I make that change?
+
+Question
+========
+I just reran it with HAM_SM_PRUNE=2. Now it takes 49 seconds - a
+little over 2x. I usually don't like passing parameters via the
+environment. Could you make it a command line option - make drop the
+defulat, report and none as options. Also, can you make kpw with the
+dsl the default now instead of maxsat? Also, I've made kobayashi-pw
+public on github, so you should adjust pyproject.toml.
 

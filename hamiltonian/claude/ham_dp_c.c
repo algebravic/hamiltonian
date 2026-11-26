@@ -2382,8 +2382,9 @@ static SMEntry *sm_merge_runs(SMWorkerState *ws, size_t *out_len) {
    H on the non-interior slots N and U (edges of G inside U and between N
    and U, plus one link per two-slot chain) is disconnected.  Both are
    necessary conditions for completion, so dropping dead keys never
-   changes the count.  Mode 0: off (default).  1: classify the merged
-   table and report.  2: drop dead keys in the workers.
+   changes the count.  Mode (sm_set_prune_mode): 0 none, 1 report
+   (classify the merged table and print; nothing is dropped), 2 drop
+   (default: dead keys are discarded in the workers).
    ====================================================================== */
 #define SMP_MAXW 512
 typedef struct {
@@ -2395,15 +2396,10 @@ typedef struct {
     uint32_t amask[SMP_MAXW];
 } SMPrune;
 static SMPrune sm_prune;
-static int sm_prune_mode = -1;
+static int sm_prune_mode = 2;
 static volatile size_t sm_prune_dropped = 0;
-static int sm_prune_mode_get(void) {
-    if (sm_prune_mode < 0) {
-        const char *e = getenv("HAM_SM_PRUNE");
-        sm_prune_mode = e ? atoi(e) : 0;
-    }
-    return sm_prune_mode;
-}
+void sm_set_prune_mode(int m) { sm_prune_mode = (m >= 0 && m <= 2) ? m : 2; }
+static int sm_prune_mode_get(void) { return sm_prune_mode; }
 
 /* 0 = live, 1 = dead by (D), 2 = dead by (C). */
 static inline int sm_prune_classify(u64 key) {
