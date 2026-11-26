@@ -2021,3 +2021,47 @@ Files are in `~/Programming/Combinatorics/hamiltonian`:
 - `doc/frontier16_findings.md`
 
 
+Question
+========
+I found that `dmesg` didn't accept the `-T` argument on that machine,
+so I couldn't get any useful information. I'm glad that you found the
+bug. If this changes the state semantics, the conservative thing to do
+is to keep the existing semantics (perhaps in a separate file), so we
+can always compare, and revert if necessary. I'd say to go ahead with
+the new semantics.
+
+Answer
+======
+The 16-slot key is in, all the new tests pass here and on the Linux VM, and the original encoding is kept for comparison.
+
+- **Two variants.** `ham_dp_c.c` now has the new key: 16 frontier slots and no flag bits. The old 15-slot key with the two flags is frozen in `ham_dp_c_legacy15.c`. Apart from the encoding, the legacy file has all of yesterday's fixes. You choose with `ham_dp_c.set_c_variant("legacy15")` or `HAM_DP_VARIANT=legacy15`; the frontier-width check follows whichever is selected.
+- **What changed in the counting.** If a path closes before the last step, that state is now discarded at once; if it closes at the last step, it is counted at once. Nothing has to remember a "closed" flag between steps any more. The other details are in §5 of `doc/frontier16_findings.md`.
+- **Old checkpoints.** The checkpoint format version is bumped, so EH checkpoints written with the old key are rejected rather than misread.
+
+Checks, all exact (paths and cycles, for both the sort-merge and hash-table back ends):
+
+| check | result |
+|---|---|
+| random graphs needing 14, 15 or 16 slots, against Held-Karp | 51 / 51 exact |
+| G_36, G_40, G_44, new key against legacy | identical; G_44 is 5,301,127 paths and 10,091 cycles |
+| eight orderings of G_36/40/44 that need 16 slots | all exact; legacy refuses them |
+| G_47 against the original code | same count, 68,361,609 |
+| merge and CRT tests | pass with both variants |
+
+As designed, an ordering that needs 17 slots (pathwidth 16) is refused with a clear message; it would need a 128-bit key.
+
+**A hiccup during the commit.** The first copy of `ham_dp_c.c` to your Mac silently delivered yesterday's file. The VM test run caught it, I recommitted, and the checksum on your Mac now matches mine. The other files were correct the first time.
+
+**For n = 75.** The pw = 15 orderings now run correctly, so a rerun with the new code gives a trustworthy count. The April value should stay withdrawn until it's reproduced.
+
+Before rerunning, two things:
+- **If it gets killed again,** `dmesg | grep -iE "killed process|out of memory"` works without `-T`, or try `journalctl -k`. Either should confirm whether it was the OOM killer.
+- **The spill directory.** `findmnt /tmp` and `df -h /tmp` will show whether `/tmp` is a real disk with enough room; the spill rule may write runs there. If it isn't, pass `--spill-dir` pointing at a disk.
+
+Files are in `~/Programming/Combinatorics/hamiltonian`:
+- `hamiltonian/claude/ham_dp_c.c`
+- `hamiltonian/claude/ham_dp_c_legacy15.c`
+- `hamiltonian/claude/ham_dp_c.py`
+- `tests/test_dp_correctness.py`
+- `doc/frontier16_findings.md`
+

@@ -50,7 +50,25 @@ import os, hashlib, math, subprocess, tempfile, cffi
 
 import pathlib as _pathlib
 _HERE = _pathlib.Path(__file__).parent
-C_SOURCE = (_HERE / "ham_dp_c.c").read_text()
+# C source variants.  "key16" (default): 16 frontier slots, no flag bits
+# (ham_dp_c.c).  "legacy15": the original 15-slot key with the NC/MARKER flag
+# bits (ham_dp_c_legacy15.c), kept for comparison and as a fallback.
+_C_VARIANTS = {"key16": ("ham_dp_c.c", 16), "legacy15": ("ham_dp_c_legacy15.c", 15)}
+_C_VARIANT = os.environ.get("HAM_DP_VARIANT", "key16")
+if _C_VARIANT not in _C_VARIANTS:
+    raise ValueError(f"HAM_DP_VARIANT must be one of {sorted(_C_VARIANTS)}")
+C_SOURCE = (_HERE / _C_VARIANTS[_C_VARIANT][0]).read_text()
+
+
+def set_c_variant(name: str) -> None:
+    """Select the C implementation: "key16" (default) or "legacy15"."""
+    global _C_VARIANT, C_SOURCE, _LIB_CACHE, MAX_STATE_SLOTS
+    if name not in _C_VARIANTS:
+        raise ValueError(f"variant must be one of {sorted(_C_VARIANTS)}")
+    _C_VARIANT = name
+    C_SOURCE = (_HERE / _C_VARIANTS[name][0]).read_text()
+    MAX_STATE_SLOTS = _C_VARIANTS[name][1]
+    _LIB_CACHE = {}
 
 # ---------------------------------------------------------------------------
 # Cache geometry detection and compile-time constant derivation
@@ -600,7 +618,7 @@ def count_hamiltonian_paths_c(n: int, order: list, adj: dict,
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
-            "Frontier exceeded the 15 slots of the 64-bit state key (vertex separation / pathwidth >= 15). "
+            f"Frontier exceeded the {MAX_STATE_SLOTS} slots of the 64-bit state key. "
             "The packed uint64 state encoding is limited to 15 frontier slots."
         )
     paths = (hi << 64) | lo
@@ -676,7 +694,7 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
     lo, hi = int(c_res_lo[0]), int(c_res_hi[0])
     if lo == hi == 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError(
-            "Frontier exceeded the 15 slots of the 64-bit state key (an introduced vertex would be slot 16: vertex separation / pathwidth >= 15)."
+            f"Frontier exceeded the {MAX_STATE_SLOTS} slots of the 64-bit state key."
         )
     paths = (hi << 64) | lo
     if count_cycles:
@@ -700,7 +718,7 @@ def count_hamiltonian_paths_peh(n: int, order: list, adj: dict,
 #     2 H <= per(A') <= prod_v ((d_v + 1)!)^(1/(d_v + 1)) * (n!)^(1/n),
 # and the number of Hamiltonian cycles is at most H / n <= H.
 
-MAX_STATE_SLOTS = 15   # frontier slots of the 64-bit state key (MAX_FS_FAST in C)
+MAX_STATE_SLOTS = _C_VARIANTS[_C_VARIANT][1]   # MAX_FS_FAST of the selected C variant
 
 
 def in_step_width(order: list, adj: dict) -> int:
@@ -726,8 +744,9 @@ def _check_width(order: list, adj: dict) -> None:
     if w > MAX_STATE_SLOTS:
         raise RuntimeError(
             f"This ordering needs {w} frontier slots during a step (vertex "
-            f"separation {w - 1}); the 64-bit state key holds {MAX_STATE_SLOTS}. "
-            "Use an ordering of vertex separation <= 14.")
+            f"separation {w - 1}); the 64-bit state key of variant "
+            f"{_C_VARIANT!r} holds {MAX_STATE_SLOTS}. "
+            f"Use an ordering of vertex separation <= {MAX_STATE_SLOTS - 1}.")
 
 
 class SMOverflow(OverflowError):
@@ -915,7 +934,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
             lib.sm_set_crt(c_mod, 0, 0)
         lo_, hi_ = int(c_res_lo[0]), int(c_res_hi[0])
         if lo_ == hi_ == 0xFFFFFFFFFFFFFFFF:
-            raise RuntimeError("Frontier exceeded the 15 slots of the 64-bit state key (an introduced vertex would be slot 16: vertex separation / pathwidth >= 15).")
+            raise RuntimeError(f"Frontier exceeded the {MAX_STATE_SLOTS} slots of the 64-bit state key.")
         cyc_ = ((int(c_cyc_hi[0]) << 64) | int(c_cyc_lo[0])) if count_cycles else None
         return (hi_ << 64) | lo_, cyc_
 

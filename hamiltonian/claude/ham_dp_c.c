@@ -188,10 +188,26 @@ void sm_configure(int nthreads,size_t worker_cap,int rbuf_size,
     sm_cfg.steal_factor=steal_factor; sm_cfg.rsort_thresh=rsort_thresh;
 }
 
-#define KEY_MARKER  ((u64)1 << 63)
-#define KEY_NC_BIT  ((u64)1 << 62)
-/* 4 bits per frontier slot + 2 flag bits → max 15 slots in 64 bits. */
-#define MAX_FS_FAST 15
+/* State key: 16 frontier slots of 4 bits each, no flag bits.
+   (Until 2026-11-26 the key had 15 slots plus two flags, KEY_NC_BIT = "a
+   closed chain exists" and KEY_MARKER = "key is non-zero"; that version is
+   kept as ham_dp_c_legacy15.c.)  Why the flags are not needed:
+   - NC.  A chain whose two endpoints have both left the frontier is a
+     complete component.  Before the last step at least one vertex is still
+     to be introduced and can never join it, so such a state can never be
+     counted: it is discarded at once.  At the last step every remaining
+     frontier vertex is interior (checked at the closure) and is eliminated
+     in this step, so the count is added at once.  Within one step, an edge
+     closing the chain at the last step yields KEY_CLOSED, which rejects
+     every further edge and is counted by apply_elim_seq.
+   - MARKER.  It only kept the initial key (empty frontier) non-zero, as 0
+     means "invalid" for apply_edge / apply_elim_seq.  Every output key has
+     fs >= 1 slots, each encoded >= 1, so it is never 0; the initial key is
+     now 0 and is only ever an input.
+   KEY_CLOSED = UINT64_MAX is never a valid key: it would need all 16 slots
+   to hold label 13, and a label occurs at most twice.                  */
+#define KEY_CLOSED  (~(u64)0)
+#define MAX_FS_FAST 16
 /* Most back-edges of one vertex (edges to earlier frontier vertices); the
    sweep enumerates 2^n_back subsets.  Exceeding it is a hard error: the
    old silent cap at 8 dropped edges and gave wrong counts.              */
@@ -214,8 +230,6 @@ static inline u64 slot_set(u64 key, int i, int8_t v)
     key |=  (u64)enc_v(v) << (4*i);
     return key;
 }
-static inline int nc_get(u64 key)   { return (int)((key >> 62) & 1u); }
-static inline u64 nc_set_1(u64 key) { return key | KEY_NC_BIT; }
 
 static inline int label_count(u64 key, int fs, int8_t lbl)
 {
@@ -250,7 +264,7 @@ static inline u64 canon(u64 key, int fs)
     uint8_t map[16];
     memset(map, 0, 16);
     uint8_t nxt = enc_v(1);
-    u64 result = key & (KEY_MARKER | KEY_NC_BIT);
+    u64 result = 0;
     for (int i = 0; i < fs; i++) {
         uint8_t n = (uint8_t)((key >> (4*i)) & 0xFu);
         if (dec_v(n) > 0) {
@@ -280,9 +294,10 @@ static inline u64 introduce(u64 key, int fs)
 static inline u64 eliminate_slot(u64 key, int u_idx, int fs)
 {
     u64 low  = key & (((u64)1 << (4*u_idx)) - 1u);
-    u64 high = (key >> (4*(u_idx+1)))
-               & (((u64)1 << (4*(fs - u_idx - 1))) - 1u);
-    return (key & (KEY_MARKER | KEY_NC_BIT)) | low | (high << (4*u_idx));
+    /* 4*(u_idx+1) == 64 when eliminating slot 15 of 16: no higher slots. */
+    u64 high = (u_idx + 1 >= 16) ? 0
+             : (key >> (4*(u_idx+1))) & (((u64)1 << (4*(fs - u_idx - 1))) - 1u);
+    return low | (high << (4*u_idx));
 }
 
 /* ======================================================================
@@ -663,8 +678,11 @@ static inline void rsort_add(RSortBuf *rb, u64 key, u128 val) {
    Returns updated canonical key, or 0 if the edge is invalid.
    ====================================================================== */
 static inline u64 apply_edge(u64 nk, int fs,
-                              int v_idx, int w_idx, int *new_nc)
+                              int v_idx, int w_idx, int last)
 {
+    /* last: this is the last step (step == n - 1).  Returns 0 if invalid,
+       KEY_CLOSED if the edge closes the Hamiltonian path at the last step. */
+    if (nk == KEY_CLOSED) return 0;          /* no edge after the closure */
     int8_t sv = slot_get(nk, v_idx);
     int8_t sw = slot_get(nk, w_idx);
 
@@ -695,11 +713,13 @@ static inline u64 apply_edge(u64 nk, int fs,
     nk = label_rename(nk, fs, sw, sv);
 
     if (sv_c == 1 && sw_c == 1) {
-        if (nc_get(nk) >= 1) return 0;
+        /* Both chains' other ends have left the frontier: the merged chain
+           is complete.  Valid only at the last step and only if every other
+           frontier vertex is interior.                                   */
+        if (!last) return 0;
         for (int k = 0; k < fs; k++)
             if (slot_get(nk, k) != -1) return 0;
-        *new_nc = 1;
-        return canon(nc_set_1(nk), fs);
+        return KEY_CLOSED;
     }
     return canon(nk, fs);
 }
@@ -712,6 +732,10 @@ static inline u64 apply_elim_seq(u64 nk, int cur_fs,
                                   const int *elim_idxs_desc, int n_elim,
                                   int step, int n, u128 cnt, u128 *total)
 {
+    if (nk == KEY_CLOSED) {                  /* closed by an edge (last step) */
+        if (step == n - 1) *total += cnt;
+        return 0;
+    }
     for (int e = 0; e < n_elim; e++) {
         int    u_idx = elim_idxs_desc[e];
         int8_t su    = slot_get(nk, u_idx);
@@ -731,23 +755,19 @@ static inline u64 apply_elim_seq(u64 nk, int cur_fs,
             if (partner) {
                 nk = canon(rk, cur_fs);
             } else {
-                if (nc_get(nk) >= 1) return 0;
+                /* The chain's other end left earlier: it closes here.  Valid
+                   only at the last step with all remaining vertices interior
+                   (they are all eliminated in this step); counted now.    */
+                if (step != n - 1) return 0;
                 for (int k = 0; k < cur_fs; k++)
                     if (slot_get(rk, k) != -1) return 0;
-
-                nk = nc_set_1(canon(rk, cur_fs));
-                if (cur_fs == 0) {
-                    if (step == n - 1) *total += cnt;
-                    return 0;
-                }
+                *total += cnt;
+                return 0;
             }
         }
     }
 
-    if (cur_fs == 0) {
-        if (step == n - 1 && nc_get(nk) == 1) *total += cnt;
-        return 0;
-    }
+    if (cur_fs == 0) return 0;               /* empty frontier, no closure */
     return nk;
 }
 
@@ -788,10 +808,10 @@ static void fused_sweep(EHT *curr, EHT *nxt,
                     if (!(S & (1 << j))) continue;
 
                     /* Hamiltonian cycle detection (same logic as sm_worker_runs) */
-                    if (cycles_total && step == n - 1) {
+                    if (cycles_total && step == n - 1 && nk != KEY_CLOSED) {
                         int8_t sv = slot_get(nk, v_idx);
                         int8_t sw = slot_get(nk, widxs[j]);
-                        if (sv == sw && sv > 0 && !(S >> (j + 1)) && !nc_get(nk)) {
+                        if (sv == sw && sv > 0 && !(S >> (j + 1))) {
                             int all_int = 1;
                             for (int k = 0; k < fs && all_int; k++) {
                                 if (k == v_idx || k == widxs[j]) continue;
@@ -801,14 +821,13 @@ static void fused_sweep(EHT *curr, EHT *nxt,
                         }
                     }
 
-                    int nc_inc = 0;
-                    u64 nk2 = apply_edge(nk, fs, v_idx, widxs[j], &nc_inc);
+                    u64 nk2 = apply_edge(nk, fs, v_idx, widxs[j], step == n - 1);
                     if (!nk2) { valid = 0; break; }
                     nk = nk2;
                 }
                 if (!valid) continue;
 
-                if (n_elim > 0) {
+                if (nk == KEY_CLOSED || n_elim > 0) {   /* KEY_CLOSED: counted */
                     nk = apply_elim_seq(nk, fs, elim_idxs_desc, n_elim,
                                         step, n, cnt, total);
                     if (!nk) continue;
@@ -840,7 +859,7 @@ static void fused_sweep(EHT *curr, EHT *nxt,
      cnt × (8+8+8)  key, val_lo, val_hi
    ====================================================================== */
 #define CKPT_MAGIC   0xC8EC7A1Eu
-#define CKPT_VERSION 2u
+#define CKPT_VERSION 3u   /* 3: 16-slot keys without flag bits */
 
 static uint64_t order_hash(int n, const int *order)
 {
@@ -1000,7 +1019,7 @@ void count_ham_paths_c(
     }
 
     if (start_step == 0)
-        eh_insert(curr, KEY_MARKER, (u128)1);
+        eh_insert(curr, (u64)0, (u128)1);     /* empty frontier */
 
     double t_start = now_ms(), t_prev = t_start, t_last_ckpt = t_start;
     double t_ckpt_total = 0.0;  /* total time spent on checkpoint I/O, excluded from profile */
@@ -1102,8 +1121,7 @@ void count_ham_paths_c(
                         if (sv == -1 || sw == -1) { (void)0; } else {
                         u64 nk = key;
                         /* Cycle detection: at last step, sv==sw>0 closes a cycle */
-                        if (cyc_lo && step == n - 1 && sv == sw && sv > 0
-                                   && !nc_get(key)) {
+                        if (cyc_lo && step == n - 1 && sv == sw && sv > 0) {
                             int all_int = 1;
                             for (int k2 = 0; k2 < fs && all_int; k2++) {
                                 if (k2 == v_idx || k2 == w_idx) continue;
@@ -1131,12 +1149,16 @@ void count_ham_paths_c(
                             nk = slot_set(nk, w_idx, -1);
                             nk = label_rename(nk, fs, sw, sv);
                             if (sv_c == 1 && sw_c == 1) {
-                                if (nc_get(nk) >= 1) goto bskip;
+                                /* Closure: valid only at the last step with
+                                   every frontier vertex interior; those are
+                                   all eliminated in this step, and no later
+                                   back-edge can apply, so count it now.   */
+                                if (step != n - 1) goto bskip;
                                 int ok = 1;
                                 for (int k2 = 0; k2 < fs; k2++)
                                     if (slot_get(nk, k2) != -1) { ok = 0; break; }
                                 if (!ok) goto bskip;
-                                BINSERT(canon(nc_set_1(nk), fs));
+                                total += cnt;
                             } else {
                                 BINSERT(canon(nk, fs));
                             }
@@ -1164,7 +1186,6 @@ void count_ham_paths_c(
                         u64    key = bkt->k[i];
                         u128   cnt = bkt->v[i];
                         int8_t su  = slot_get(key, u_idx);
-                        int    nc  = nc_get(key);
                         if (su == 0) continue;
                         u64 rk = eliminate_slot(key, u_idx, fs);
                         if (su == -1) {
@@ -1176,7 +1197,6 @@ void count_ham_paths_c(
                             if (partner) {
                                 CINSERT(canon(rk, fs - 1), cnt);
                             } else {
-                                if (nc + 1 > 1) continue;
                                 int ok = 1;
                                 for (int k2 = 0; k2 < fs - 1; k2++)
                                     if (slot_get(rk, k2) != -1) { ok = 0; break; }
@@ -1216,12 +1236,7 @@ void count_ham_paths_c(
             }
         }
 
-        /* Final-step lookup: count Hamiltonian path completions. */
-        if (step == n - 1) {
-            u64   target = KEY_MARKER | KEY_NC_BIT;
-            u128 *vp     = eh_lookup(curr, target);
-            if (vp) total += *vp;
-        }
+        /* (No final-step lookup: completions are counted at the closure.) */
 
         if (verbose) {
             double t_now = now_ms();
@@ -2376,7 +2391,7 @@ static void *sm_worker_runs(void *arg) {
         u64  base = w->in[i].key;
         u64  cnt  = w->in[i].val;
         for (int S = 0; S < n_subsets; S++) {
-            u64 nk = base; int valid = 1; int nc_inc = 0;
+            u64 nk = base; int valid = 1;
             for (int j = 0; j < w->n_back && valid; j++) {
                 if (!(S & (1 << j))) continue;
 
@@ -2384,14 +2399,14 @@ static void *sm_worker_runs(void *arg) {
                    when sv == sw (two free ends of the same segment), the normal
                    apply_edge would reject this as a premature cycle.  But at
                    the final step this closes a Hamiltonian cycle, so count it.
-                   Conditions: no remaining edges in S after this one, nc_bit
-                   clear (no completed sub-components), and all other frontier
-                   slots are internal (-1, not free ends of other segments).   */
-                if (w->count_cycles && w->step == w->n - 1) {
+                   Conditions: no remaining edges in S after this one, the path
+                   has not been closed by an earlier edge (nk != KEY_CLOSED),
+                   and all other frontier slots are internal (-1).            */
+                if (w->count_cycles && w->step == w->n - 1 && nk != KEY_CLOSED) {
                     int8_t sv = slot_get(nk, w->v_idx);
                     int8_t sw = slot_get(nk, w->widxs[j]);
                     if (sv == sw && sv > 0) {
-                        if (!(S >> (j + 1)) && !nc_get(nk)) {
+                        if (!(S >> (j + 1))) {
                             int all_int = 1;
                             for (int k = 0; k < w->fs && all_int; k++) {
                                 if (k == w->v_idx || k == w->widxs[j]) continue;
@@ -2403,12 +2418,13 @@ static void *sm_worker_runs(void *arg) {
                     }
                 }
 
-                u64 nk2 = apply_edge(nk, w->fs, w->v_idx, w->widxs[j], &nc_inc);
+                u64 nk2 = apply_edge(nk, w->fs, w->v_idx, w->widxs[j],
+                                     w->step == w->n - 1);
                 if (!nk2) { valid = 0; break; }
                 nk = nk2;
             }
             if (!valid) continue;
-            if (w->n_elim > 0) {
+            if (nk == KEY_CLOSED || w->n_elim > 0) {   /* KEY_CLOSED: counted */
                 nk = apply_elim_seq(nk, w->fs, w->elim_idxs_desc, w->n_elim,
                                     w->step, w->n, cnt, &local_total);
                 if (!nk) continue;
@@ -4275,7 +4291,7 @@ void count_ham_paths_sm(
     for (int i = 0; i <= n; i++) R->fidx[i] = -1;
     R->curr = smtab_alloc(1024);
     R->nxt  = smtab_alloc(1024);
-    R->curr->data[0].key = KEY_MARKER;
+    R->curr->data[0].key = 0;                /* empty frontier */
     R->curr->data[0].val = (u64)1;
     R->curr->cnt = 1;
 
