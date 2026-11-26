@@ -2265,3 +2265,183 @@ defulat, report and none as options. Also, can you make kpw with the
 dsl the default now instead of maxsat? Also, I've made kobayashi-pw
 public on github, so you should adjust pyproject.toml.
 
+You should also add the pruning modification (with attribution to the
+code of Zhao Hui Du) to the latex paper and slides.
+
+Answer
+======
+Now the slides.
+
+The paper builds cleanly and the slide fits. Now I'll finish checking the CLI changes from before, since that test run was interrupted.
+
+Tests pass apart from one case that runs past the VM's time limit; it passed earlier in pruning-only form. Next, `uv.lock`:
+
+I've added the pruning to the paper and the slides, crediting Zhao Hui Du's program. I've also made the code changes from your previous message. Both LaTeX files compile cleanly, and the tests pass except one long test case that I couldn't finish here (details at the end).
+
+**Paper** (`doc/Papers/hampath_paper_full.tex`): a new section 13, "Pruning States That Cannot Be Completed", sits just before Results.
+- **Attribution:** it opens with Du's program, cited as a new entry `DuPath4` in `square_sum.bib`. I don't know the program's date or where it was published, so the entry says "C++ program, communicated to the author"; please correct it if it appeared on the OEIS or elsewhere.
+- **Proposition 2:** it states both necessary conditions, connectivity (C) and the endpoint budget (D), with a proof. A remark extends the argument to the cycle count.
+- **Implementation and Effect:** these subsections cover how the test runs in the workers, the correctness checks, the dead-state fractions, a timing table from the Linux VM and your 49.5 s on the iMac. They also say that the runs for n = 62–75 were made without pruning.
+- **Conclusion:** I added one item to the list of contributions.
+- There is a `% TODO` comment asking for an unpruned iMac time with the same ordering. Your earlier 111 s run used a different ordering, so it isn't a fair comparison. If you run `ham_count 58 --sort-merge --prune none --machine-yaml machine.yaml`, I'll put that figure in.
+
+**Slides** (`doc/Talks/talk2.tex`): there is a new slide, "Pruning States That Cannot Finish — after Zhao Hui Du", at the end of Part VI, and an extra line in the outline. I looked at both pages rendered and the text fits.
+
+**Code:**
+- **`--prune {drop,report,none}`:** this is now a `ham_count` option, and a `prune=` argument to `count_hamiltonian_paths_sm`. `drop` is the default, and the environment variable is no longer read. With `-v`, the log says which mode was used. The old `legacy15` variant prints a note that it has no pruning.
+- **Ordering defaults:** `--ordering` now defaults to `kpw` and `--kpw-engine` to `dsl`.
+- **`pyproject.toml`:** kobayashi-pw now comes from `github.com/algebravic/kobayashi-pw`, pinned to commit `5f52863`, which is your current `master` on GitHub. The editable local path is left as a comment. I regenerated `uv.lock`; the only change is the kobayashi-pw source.
+- **Tests:** the two tests tuned to unpruned table sizes now pass `prune="none"`, and the Held-Karp comparisons now check both `drop` and `none`. Everything passes except `test_many_back_edges[2]`: running both modes now takes longer than the VM's 3-minute limit, so I couldn't finish it here. It passed earlier with pruning alone, so please run it on your machine.
+- **Design note:** `doc/sm_prune_design.md` is updated to describe the option.
+
+**Housekeeping:**
+- The preview images I made to check the layout are in `doc/Talks/_to_delete/` and `doc/Papers/_to_delete/`, because I can't delete files in your folder. Both folders can be removed.
+- From my earlier failed commit, `ham_dp_c.c`, `doc/sm_prune_design.md` and `doc/contrib_analysis.md` are still staged in git. They are staged in their versions from before this round of edits, so run `git add` again before you commit.
+
+Question
+========
+Zhao Hui Du's code is available here
+`https://github.com/emathgroup/selectedTopics/blob/master/content/attached/files/path4.cpp`
+That github has lots of unannotated programs solving various problems.
+
+Answer
+======
+I've added the GitHub link to the `DuPath4` entry in `square_sum.bib`, and the paper's reference now shows it. The paper recompiles without errors.
+
+- **Same program:** the file at that link is byte-for-byte identical to your `doc/contrib/path4.cpp`, so the timings and analysis I did apply to the published version.
+- **Analysis doc:** `doc/contrib_analysis.md` now names the repository and links to it.
+- **No date in the citation:** the GitHub page shows no author, commit or date for the file, so the entry still has none. If you know when Du wrote it or posted it, I can add a `year`.
+
+If you'd like, I could survey the other programs in that repository to
+see whether any of them handle the square-sum graph or a related
+counting problem.
+
+Question
+========
+First, the pruning idea is really in the basic algorithm (even though
+it definitely affects the run time) rather than the engineering part,
+so it should be moved to talk1, and mentioned in talk2 by comparison
+of timing (and storage use). Yes, survey the other programs in Zhao's
+repo to see if any are relevant.
+
+Answer
+======
+Slides are done. Now the survey write-up.
+
+I've moved the pruning into talk1 and turned the talk2 slide into a timing and storage comparison. The survey of Zhao Hui Du's repository is in `doc/emathgroup_survey.md`: two things in it are relevant, a version of his program that counts cycles and a forum post on counting knight's tours. Both talks compile, and I looked at the changed slides rendered.
+
+**`talk1.tex`, the algorithm talk:**
+- A new slide, "Pruning States That Cannot Finish — after Zhao Hui Du", sits at the end of the classical-DP part, right after "Why Ordering Matters".
+- It states the two conditions as a proposition: the connectivity test and the endpoint budget, the rule that a path has only two ends. It gives a one-line argument for why dropping these states leaves the count unchanged, the simplest dead state (three chains whose far ends have already left the frontier), and how much is dead: 55% of all states at n = 52.
+- The outline has a new line for it. I tightened two spaces so that "Treewidth comparison" still fits on the page.
+
+**`talk2.tex`, the engineering talk:** the old slide is now "Effect of Pruning on Time and Storage".
+- **Time:** the table from the Linux VM.
+- **Storage:** n = 58 on your iMac, same ordering for both runs.
+
+  | | without pruning | with pruning |
+  |---|---|---|
+  | peak table (states) | 15.0 M | 5.5 M |
+  | peak table (16 B per state) | 241 MB | 88 MB |
+  | states over all steps | 167 M | 58 M |
+
+  The unpruned sizes come from your `--prune report` run, which keeps every state, so they are exactly the unpruned tables.
+- **Caveat on the slide:** the worker buffers don't shrink, so the process's peak memory falls less than the tables do.
+- **iMac time:** the slide gives your 49.5 s pruned, but no unpruned time on the iMac, because there is no clean `--prune none` run with that ordering yet. The paper has the same gap, marked with a TODO.
+
+I left the paper's pruning section where it is, after the sort-merge section. To match the talks it should probably move up next to the DP correctness section, section 4. Should I move it?
+
+**What in the repository is relevant.** The repository is the source of a blog that collects topics from the Chinese forum bbs.emath.ac.cn. The programs are unannotated attachments from forum threads; apart from one small script, no post links to them, and no post discusses the square-sum problem.
+- **`path4.2.cpp`** is a version of Du's program that counts Hamiltonian cycles instead of paths. It is evidently his, since the code is otherwise identical to `path4.cpp`.
+  - It starts from vertex N with its two cycle edges already fixed, instead of from all N(N−1)/2 pairs of endpoints. It also uses 128-bit masks, so N can go up to 127, and merges states for 9 levels instead of 6.
+  - Its counts agree with A071984 for N = 34–50, so it is an independent check by a third method.
+  - It took 10–12 s for N = 48 and 50, and didn't finish N = 52 within 55 s. That makes it slower than Dobbelaere's program (about 32 s for N = 52) and much slower than ours.
+- **The knight's-tour post** (`knight-tour.md`) describes KeyTo9_Fans's row-by-row frontier DP for closed knight's tours. Its state is the same as ours: how many edges each frontier vertex already has, plus labels saying which ones are joined. It reached 19381952998732022416892 closed tours on the 9×10 Chinese chessboard (OEIS A175881, A193054, A193055).
+  - The post says open tours, i.e. Hamiltonian paths, on that board have never been counted.
+  - That could be a target for our DP with a kpw ordering. Row by row, its frontier is about 19 vertices, more than our 16 slots, so the first step would be computing the pathwidth of that knight graph.
+
+Everything else is unrelated: Wordle solvers, word-grid fillers, number-theory searches, and so on. The survey lists them briefly; for files without comments, the description is my reading of the code.
+
+**Cleanup:** the preview images I made to check the slides are in
+`doc/Talks/_to_delete/` again, since I can't delete files in your
+folder. `doc/Papers/_to_delete/` from last time is still there
+too. Both folders can be removed.
+
+
+Question
+========
+I'll be regenerating the timings. I just ran n=61 on an M3Pro laptop
+with 18GB with the new code. It took 281.874 seconds (the optimal
+pathwidth ordering added another 1.98 seconds).
+
+Answer
+======
+The n = 61 log checks out, and your question about Du's algorithm can largely be answered from his own repository and the OEIS records.
+
+**The n = 61 run (`new_61.txt`)**
+- **The count matches:** 3711439128718, the same as A071983(61) in `data/b071983.txt`.
+- **Configuration:** 6 threads, Apple clang, pathwidth 14, everything in RAM. No step spilled to disk, and the peak resident memory was 8.66 GB.
+- **Where the 282 s went:** about 228 s generating states, 32 s in the per-worker sorts (flushes), and 21 s in the parallel merges. Generating states dominates; it was 15–16 s per step at steps 40–41.
+- **Pruning:** 1.88 G of the 4.39 G generated contributions (43%) were dropped before being stored. The largest table had 145 M states, at step 41.
+
+  That 43% counts only what was dropped at each step. It doesn't include the successors those dead states would have produced. The unpruned run will show the full effect.
+
+**Du's algorithm.** The dates line up closely with his GitHub repository:
+
+| Sequence | Values Du added | Program in his repository |
+|---|---|---|
+| A071983 (paths) | a(55)-a(56): Zhao Hui Du, Apr 25 2024; a(57)-a(58): Zhao Hui Du, Apr 26 2024 | `path4.cpp` |
+| A071984 (cycles) | a(64) from Zhao Hui Du, Apr 30 2024; a(65) from Zhao Hui Du, May 08 2024 | `path4.2.cpp` |
+
+- **Timing:** the repository's only commit is dated 14 May 2024, a week after his last OEIS addition.
+- **Fit with each program:** `path4.cpp` has 64-bit masks, which cover the paths for n ≤ 58. The cycle values for n = 64 and 65 need more than 62 vertices, and `path4.2.cpp` is exactly that change: 128-bit masks, one vertex's two cycle edges fixed at the start, and states merged for 9 levels instead of 6.
+
+This is circumstantial, not proof, but it is strong. He almost certainly used these two programs, and their method is the one in `doc/contrib_analysis.md`:
+- the vertices are processed in descending order, with each state recording the fragment endpoints and a mask of finished vertices;
+- states are merged by a `std::map` for the first few levels, then the rest is searched in parallel with OpenMP;
+- states are dropped by the degree, connectivity and forced-edge tests.
+
+The OEIS records also suggest that `path4.2` is fast enough on cycles to reach n = 65; on N ≤ 52 in our VM it was slower than Dobbelaere's backtracking. A few hours on a fast multicore machine at n = 65 is plausible, but I haven't measured anything at that size.
+
+If he replies, two questions are worth asking: what D and how many threads he used, and how long n = 58 and n = 65 took. That would let the paper compare methods fairly.
+
+**The OEIS page itself.** The A071983 page says the b-file runs to n = 75, but its data section stops at a(58). Also, the b-file is described as "Table of n, a(n) for n = 15..75," with terms n=15..59 from Zhao Hui Du. Your b-file note credits Du with n up to 59, but his OEIS extensions only go to a(58), so you may want to check whether that 59 is right.
+
+**A new target.** For A071984 the LINKS section lists a table of n,
+a(n) for n = 32..67 by Lawrence Li. Our DP already counts cycles with
+`--cycles` at essentially no extra cost. If your Linux runs to n = 75
+can be repeated with `--cycles`, or were already run that way, they
+would extend A071984 well past 67.
+
+Question
+========
+I tried to extend the data section of the OEIS page with values after
+58, but I was overruled by the administrators. They said that the
+values on the page were enough, and any further values should go in
+the b-file, which I did.
+
+Answer
+======
+That explains the gap, so it isn't something to fix. The OEIS limits the data section to about three lines (roughly 260 characters), and A071983's terms are already 12 digits long by a(58). New terms only appearing in the b-file is the normal outcome, and the page is consistent as it stands.
+
+The one thing I'd still check is the b-file note: the credit "terms
+n=15..59 from Zhao Hui Du". On the main page his extensions go only to
+a(58). Unless he also posted a(59) somewhere, for example on the wiki
+or in an earlier b-file, the credit should probably end at 58. a(59)
+would then be credited to whoever computed it first, which may be you.
+
+Question
+========
+That comment about 15..59 was there before I posted my values. He must
+have run into the same restriction that I had.
+
+Answer
+======
+That makes sense, and I withdraw the suggestion. If the note predates your edit, Du almost certainly submitted a b-file running to n = 59 at the time. The data section was cut off at a(58) for the same reason yours was, so his a(59) appears only in the b-file. The credit "15..59 from Zhao Hui Du" is then correct, and a(59) is his as well.
+
+So the paper should credit a(55)–a(59) to Du, not a(55)–a(58), and
+your values start at a(60). Your own computation agrees with his a(59)
+= 332409010079 (from `data/b071983.txt`), which is an independent
+confirmation of his term.
+
+

@@ -86,14 +86,15 @@
   \item Square-sum graphs
   \item Hamiltonian paths: why hard?
 \end{itemize}
-\vspace{0.3cm}
+\vspace{0.1cm}
 \textbf{\color{midblue}Classical DP Foundations}
 \begin{itemize}
   \item Bellman (1962), Held-Karp (1962)
   \item DP table structure
   \item Why ordering matters
+  \item Pruning dead states (Z.\,H.~Du)
 \end{itemize}
-\vspace{0.3cm}
+\vspace{0.1cm}
 \textbf{\color{midblue}Bell Numbers and Pathwidth}
 \begin{itemize}
   \item Bell numbers and state counts
@@ -328,6 +329,55 @@ vertices introduced but still having future neighbours.
 \textbf{Crucial:} the frontier width $|F_i|$ depends entirely on the ordering $\sigma$.\\[4pt]
 Choose $\sigma$ to \alert{minimise $\max_i |F_i|$}\\
 and the state space shrinks dramatically.
+\end{columns}
+\end{frame}
+
+\begin{frame}{Pruning States That Cannot Finish \hfill{\normalsize after Zhao Hui Du}}
+\footnotesize
+\begin{columns}[t]
+\column{0.52\textwidth}
+Zhao Hui Du's program \texttt{path4.cpp} (emathgroup, GitHub) discards a
+partial state once the unfinished vertices can no longer be joined into
+one path. The plain frontier DP keeps such a state until the last step.
+
+\vspace{0.1cm}
+\textbf{After step $i<n-1$:} $F$ = frontier, $U$ = vertices still to
+come, $N\subseteq F$ = frontier vertices of degree $<2$.
+$H_\sigma$ = edges of $G$ inside $U$ and between $N$ and $U$, plus a link
+joining the two frontier ends of each chain.
+
+\vspace{0.1cm}
+\begin{block}{Proposition (necessary for completion)}
+\begin{itemize}
+  \item[(C)] $H_\sigma$ is connected and $N\neq\emptyset$;
+  \item[(D)] \emph{endpoint budget:} the vertices forced to be path ends
+    number at most $2$:\\
+    chains whose other end has left $F$,\\
+    $u\in F$ of degree $0$ with one neighbour in $U$,\\
+    $w\in U$ of degree $1$ in $H_\sigma$.
+\end{itemize}
+\end{block}
+
+\column{0.44\textwidth}
+\textbf{Why it is safe:} a Hamiltonian path completing $\sigma$, with each
+chain replaced by its link, is a spanning path of $H_\sigma$ (C), and has
+exactly two ends (D). Dropping violators leaves the count unchanged
+(also for cycles).
+
+\vspace{0.15cm}
+\textbf{Simplest dead state:} three chains whose other ends have left the
+frontier: no path has three ends.
+
+\vspace{0.15cm}
+\begin{exampleblock}{How much is dead?}
+\begin{itemize}
+  \item $n=52$: \textbf{55\%} of all states
+  \item large steps of $n=58$: 53--75\%
+  \item all fail (D); (C) never adds anything here
+\end{itemize}
+Dead states also have no live successors, so the saving compounds:
+$n=58$ needs $2.9\times$ fewer states in total.
+\end{exampleblock}
 \end{columns}
 \end{frame}
 

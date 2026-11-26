@@ -1,6 +1,6 @@
 # Completability pruning for the sort-merge DP (Du's idea)
 
-Status: experimental. It is controlled by `HAM_SM_PRUNE` and is off by default; with it off the code paths are unchanged. It lives only in `ham_dp_c.c` (key16); `ham_dp_c_legacy15.c` is untouched.
+Status: on by default since 2026-11-26. It is chosen with `ham_count --prune {drop,report,none}` (`count_hamiltonian_paths_sm(..., prune=...)`), and the default is `drop`. It was first tested as the environment variable `HAM_SM_PRUNE` (0/1/2 = none/report/drop), which is no longer read. It lives only in `ham_dp_c.c` (key16); `ham_dp_c_legacy15.c` has no pruning.
 
 ## Idea
 
@@ -59,8 +59,8 @@ Both conditions are necessary, not sufficient, so pruning never removes a comple
 The cost is O(fs × iterations + |{w}|) per output key.
 
 **Modes:**
-- `HAM_SM_PRUNE=1` counts only. After the merge, every deduplicated state is classified (live, dead by D, or dead by C) and one line per step is printed: `[prune] step=… states=… deadD=… deadC=…`. The states are kept, so the run is identical to an unpruned run apart from the time spent checking.
-- `HAM_SM_PRUNE=2` drops dead keys inside the worker, before they reach the buffers, and prints `[prune] step=… dropped_raw=…`.
+- `report` (formerly `HAM_SM_PRUNE=1`) counts only. After the merge, every deduplicated state is classified (live, dead by D, or dead by C) and one line per step is printed: `[prune] step=… states=… deadD=… deadC=…`. The states are kept, so the run is identical to an unpruned run apart from the time spent checking.
+- `drop` (formerly `HAM_SM_PRUNE=2`; the default) drops dead keys inside the worker, before they reach the buffers, and prints `[prune] step=… dropped_raw=…`.
 
 ## How it will be evaluated
 
@@ -109,3 +109,8 @@ In the steps that dominate the run, pruning leaves 0.3–0.5 of the states, and 
    - whether dropping (C) makes the check cheaper without losing anything.
 2. Because the test is cheap and sound, it could become the default once it has been run on the Mac and Linux machines at larger n, for example n = 69 and 74. Making it the default changes the CRT wrap points and spill behaviour, so the two calibrated tests would need `HAM_SM_PRUNE=0`.
 3. The test could be applied **before** the subset enumeration, to prune input states early, and inside `apply_edge`. Both would save work in the sweep, not only in the sort and merge.
+
+### Update (2026-11-26)
+
+- `--prune drop` is now the default, and the two calibrated tests pass `prune="none"`.
+- On the M3 iMac, n = 58 runs in 49.5 s with `drop` (`count_58_sm_pruned3.txt`). With `report` it takes 154 s (`count_58_sm_pruned2.txt`), because `report` keeps every state and adds a serial classification pass. A clean `none` run with the same ordering is still to be done.

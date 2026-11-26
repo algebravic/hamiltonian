@@ -267,7 +267,7 @@ requires-dist = [
     { name = "cffi", specifier = ">=2.0.0" },
     { name = "graph-families", git = "https://github.com/algebravic/graph_families.git" },
     { name = "graphillion", git = "https://github.com/takemaru/graphillion.git?rev=v2.0rc0" },
-    { name = "kobayashi-pw", editable = "../kobayashi-pw" },
+    { name = "kobayashi-pw", git = "https://github.com/algebravic/kobayashi-pw.git?rev=5f528634c3271a224ec39eeaebeb780750220216" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "networkx", specifier = ">=3.4.2,<4" },
     { name = "numpy" },
@@ -385,12 +385,7 @@ wheels = [
 [[package]]
 name = "kobayashi-pw"
 version = "0.1.0"
-source = { editable = "../kobayashi-pw" }
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+source = { git = "https://github.com/algebravic/kobayashi-pw.git?rev=5f528634c3271a224ec39eeaebeb780750220216#5f528634c3271a224ec39eeaebeb780750220216" }
 
 [[package]]
 name = "matplotlib"

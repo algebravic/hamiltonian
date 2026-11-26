@@ -115,13 +115,14 @@
 
 \column{0.32\textwidth}
 \textbf{\color{midblue}Iteration 5: Going Parallel}
-\begin{itemize}
+\begin{itemize}\setlength{\itemsep}{1pt}
   \item Why hash-based parallelism failed
   \item Generate $\to$ sort $\to$ merge
   \item Merging by hash range
   \item Load balancing by randomising
+  \item Effect of pruning (Du)
 \end{itemize}
-\vspace{0.2cm}
+\vspace{0.05cm}
 \textbf{\color{midblue}Results and Lessons}
 \begin{itemize}
   \item $n=61$: 97\,min, $<$2\,GB (laptop)
@@ -915,6 +916,64 @@ Light steps reach 1.5--1.9, but they are short.
 \begin{alertblock}{Not yet cross-checked}
   $n=75$: one completed run. It is the first with frontier width $15$
   (the most a 64-bit key holds) and the first total above $2^{64}$.
+\end{alertblock}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Effect of Pruning on Time and Storage}
+\footnotesize
+\begin{columns}[t]
+\column{0.50\textwidth}
+Pruning dead states (Du's idea; see the algorithm talk) is applied by the
+workers after the eliminations, \emph{before} a contribution enters a
+buffer: a dead state is never sorted, merged, stored or extended.
+Cost per key: a few popcounts and a bit-set fix-point.
+
+\vspace{0.15cm}
+\textbf{Time} (Linux VM, 4 threads, same ordering per row)
+
+\vspace{0.05cm}
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+$n$ & without & with & \\
+\midrule
+55 & 9.4\,s & 5.2\,s & $1.8\times$\\
+56 & 16.6\,s & 11.2\,s & $1.5\times$\\
+\rowcolor{dkgreen!15}
+57 & 68.2\,s & 29.4\,s & $2.3\times$\\
+58 & $>$174\,s & 130.1\,s & \\
+\bottomrule
+\end{tabular}
+\end{center}
+$n=58$ without pruning stopped after step 37 (158\,s); with pruning,
+step 37 at 64.6\,s.
+
+\column{0.46\textwidth}
+\textbf{Storage}, $n=58$, M3 iMac, same ordering
+
+\vspace{0.05cm}
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+ & without & with\\
+\midrule
+peak table (states) & 15.0\,M & 5.5\,M\\
+peak table (16\,B entries) & 241\,MB & 88\,MB\\
+states over all steps & 167\,M & 58\,M\\
+\bottomrule
+\end{tabular}
+\end{center}
+Live fraction per step: $0.25$--$0.47$.
+
+\vspace{0.15cm}
+\textbf{Time on the iMac:} $49.5$\,s with pruning (4 threads).
+
+\vspace{0.1cm}
+\begin{alertblock}{Caveats}
+Single runs. The worker buffers ($2P\cdot\texttt{CAP}$ entries) do not
+shrink, so peak RSS falls less than the tables do.
+Counts unchanged for $n=15$--$58$.
 \end{alertblock}
 \end{columns}
 \end{frame}

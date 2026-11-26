@@ -1,6 +1,6 @@
 # The two contributed programs in `doc/contrib`
 
-The two files are `A071984_opt.cpp` (Bert Dobbelaere) and `path4.cpp` (Zhao Hui Du; his name is not in the file).
+The two files are `A071984_opt.cpp` (Bert Dobbelaere) and `path4.cpp` (Zhao Hui Du; his name is not in the file). Du's program is published, without annotation, in the emathgroup repository: <https://github.com/emathgroup/selectedTopics/blob/master/content/attached/files/path4.cpp>.
 
 ## Summary
 

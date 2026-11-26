@@ -999,6 +999,144 @@ On the Linux machine, $n=61$ takes $699$\,s of DP time, against $97$ minutes
 for extendible hashing on the laptop.
 
 % -------------------------------------------------------
+\section{Pruning States That Cannot Be Completed}
+\label{sec:prune}
+% -------------------------------------------------------
+
+The idea of this section is taken from a program of Zhao Hui
+Du~\cite{DuPath4} that counts the Hamiltonian paths of~$\Gn$.
+His program processes the vertices in the fixed order $n,n-1,\ldots,1$ and
+discards a partial state as soon as the vertices that are not yet finished
+can no longer be joined, together with the existing path fragments, into a
+single path.
+It does this with a degree test and a connectivity test.
+Our DP had no such test.
+A state that can never be completed is carried, multiplied by up to
+$2^{\nb}$ at each step, sorted and merged, until it is rejected at an
+elimination or at the last step.
+The simplest example is a state with three half-external chains
+(Section~\ref{sec:dp}): no two of them can ever be joined before the last
+step, and no single path has three ends outside the frontier.
+
+\subsection{Necessary conditions}
+
+After step~$t<n-1$ let $F$ be the frontier, after the eliminations of
+step~$t$, and $U=\{v_{t+1},\ldots,v_{n-1}\}\neq\emptyset$ the vertices not yet
+introduced.
+Every edge with no end in~$U$ has been decided.
+For a state $\sigma$ let $N=\{u\in F:\sigma_u\neq-1\}$ be the frontier
+vertices that are not interior, and for $u\in F$ let
+$d_U(u)=|\Gamma(u)\cap U|$, where $\Gamma(u)$ is the set of neighbours
+of~$u$; this is at least~$1$ since otherwise $u$
+would have been eliminated.
+Let $H_\sigma$ be the graph on $N\cup U$ whose edges are the edges of~$G$
+inside~$U$, the edges of~$G$ between $N$ and~$U$, and one \emph{link}
+joining the two frontier ends of each chain that has both ends in~$F$.
+
+\begin{proposition}\label{prop:prune}
+If a state $\sigma$ after step $t<n-1$ extends to a Hamiltonian path of~$G$,
+then
+\begin{enumerate}[nosep,label=(\Alph*)]
+  \setcounter{enumi}{2}
+  \item $N\neq\emptyset$ and $H_\sigma$ is connected;
+  \item every $w\in U$ has $\deg_{H_\sigma}(w)\ge1$, and
+  \[
+    e(\sigma) = m(\sigma)
+      + \#\{u\in F:\sigma_u=0,\ d_U(u)=1\}
+      + \#\{w\in U:\deg_{H_\sigma}(w)=1\}\ \le\ 2,
+  \]
+  where $m(\sigma)$ is the number of half-external chains.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+Let $P$ be a Hamiltonian path completing~$\sigma$.
+Its edges are the decided edges of~$\sigma$ and a set $E'$ of edges with an
+end in~$U$; an edge of~$E'$ cannot meet an interior or eliminated vertex,
+so $E'\subseteq E(H_\sigma)$.
+The decided edges form vertex-disjoint paths (the chains, and the trivial
+paths at vertices with $\sigma_u=0$).
+No chain has both ends eliminated, since then it would be all of~$P$
+and $U$ would be empty.
+So each chain has either both ends in~$N$, or one end in~$N$ and the other
+an eliminated end of~$P$.
+Replacing each chain of the first kind by its link turns $P$ into a
+spanning path of $N\cup U$ in $H_\sigma$, which proves~(C); $N$ is non-empty
+because $P$ contains an edge between a decided vertex and~$U$.
+For~(D): every vertex of~$P$ has degree at least~$1$ in~$P$.
+A vertex $w\in U$ has $\deg_P(w)\le\deg_{H_\sigma}(w)$, and a vertex
+$u\in F$ with $\sigma_u=0$ has $\deg_P(u)\le d_U(u)$, so the vertices in the
+last two terms of $e(\sigma)$ are ends of~$P$; so is the eliminated end of
+each half-external chain.
+These vertices are distinct, and $P$ has two ends.
+\end{proof}
+
+A Hamiltonian cycle found at the last step minus its closing edge, which
+is decided at that step, is a Hamiltonian path completing the same state,
+so the proposition also justifies the pruning when cycles are counted.
+Dropping every state that violates (C) or (D) therefore leaves both counts
+unchanged.
+
+\subsection{Implementation}
+
+At each step the components of $G[U]$ are computed once by union--find,
+and for each frontier slot $u$ we record $d_U(u)$ and the bit set of the
+components containing a neighbour of~$u$; for each $w\in U$ with a frontier
+neighbour we record $\deg_{G[U]}(w)$ and the bit set of its frontier
+neighbours.
+For a key, $e(\sigma)$ is then a few population counts, and~(C) is a
+fix-point iteration on two bit sets (slots reached and components reached),
+in time $O(\fs\cdot\text{iterations}+|\partial U|)$.
+The test is applied by the workers of Section~\ref{sec:sm} to every
+contribution after the eliminations and before it enters a buffer, so a
+dead state is never sorted, never merged and never generates successors.
+Du's program also commits an edge as soon as an endpoint has a single
+possible neighbour left; that has no counterpart here, where an edge is
+decided when its later end is introduced.
+
+\subsection{Effect}
+
+The counts with pruning agree with those without it, and with
+A071983~\cite{OEIS-A071983}, for every $n$ with $15\le n\le 50$ and for
+$n=53,55,56,57,58$; the cycle counts agree for $32\le n\le 48$; and the
+counts agree with Held--Karp on random graphs of in-step width~$16$ and on
+graphs with many back-edges.
+At $n=40$ between $25\%$ and $75\%$ of the states of each step are dead,
+and at $n=52$, summed over all steps, $54.6\%$ are.
+Every rejected state violates~(D); on these graphs and orderings
+condition~(C) never rejected a state that (D) accepted.
+Table~\ref{tab:prune} compares the DP times with and without pruning on a
+four-thread Linux virtual machine; at $n=57$ pruning halves the largest
+table, and at step~$37$ of $n=58$ it reduces the table from $24.5$ to $7.5$
+million states.
+On the M3 iMac with four threads, $n=58$ takes $49.5$\,s of DP time with
+pruning.
+% TODO: add the unpruned time on the iMac with the same ordering
+% (ham_count 58 --sort-merge --prune none --machine-yaml machine.yaml).
+The runs for $62\le n\le 75$ reported in Section~\ref{sec:results} were made
+without pruning.
+
+\begin{table}[H]
+\centering
+\caption{DP time with and without pruning (Linux VM, $4$ threads, one run
+each, same ordering in each row).}
+\label{tab:prune}
+\begin{tabular}{rrrr}
+\toprule
+$n$ & without & with & ratio\\
+\midrule
+55 & $9.4$\,s & $5.2$\,s & $1.8$\\
+56 & $16.6$\,s & $11.2$\,s & $1.5$\\
+57 & $68.2$\,s & $29.4$\,s & $2.3$\\
+58 & $>174$\,s & $130.1$\,s & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+\noindent
+For $n=58$ the run without pruning was stopped after step~$37$, at $158.0$\,s;
+the run with pruning reached that step at $64.6$\,s.
+
+% -------------------------------------------------------
 \section{Results}
 \label{sec:results}
 % -------------------------------------------------------
@@ -1158,6 +1296,9 @@ The main technical contributions are:
         that own disjoint ranges of hash space.
         Keeping every table in hash order balances the work without a cost
         model.
+  \item Pruning, after Zhao Hui Du, of the states that can no longer be
+        completed to a Hamiltonian path (an endpoint budget and a
+        connectivity test), which halves the DP time at $n=57$.
 \end{enumerate}
 
 The approach is general and can be applied to any sparse graph for which the
