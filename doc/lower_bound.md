@@ -2620,4 +2620,309 @@ Experiments 1 and 2 are done. The main answer to your question: the pruning gain
 
 The code is `hamiltonian/claude/prune_study.py`, and the raw results and tables are in `data/prune_study/`; the analysis file can be regenerated from the raw results.
 
-One problem with the file transfer to your machine: an earlier copy of `prune_study.py` arrived on your machine stale, without my last edits. Experiment 1 was run with that copy. It differs only in skipping one sanity check (that every completable state is also in the pruned table) and doing a redundant extra pass, so the numbers stand. The file in the repo is now the current version, and I confirmed the copies match.
+One problem with the file transfer to your machine: an earlier copy of
+`prune_study.py` arrived on your machine stale, without my last
+edits. Experiment 1 was run with that copy. It differs only in
+skipping one sanity check (that every completable state is also in the
+pruned table) and doing a redundant extra pass, so the numbers
+stand. The file in the repo is now the current version, and I
+confirmed the copies match.
+
+Question
+========
+Yes, please resume.
+
+Answer
+======
+The time isn't going into finding the minimum pathwidth. It goes into the second stage, which picks the cheapest ordering among all the pathwidth-optimal ones. For square grids that stage blows up. I timed the k×k grid in the Linux VM with the current defaults (kpw ordering, DSL engine, work-model cost):
+
+| grid | pw | DAG nodes | search for min pw | choosing the ordering | Pareto labels |
+|---|---|---|---|---|---|
+| 7×7 | 7 | 20 k | 0.0 s | 0.5 s | 148 |
+| 8×8 | 8 | 80 k | 0.2 s | 5.2 s | 487 |
+| 9×9 | 9 | 318 k | 0.7 s | 86.8 s | 2200 |
+| 10×10 | 10 | 1.25 M | 7.4 s | (not run to completion) | |
+
+The pathwidth search stays fast: 7.4 s at 10×10. The ordering stage multiplies by roughly 10–17 per unit of k, so 10×10 would take something like 15–25 minutes, and probably more, since the growth rate is itself increasing. That's an extrapolation; I didn't run it. The cause is the number of Pareto labels kept per DAG node, about 4.5× more per unit of k. The work-model cost doesn't decompose along the DAG, so the optimiser has to keep every non-dominated partial cost. A grid has an enormous number of nearly equivalent pathwidth-optimal orderings, so very little gets dominated. The square-sum graphs needed only 26–318 labels, which is why we never saw this there.
+
+Capping the labels with `--kpw-max-labels` loses almost nothing:
+
+| grid | labels | time | work value |
+|---|---|---|---|
+| 8×8 | all (487) | 5.2 s | 7818 |
+| 8×8 | 8 | 1.0 s | 7818 |
+| 9×9 | all (2200) | 86.8 s | 1.794e5 |
+| 9×9 | 32 | 9.8 s | 1.794e5 |
+| 9×9 | 8 | 7.6 s | 1.817e5 (+1.3%) |
+| 10×10 | 16 | 45.3 s | 1.368e7 |
+
+With a cap, the result is no longer guaranteed optimal, and the log marks it "(truncated)". In these cases the cap found the optimum or came within 1.3% of it.
+
+For this graph, I'd run it with:
+```
+ham_count --graph data/Dimacs/grid_10_10.dimacs --sort-merge --kpw-max-labels 32
+```
+Two caveats:
+- **The work model wasn't fitted on grids.** It was fitted on square-sum graphs, so its fine distinctions between grid orderings mean little anyway.
+- **The ordering choice matters less here.** A grid at pathwidth 10 is a small DP, and the ordering effects we measured were at most 1.4–3× on square-sum graphs. A cheap cost is a reasonable alternative, e.g. `--kpw-cost v2`; I haven't timed that.
+
+A real fix belongs in `ham_kpw`. Two options:
+- a default cap when none is given, e.g. 256 labels, with a warning saying the result may not be optimal;
+- a time budget that falls back to a cap once it's exceeded.
+
+I'd write the design note first, as usual. Should I?
+
+Question
+========
+Write the design note.
+
+The n=63 run for the square graph finished on the M3pro/18GB
+laptop. It's in `new_63_prune.txt`
+
+Answer
+======
+Now the design note:
+
+I've written the design note for bounding the ordering stage, and your n = 63 run checks out.
+
+**The design note** is `doc/kpw_label_cap_design.md`; nothing is implemented yet.
+- **Progressive cap, new default:** when `--kpw-max-labels` isn't given, the optimiser runs with caps of 64, 512, 4096 labels and then none. It stops at the first run that isn't truncated, which is the exact optimum. If the time budget runs out first, it stops and keeps the best ordering found so far, with a warning that it isn't proven optimal.
+- **Budget:** a new `--kpw-time-budget SECONDS`, default 60, covering only the ordering stage. Before each further run it predicts that run's time from the previous ones and skips it if it would exceed the budget. A run can't be interrupted once started, so this prediction is what keeps within the budget.
+- **Explicit caps:** `--kpw-max-labels L` behaves exactly as now, and `--kpw-max-labels 0` means no cap and no budget.
+- **Logging:** the log line lists each cap tried, with its time and value, and says whether the result is exact.
+- **Effect:** G_n needed 26–318 labels in the runs I checked, so the default should normally still finish exactly within one or two runs. Grids would get a near-optimal ordering in about a minute instead of 15–25 minutes or more.
+
+I added two cap measurements on the 9×9 grid. With 128 labels it took 24.4 s and with 512 labels 56.4 s, both reaching the exact optimum's value (uncapped: 86.8 s). So a smaller cap is cheaper but not proportionally so, and the result often matches the optimum even when the solver can't certify it.
+
+**n = 63 (`new_63_prune.txt`)** is correct: 121460168051419, matching `data/b071983.txt`. It took 622.9 s, against 1162 s on the 64-core Linux machine without pruning. The run summed 3.25 G states over all steps, its largest table had 176 M states (step 41), and peak memory was 10.0 GB.
+
+Steps 39–42 each wrote about 1 GB of runs to disk, so on 18 GB n = 63
+is at the edge of fitting in RAM. Most of the memory pressure is the
+fixed worker buffers: 6 workers × 2 × 32 M entries × 16 bytes ≈ 6.4
+GB. Halving `SM_WORKER_CAP` in `yaml/new-machine.yaml` to 16 M would
+free about 3.2 GB, which should avoid spilling at n = 63 and probably
+at n = 64. The cost is more, smaller sorted batches for the merge to
+combine; I don't know how much that costs at these sizes.
+
+Question
+========
+Implement the caps as described in the design note
+
+Answer
+======
+The progressive caps are in, and `grid_10_10` now runs end to end. The ordering took 13.5 s with a 20 s budget, the DP 4.2 s, and the count is 730044829512632, which equals A120443, the number of (undirected) Hamiltonian paths in the n X n grid graph, at n = 10.
+
+**What changed:**
+- **`ham_kpw.kpw_order`:** with no `max_labels`, it now uses the progressive cap. It runs with caps of 64, 512 and 4096 labels, then uncapped. It stops at the first exact result, or skips any run predicted to exceed `time_budget`, which defaults to 60 s. The first run always completes. `max_labels=0` means uncapped and always exact; `L > 0` is one run with cap L, as before. `kpw_candidates` passes the budget through.
+- **Log line:** the `kpw:` line now lists each cap with its time and value, and says why it stopped. For example, for the 10×10 grid: `caps=64:60.8s/1.304e+07 stop=budget … (truncated; not proven optimal)`.
+- **`ham_count`:** there is a new `--kpw-time-budget SECS`, and the help for `--kpw-max-labels` explains the three modes.
+- **The C file:** the per-step `[prune]` lines are now printed only with `-v` or `--instrument`, because they were cluttering normal runs.
+
+**Measured in the VM**, with defaults unless noted:
+
+| graph | runs | result |
+|---|---|---|
+| G_58 | 64 (truncated), then 512 | exact, 5.9 s (2.9 s uncapped) |
+| G_63 | 64 (truncated), then 512 | exact, 17.1 s |
+| 8×8 grid | 64 (truncated), then 512 | exact, 3.9 s (5.2 s uncapped) |
+| 9×9 grid, 15 s budget | 64 | stopped at budget, 10.6 s; same value as the true optimum (86.8 s uncapped), but not certified |
+| 10×10 grid | 64 | stopped at budget, 60.8 s, value 1.304e7 |
+
+One correction to my design note: square-sum graphs usually take **two** runs, not one. They need 26–318 labels, so the 64-label run is truncated and the 512-label run is exact. The ordering stage therefore costs about twice what an uncapped run would, up to about 9 s extra at n = 63, which is negligible next to the DP. I've corrected the note and added a results section to it.
+
+**Tests:** I added `test_progressive_equals_uncapped` (G_40, G_48 and G_56, both engines, same ordering and value as uncapped), `test_progressive_budget_stops_on_grid` and `test_explicit_cap_single_run`. All of `tests/test_kpw.py` passes: 50 passed, 7 skipped.
+
+On the VM, `ham_count` doesn't find `work_model.json` at its default
+path, so it falls back to the v7 cost. On your Mac the work model is
+found, so you'll see the work cost instead.
+
+Question
+========
+Re: your suggestion of halving `SM_WORKER_CAP`. Can this be figured out
+dynamically by the program instead of informed guessing and rerun?
+
+Answer
+======
+Yes. The program already has everything it needs to choose the buffer size at each step. Once a step's input table has been built it knows the input size, n_back, its RAM budget, and how much output the previous steps produced per input state. The worker buffers are also freed and reallocated at every step (`ham_dp_c.c` line ~3830), so the size could differ from step to step at no cost. Today `SM_WORKER_CAP` is one fixed number for the whole run, and at n = 63 it reserved 6.4 GB of buffers on an 18 GB machine.
+
+To find out what the buffer size actually costs, I ran n = 58 in the VM with two sizes, same ordering:
+
+| SM_WORKER_CAP | DP time | generate | per-worker sorts | merge | runs per step (max) | duplicates removed within a run |
+|---|---|---|---|---|---|---|
+| 32 M entries (512 MB) | 131.7 s | 94.8 s | 19.9 s | 18.1 s | 4 | up to 1.74× |
+| 1 M entries (16 MB) | 125.7 s | 85.1 s | 14.8 s | 25.9 s | 24 | up to 1.16× |
+
+These are single runs in the VM, so a few seconds either way is noise. The pattern is what matters:
+- **Smaller buffers make the sorts cheaper**, since a 16 MB buffer sits much closer to cache.
+- **Smaller buffers make the merge dearer**, with 6× as many sorted runs to combine.
+- **Smaller buffers remove fewer duplicates before writing a run.** Each run then holds more entries, so part of the memory saved on buffers comes back as larger runs.
+
+Overall, at this size, a 32-fold reduction in buffer size cost nothing in time. So the buffer size is mainly a memory decision, and it's one that can be made per step.
+
+**How the rule would work**, at the start of each step:
+1. **Predict the step's output.** Use the input size times the output-per-input ratio seen at earlier steps with the same n_back, falling back to 2^n_back.
+2. **Never make a buffer larger than one worker's share of that output.** Beyond that it only wastes memory. At n = 58 every step fit in a single 32 M buffer, so nearly all of each 512 MB buffer was unused.
+3. **Take the largest size**, up to the yaml value, whose predicted total fits the budget: input table + buffers + runs (corrected for the weaker in-run dedup at that size) + merge reserve.
+4. **If no size fits, spilling is unavoidable.** Then choose the size that minimises the predicted spill, without exceeding a maximum number of runs, so the merge doesn't degrade.
+
+`SM_WORKER_CAP` in the yaml would then become an upper limit, not a fixed value. For your n = 63 run, steps 39–42 would have chosen about 16 M and avoided the roughly 1 GB spills. That is a prediction; it can't be checked until it's implemented.
+
+One more option, which I'd leave for later: let workers shrink their buffers in the middle of a step when the RAM-resident runs approach the spill limit. That reacts to bad predictions, but it is more intricate code.
+
+Following your usual practice, I'd write this up as a design note
+first: the rule, the memory model with the dedup correction, where it
+goes in `sm_fused_sweep`, the log fields, and the tests. Shall I?
+
+Answer
+======
+Write the design note.
+
+The n=63 run with SM_WORKER_CAP halved is in `new_63_prune_capped.txt`
+
+Answer
+======
+Halving `SM_WORKER_CAP` did what the design note predicts: nothing spilled. Both runs give the correct count, 121460168051419, with the same build, ordering and settings except the buffer size.
+
+| n = 63, M3 Pro 18 GB, 6 threads | 32 M buffers | 16 M buffers |
+|---|---|---|
+| DP time | 622.9 s | 601.1 s |
+| generate | 492 s | 489 s |
+| per-worker sorts (flushes) | 82 s | 57 s |
+| merge | 51 s | 54 s |
+| most runs in one step | 18 | 36 |
+| steps that spilled to disk | 4 (≈ 1 GB each) | 0 |
+| smallest spill limit | 5.17 GB | 8.17 GB |
+| peak RSS | 10.01 GB | 9.36 GB |
+
+- **The spill disappeared.** The smallest spill limit rose by 3.0 GB, the 3.2 GB of buffers freed minus a little elsewhere. I had estimated about 8.4 GB for step 41 from the earlier log, and the actual minimum over all steps was 8.17 GB, so the memory model holds up. Steps 39–42 needed at most about 6.4 GB of runs, so they now fit with room to spare.
+- **Time improved by only 22 s (3.5%), about the size of run-to-run noise.** The gain is all in the sorts: no spill writes, and smaller buffers that sit closer to cache. The merge got 3 s slower with twice as many runs. Generating states, about 80% of the time, is unchanged.
+- **Peak RSS fell by 0.65 GB**, not the full 3.2 GB freed from the buffers. The peak is now probably set by the merge phase (input table plus runs plus output) rather than by generation.
+
+So on this machine n = 63 was only just over the memory edge, and 16 M is clearly the better fixed setting. That is exactly what the per-step rule would have chosen for the steps that matter. This run supports the design rather than replacing it. A fixed 16 M will spill again at some larger n, while the automatic rule keeps buffers as large as memory allows when there's room and shrinks them when there isn't.
+
+For now, keep `SM_WORKER_CAP: 16777216` in `yaml/new-machine.yaml` for
+n = 64 and beyond. Shall I implement the automatic version as
+described in the note?
+
+Question
+========
+Implement the automatic version
+
+The parameters in `work_model.json` are determined by analyzing a few
+runs.  Is it possible to come up with an informative model, and use
+that to determined parameters. I'm concerned that the paucity or bias
+of the run data might cause the choice of parameters to be bad.
+
+
+Answer
+======
+The automatic buffer size is implemented and tested, and its design note is updated (`doc/worker_cap_design.md`). I've also looked into your work-model question: the data behind the model is thinner than it looks, and our own experiments show it costing up to 18%.
+
+**What's implemented**
+- **One change from the design:** each step's output is predicted by **sampling**, not from history. Before the workers start, the step's transitions, eliminations and pruning are run on up to 65,536 evenly spaced input states, and the count is scaled up to the full input. History had no data at the first step with a new n_back, exactly where the 2^n_back fallback is too high. Sampling costs a few milliseconds per step. At n = 57 it predicted the output exactly to the precision logged (`pred=4M actual=4M`).
+- **The rule:** the buffer size C is the largest power of two between `SM_WORKER_CAP_MIN` (default 1 M entries) and `SM_WORKER_CAP` (now the maximum) that fits the budget, starting from one worker's share plus 25%. If nothing fits, C is the minimum.
+- **Options:**
+  - `ham_count --worker-cap {auto,fixed}`, default `auto`;
+  - yaml keys `SM_WORKER_CAP_MIN` and `SM_MAX_RUNS`, printed in the header.
+- **Logging:**
+  - `--instrument` prints a `cap:` line per step;
+  - the `-v` step tag now shows what actually happened, `[sm]`, `[sm+spill k/K]` or `[ext]`, replacing the stale `[ext]`.
+- **Checks:**
+  - counts for n = 30–50 are identical under `auto` and `fixed`;
+  - the new `tests/test_worker_cap.py` checks that the per-step checksums are identical across five settings of cap and policy;
+  - with a forced 300 MB budget, `fixed` spills and `auto` doesn't;
+  - n = 57 with a 600 MB budget: `fixed` spilled at every step, `auto` at none, same count.
+  - The merge, CRT and build-cache tests pass, as do two of the correctness tests. The remaining correctness tests ran too long for the VM's time limit, so I didn't run them after this change.
+- **A caveat on my earlier measurement:** the VM has only 3 GB of RAM, so its merge budget is zero and every run in my 32 M vs 1 M comparison spilled to disk. That comparison still shows the sort/merge trade-off, but it isn't a measurement of the in-RAM case. I've added this caveat to the note.
+- **Still to measure:** `auto` vs `fixed` timings on your M3 Pro at n = 61–63.
+
+**Your question about `work_model.json`.** Your concern is justified, and more specifically than you may think:
+- **All 9 fitting logs are n = 60.** They contribute 407 steps, but they are 9 orderings of one graph.
+- **The out-of-sample check means nothing.** `r2_leave_one_n_out` equals the in-sample R² (0.894) because there is only one n to leave out.
+- **The data is biased.** The logs are unpruned runs, from orderings chosen by earlier SA/MaxSAT experiments, not representative samples of the pathwidth-optimal orderings it now ranks.
+- **It costs us.** In experiment 2, the work-optimal ordering was the best pruned ordering only at n = 56. At n = 50, 52 and 54 other pathwidth-optimal orderings beat it by 4%, 9% and 18% in total pruned states.
+
+**What would improve it**, in increasing order of ambition:
+1. **Better data and an honest check.** The experiment-2 code already produces per-step state counts for uniform samples of pathwidth-optimal orderings, cheaply, pruned and unpruned. Refit across many n, say 44–58, validate by leaving out a whole n, and score by what actually matters: how well the model ranks orderings, not R² per step.
+2. **A model built from the DP's mechanics.** Replace the 11-term free regression with a few factors that have a meaning:
+   - expansion of 2^n_back, times the fraction of back-edge subsets that are valid;
+   - collapse from eliminations;
+   - survival under pruning, which the dangling-chain lemma and the independence predictor already describe.
+
+   Their parameters would be estimated with shrinkage towards the values the mechanics imply, so sparse or biased data can't push them far.
+3. **Measuring instead of predicting.** The sampler I just wrote estimates a step's output from its actual input. Combined with a partial DP over the first k steps (`--kpw-candidates` already ranks candidates by a partial DP), it could rank a handful of candidate orderings directly, with no fitted model.
+
+I'd start with option 1, since it tells us how good or bad the current
+model is before anything gets redesigned. Shall I write it up as a
+design note?
+
+Question
+========
+Write a design note
+
+Answer
+======
+I've written the design note: `doc/work_model_redesign.md`. It sets out three phases, with a decision point after the first.
+
+**Phase 1: better data and an honest check (do first).**
+- **Data:** for n = 44–56, take about 20 orderings per n: the work, v7 and v2 optima, the 3 best under v2, and 16 uniform samples from the pathwidth-optimal DAG. Run the C DP on each with and without pruning, and record the per-step state counts. The n = 50–56 data from experiment 2 already covers part of this.
+- **Target:** the quantity kpw actually minimises, Σ_t s_t·2^{n_back}, measured on pruned runs.
+- **Validation:** leave one n out. The metrics are rank correlation between predicted and actual cost over the orderings, regret of the model's pick against the best sampled ordering, and regret of its exact optimum over the whole DAG, which is what matters in production. Per-step RMSE is reported but not used to decide.
+- **Baselines:** the current model, a refit of the same model on the new data, v7, v2, and the frontier sum.
+- **Decision rule:** adopt the refit model only if its median regret improves and no held-out n is more than 5% worse.
+- **Code fix:** `work_model.py` will report a leave-one-n-out score only when the fit covers at least two values of n.
+
+**Phase 2: a model built from the DP's mechanics, only if Phase 1 leaves real regret (above about 5%).** Per-step growth is split into three factors:
+- **Expansion:** how many back-edge subsets are valid, from a simple model of how many frontier vertices are interior or chain ends.
+- **Deduplication:** a log-Bell bound with a coefficient whose prior is centred at 1.
+- **Pruning survival:** from the independence predictor and the dangling-chain lemma.
+
+The few parameters are fitted with Bayesian shrinkage towards their mechanistic values, so sparse or biased data can't pull them far. This is labelled as research.
+
+**Phase 3: ranking by measurement.** Use the Phase 1 data to check whether a partial DP over the first k steps (what `--kpw-candidates` already does) ranks orderings in the same order as their full totals. If it does, ranking a short list of candidates directly avoids having a model at all.
+
+**Limits stated in the note:** validation only goes up to n =
+56–60. The "best" ordering is the best of about 20 samples, not the
+true optimum, so the true regret could be larger. The targets are
+state counts, so the VM's 3 GB of RAM doesn't affect them.
+
+Question
+========
+Re: 2^{n_back}: I understand that n_back is the relevant set size, but
+is there an argument for c^{n_back} for c different from 2?
+
+Answer
+======
+Not 2 exactly. The real per-step cost isn't of the form c^{n_back} at all: 2^{n_back} counts work the code does but doesn't need to do.
+
+First, a correction to the premise. In our DP, n_back is the number of **back-edges of the vertex being introduced**, its edges to vertices already on the frontier. It isn't the size of a Kobayashi relevant set, which is a different notion. The sweep loops over all 2^{n_back} subsets of those edges for every input state, which is where the 2^{n_back} in W = Σ s_t·2^{nb_t} comes from.
+
+**A valid subset has at most 2 edges.** This follows from the transition rules. The new vertex v enters with no edges. After one chosen edge it is a chain end, and after two it is interior. A third edge at v is always rejected, because `apply_edge` refuses an interior endpoint. So each input state produces at most
+
+  1 + n_back + C(n_back, 2)
+
+outputs: 2, 4, 7 and 11 for n_back = 1–4. That grows quadratically, not exponentially. The other 2^{n_back} − (that number) subsets are enumerated and then rejected.
+
+**What the n = 61 logs show** (steps with at least 20 M input states, averaged by n_back):
+
+| n_back | steps | compute ms per M inputs, pruned | written per input, pruned | written per input, unpruned | 2^{nb} | 1 + nb + C(nb,2) |
+|---|---|---|---|---|---|---|
+| 1 | 2 | 42 | 1.67 | 1.85 | 2 | 2 |
+| 2 | 11 | 111 | 1.69 | 2.24 | 4 | 4 |
+| 3 | 5 | 220 | 2.03 | 3.10 | 8 | 7 |
+| 4 | 1 | 359 | 0.42 | 0.66 | 16 | 11 |
+
+- **Generation cost does grow by about 2 per back-edge** (the per-step ratios are 2.6, 2.0 and 1.6). The code really does walk through all 2^{n_back} subsets, so c ≈ 2 is a fair description of the current generation time. The nb = 4 row rests on a single step.
+- **The number of outputs barely depends on n_back** (about 1.7–2 per input, lower at nb = 4 where many vertices are eliminated). That number is what drives the sorting, the merging and the memory, and the model already captures it through s_{t+1}.
+
+So the honest per-step cost has two parts: an enumeration term in 2^{n_back}, which is cheap per subset because invalid ones are rejected early, and a much more expensive term per output. One exponent c can't fit both, and the fitted c would differ between pruned and unpruned runs.
+
+**Two consequences:**
+1. **A code change.** The sweep could enumerate only the subsets of size ≤ 2. Generation would then cost in proportion to 1 + nb + C(nb, 2) instead of 2^{nb}. For G_n, where n_back ≤ 4, the saving is modest: at most 16 against 11 attempts, and fewer edge applications per attempt. For graphs with more back-edges, such as knight graphs or other orderings, it would be large: at n_back = 8 it is 37 against 256. The results can't change, since the skipped subsets are exactly the ones always rejected.
+2. **A better cost model needs no fixed c.** The exact DAG optimiser accepts any nonnegative per-step multiplier e_t of the carried state count, the e of the (a, e, k) form. So the cost can be e_t = α·(subsets enumerated at step t) + β·(expected outputs per input). α and β, or even a small table indexed by n_back, can be fitted to the measured per-step generation, sort and merge times, which the instrumented logs already record. Fitting e_t this way belongs in Phase 1 of the work-model note as an extra target, next to state counts.
+
+Shall I add both to the design notes (the enumeration change as its
+own short note, the cost form to the work-model note), or go straight
+to implementing the enumeration change, since it's small and can't
+change any result?
+

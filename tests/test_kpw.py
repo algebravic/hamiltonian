@@ -200,3 +200,46 @@ def test_dsl_engine_equals_kopt(n, cost, cache):
     assert rd.value == pytest.approx(rk.value, rel=1e-12)
     if n <= 40:
         assert count_hamiltonian_paths_c(n, rd.order, adj) == KNOWN[n]
+
+
+# ---- progressive label cap (doc/kpw_label_cap_design.md) ----
+def _grid(k):
+    import networkx as nx
+    G = nx.grid_2d_graph(k, k)
+    lab = {v: i + 1 for i, v in enumerate(sorted(G))}
+    return {lab[v]: {lab[w] for w in G[v]} for v in G}
+
+
+@pytest.mark.parametrize("n", [40, 48, 56])
+@pytest.mark.parametrize("engine", ["dsl", "kopt"])
+def test_progressive_equals_uncapped(n, engine, cache):
+    adj = build_graph(n)
+    kw = dict(cost="v7", engine=engine) if engine == "dsl" else dict(cost="v7", dag=_dag(n, cache))
+    rp = ham_kpw.kpw_order(adj, **kw)                     # default: progressive
+    ru = ham_kpw.kpw_order(adj, max_labels=0, **kw)       # no cap
+    assert rp.exact and ru.exact and rp.stop == "exact"
+    assert rp.order == ru.order and rp.value == pytest.approx(ru.value, rel=1e-12)
+    assert rp.rounds and rp.rounds[-1][3]
+
+
+_WM = next((p for p in (DEFAULT_PATH, os.path.join(REPO, "work_model.json"))
+            if os.path.isfile(p)), None)
+
+
+@pytest.mark.skipif(_WM is None, reason="needs a work_model.json")
+def test_progressive_budget_stops_on_grid():
+    # 8x8 grid, work cost: 487 labels, so the 64-label run is truncated
+    adj = _grid(8)
+    r = ham_kpw.kpw_order(adj, cost="work", work_model=_WM, engine="dsl", time_budget=0.0)
+    assert len(r.rounds) == 1 and r.rounds[0][0] == 64          # first run always happens
+    assert r.stop == "budget" and not r.exact
+    assert "not proven optimal" in r.summary()
+    assert max(frontier_width(adj, r.order)) == r.pw
+    rx = ham_kpw.kpw_order(adj, cost="work", work_model=_WM, engine="dsl")  # default budget: exact
+    assert rx.exact and rx.stop == "exact" and rx.value <= r.value * (1 + 1e-12)
+
+
+def test_explicit_cap_single_run():
+    adj = _grid(7)
+    r = ham_kpw.kpw_order(adj, cost="v7", engine="dsl", max_labels=8)
+    assert not r.rounds and r.max_labels <= 8

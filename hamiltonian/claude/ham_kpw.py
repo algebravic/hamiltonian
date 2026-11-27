@@ -195,6 +195,8 @@ class KpwResult:
     dag: DagInfo
     optimiser: str = "C"
     extra: dict = field(default_factory=dict)
+    rounds: list = field(default_factory=list)   # progressive cap: (cap, seconds, value, exact)
+    stop: str = ""                               # "exact" or "budget" (progressive cap only)
 
     def summary(self) -> str:
         d = self.dag
@@ -203,9 +205,14 @@ class KpwResult:
         load = f" load={d.load_s:.1f}s" if d.load_s else ""
         if d.builder == "dsl":
             src = f"dsl search {d.build_s:.1f}s"
+        caps = ""
+        if self.rounds:
+            caps = " caps=" + ",".join(f"{'none' if c is None else c}:{t:.1f}s/{v:.4g}"
+                                       for c, t, v, _ in self.rounds) + f" stop={self.stop}"
         return (f"kpw: pw={self.pw} dag_nodes={d.nodes}{orderings} dag={src}{load} "
-                f"opt({self.cost},{self.optimiser})={self.opt_s:.1f}s "
-                f"labels={self.max_labels}{'' if self.exact else ' (truncated)'} "
+                f"opt({self.cost},{self.optimiser})={self.opt_s:.1f}s{caps} "
+                f"labels={self.max_labels}"
+                f"{'' if self.exact else ' (truncated; not proven optimal)'} "
                 f"value={self.value:.4g}")
 
 
@@ -249,12 +256,70 @@ def _dsl_order(adj: dict, cost: str, work_model: str | None, expand_base: float,
                      opt_s, info, f"DSL-{s.mode}", extra)
 
 
+PROGRESSIVE_CAPS = (64, 512, 4096)
+DEFAULT_TIME_BUDGET = 60.0
+
+
+def _progressive(solve_once, budget: float, caps=PROGRESSIVE_CAPS) -> KpwResult:
+    """Run solve_once(cap) for cap in caps and then None (no cap), stopping at the
+    first result that is not truncated (the exact optimum) or when the next run is
+    predicted to exceed the time budget.  The first run always happens.  Every
+    result is a pathwidth-optimal ordering; the best value is kept
+    (doc/kpw_label_cap_design.md)."""
+    rounds, best, used, stop = [], None, 0.0, "budget"
+    for cap in list(caps) + [None]:
+        if rounds:
+            last = rounds[-1][1]
+            growth = (last / max(rounds[-2][1], 1e-3)) if len(rounds) >= 2 else 3.0
+            if used + last * max(growth, 1.0) > budget:
+                break
+        t0 = time.time()
+        r = solve_once(cap)
+        dt = time.time() - t0
+        used += dt
+        rounds.append((cap, dt, r.value, r.exact))
+        if best is None or r.value < best.value or r.exact:
+            best = r
+        if r.exact:
+            stop = "exact"
+            break
+    best.rounds, best.stop, best.opt_s = rounds, stop, used
+    return best
+
+
 def kpw_order(adj: dict, *, cost: str = "work", work_model: str | None = None,
               expand_base: float = 1.55, density_alpha: float = 0.25,
               max_labels: int | None = None, dag: DagHandle | None = None,
               python: bool = False, kopt_bin: str | None = None, engine: str = "kopt",
-              **dag_kw) -> KpwResult:
-    """Exact optimum of ``cost`` over the pathwidth-optimal DAG.
+              time_budget: float = DEFAULT_TIME_BUDGET, **dag_kw) -> KpwResult:
+    """Optimum of ``cost`` over the pathwidth-optimal DAG.
+
+    max_labels: None (default) = progressive cap: caps PROGRESSIVE_CAPS then no cap,
+    stopping at the first exact result or when ``time_budget`` seconds (secondary
+    optimisation only) would be exceeded; then the best ordering found is returned,
+    marked not exact.  0 = no cap, always exact.  L > 0 = a single run with cap L.
+"""
+    if max_labels is None:
+        if engine == "kopt" and dag is None:
+            dag = load_dag(adj, **dag_kw)                   # build/load the DAG once
+        return _progressive(
+            lambda cap: _kpw_order_once(adj, cost=cost, work_model=work_model,
+                                        expand_base=expand_base, density_alpha=density_alpha,
+                                        max_labels=cap, dag=dag, python=python,
+                                        kopt_bin=kopt_bin, engine=engine, **dag_kw),
+            time_budget)
+    return _kpw_order_once(adj, cost=cost, work_model=work_model, expand_base=expand_base,
+                           density_alpha=density_alpha, max_labels=(max_labels or None),
+                           dag=dag, python=python, kopt_bin=kopt_bin, engine=engine, **dag_kw)
+
+
+def _kpw_order_once(adj: dict, *, cost: str = "work", work_model: str | None = None,
+                    expand_base: float = 1.55, density_alpha: float = 0.25,
+                    max_labels: int | None = None, dag: DagHandle | None = None,
+                    python: bool = False, kopt_bin: str | None = None, engine: str = "kopt",
+                    **dag_kw) -> KpwResult:
+    """One optimisation of ``cost`` over the pathwidth-optimal DAG, with at most
+    ``max_labels`` Pareto labels per node (None: no cap, exact).
 
     engine="kopt" (default): the DAG from kpw/kpw2 (cached), optimised by the C program
     kopt, or in Python if ``python`` is set or kopt cannot be built.
@@ -308,7 +373,8 @@ def kpw_candidates(adj: dict, *, k: int = 5, samples: int = 0, seed: int = 0,
                    work_model: str | None = None, expand_base: float = 1.55,
                    density_alpha: float = 0.25, max_labels: int | None = None,
                    dag: DagHandle | None = None, python: bool = False,
-                   kopt_bin: str | None = None, **dag_kw) -> tuple[int, list[tuple[str, list]]]:
+                   kopt_bin: str | None = None, time_budget: float = DEFAULT_TIME_BUDGET,
+                   **dag_kw) -> tuple[int, list[tuple[str, list]]]:
     """Distinct candidate orderings: the optimum under each cost in ``costs``,
     the k best under V2 (exact; Python), and ``samples`` uniform DAG samples."""
     h = dag if dag is not None else load_dag(adj, **dag_kw)
@@ -327,6 +393,7 @@ def kpw_candidates(adj: dict, *, k: int = 5, samples: int = 0, seed: int = 0,
             continue
         r = kpw_order(adj, cost=c, work_model=work_model, expand_base=expand_base,
                       density_alpha=density_alpha, max_labels=max_labels, dag=h,
+                      time_budget=time_budget,
                       python=python, kopt_bin=kopt_bin)
         add(f"opt-{c}", r.order)
     if k > 1:

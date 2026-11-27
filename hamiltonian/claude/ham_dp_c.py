@@ -529,6 +529,9 @@ def clear_cache() -> int:
     return n
 
 
+_CAP_MIN, _MAX_RUNS = 1 << 20, 1024      # set from machine.yaml by _get_lib
+
+
 def _get_lib():
     global _FORCE_REBUILD
     # Detect cache sizes once; derive -D flags; fold both into the cache key
@@ -620,6 +623,7 @@ def _get_lib():
         void sm_set_word_bits(int b);
         void sm_set_spill_dir(const char *dir);
         void sm_set_prune_mode(int m);
+        void sm_set_cap_policy(int automatic, uint64_t cap_min, uint64_t max_runs);
         void sm_set_crt(const uint64_t *moduli, int k, uint64_t snap_bytes);
         int  sm_crt_replay_from(void);
         uint64_t sm_crt_residue(int i, int which);
@@ -682,8 +686,11 @@ def _get_lib():
         _rv("SM_STEAL_FACTOR",     32),
         _rv("RSORT_THRESH",        1 << 19),
     )
+    global _CAP_MIN, _MAX_RUNS
+    _CAP_MIN, _MAX_RUNS = _rv("SM_WORKER_CAP_MIN", 1 << 20), _rv("SM_MAX_RUNS", 1024)
     print(f"# ham_dp_c: SM_NTHREADS={_rv('SM_NTHREADS', _nthreads_def)} "
           f"SM_WORKER_CAP={_rv('SM_WORKER_CAP', _wcap_def)} "
+          f"SM_WORKER_CAP_MIN={_CAP_MIN} SM_MAX_RUNS={_MAX_RUNS} "
           f"SM_RBUF_SIZE={_rv('SM_RBUF_SIZE', _rbuf_def)} "
           f"SM_BB_BUF={_rv('SM_BB_BUF', _bb_def)} "
           f"SM_PAR_MERGE_THRESH={_rv('SM_PAR_MERGE_THRESH', 50_000_000)}", flush=True)
@@ -968,6 +975,7 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                                 crt_snap_bytes: int | None = None,
                                 spill_dir: str | None = None,
                                 prune: str = "drop",
+                                worker_cap: str = "auto",
                                 _word_bits: int = 64,
                                 **kwargs):
     """Count undirected Hamiltonian paths in G_n via the sort-merge frontier DP.
@@ -1008,6 +1016,11 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
                      "report" keeps them and prints how many are dead per
                      step (diagnostic, slower than "none"); "none" is off.
                      The count is the same in every mode.
+    worker_cap     : "auto" (default) chooses the worker buffer size per step
+                     from a sampled estimate of the step's output and the RAM
+                     budget, between SM_WORKER_CAP_MIN and SM_WORKER_CAP
+                     (doc/worker_cap_design.md); "fixed" always uses
+                     SM_WORKER_CAP.  The count is the same either way.
     _word_bits     : test hook only: emulate 2^b-bit counts (b < 64) so that
                      wraps and the CRT path can be exercised at small n.
     """
@@ -1073,8 +1086,14 @@ def count_hamiltonian_paths_sm(n: int, order: list, adj: dict,
         if prune != "none":
             print(f"# prune={prune} ignored: the {_C_VARIANT} variant has no pruning",
                   file=sys.stderr)
+    if worker_cap not in ("auto", "fixed"):
+        raise ValueError(f"worker_cap must be 'auto' or 'fixed', not {worker_cap!r}")
+    try:
+        lib.sm_set_cap_policy(int(worker_cap == "auto"), _CAP_MIN, _MAX_RUNS)
+    except AttributeError:               # legacy15 variant: fixed buffers only
+        pass
     if verbose or instrument:
-        print(f"# sort-merge: prune={prune}", file=sys.stderr)
+        print(f"# sort-merge: prune={prune} worker_cap={worker_cap}", file=sys.stderr)
 
     def _run(modulus=0, crt=()):
         lib.sm_set_modulus(modulus)

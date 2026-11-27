@@ -286,8 +286,17 @@ def parse_args():
     p.add_argument("--kpw-greedy2", action="store_true",
                    help="(kpw) Second greedy rule: smaller DAG, usually worse orderings.")
     p.add_argument("--kpw-max-labels", type=int, default=None, metavar="L",
-                   help="(kpw) Keep at most L Pareto labels per DAG node (bounds the "
-                        "optimiser's memory; the result may then be suboptimal).")
+                   help="(kpw) Pareto labels kept per DAG node by the secondary-cost "
+                        "optimiser.  Default: progressive cap (64, 512, 4096, then none), "
+                        "stopping at the first exact optimum or when --kpw-time-budget "
+                        "would be exceeded (then the best ordering found, marked not proven "
+                        "optimal).  L > 0: one run with cap L (may be suboptimal).  "
+                        "0: no cap, always exact (may take very long, e.g. on grids).")
+    p.add_argument("--kpw-time-budget", type=float, default=60.0, metavar="SECS",
+                   help="(kpw) Time budget for the secondary-cost optimisation under the "
+                        "progressive cap (default 60).  The first run always completes; "
+                        "a further run is skipped if it is predicted to exceed the budget. "
+                        "See doc/kpw_label_cap_design.md.")
     p.add_argument("--kpw-engine", choices=["kopt", "dsl"], default="dsl",
                    help="(kpw) dsl: kobayashi-pw's DSL (engine E2), one process, no DAG "
                         "file (default); kopt: DAG from kpw/kpw2 (cached) optimised by "
@@ -382,6 +391,11 @@ def parse_args():
                         "can no longer become a Hamiltonian path; report keeps them and "
                         "prints the number of dead states per step (diagnostic, slower "
                         "than none); none turns it off.  The count is the same.")
+    p.add_argument("--worker-cap", choices=["auto", "fixed"], default="auto",
+                   help="(sort-merge only) Worker buffer size: auto (default) chooses it per "
+                        "step from a sampled estimate of the step's output and the RAM "
+                        "budget, between SM_WORKER_CAP_MIN and SM_WORKER_CAP of the machine "
+                        "yaml; fixed always uses SM_WORKER_CAP (doc/worker_cap_design.md).")
     p.add_argument("--cycles", action="store_true",
                    help="Also count Hamiltonian cycles and report alongside paths.")
     p.add_argument("--instrument", action="store_true",
@@ -512,13 +526,15 @@ def _kpw_ordering(label, n_vertices, adj, args, eb, da):
             print("  WARNING: --kpw-greedy2/--kpw-python apply to --kpw-engine kopt only", flush=True)
         res = ham_kpw.kpw_order(adj, cost=args.kpw_cost, work_model=args.work_model,
                                 expand_base=eb, density_alpha=da,
-                                max_labels=args.kpw_max_labels, engine="dsl")
+                                max_labels=args.kpw_max_labels, engine="dsl",
+                                time_budget=args.kpw_time_budget)
     else:
         dag = get_dag()
         res = ham_kpw.kpw_order(adj, cost=args.kpw_cost, work_model=args.work_model,
                                 expand_base=eb, density_alpha=da,
                                 max_labels=args.kpw_max_labels, dag=dag,
-                                python=args.kpw_python, kopt_bin=args.kopt_bin)
+                                python=args.kpw_python, kopt_bin=args.kopt_bin,
+                                time_budget=args.kpw_time_budget)
     if "fallback" in res.extra:
         print(f"  WARNING: {res.extra['fallback']}", flush=True)
     print(f"  {res.summary()}", flush=True)
@@ -529,6 +545,7 @@ def _kpw_ordering(label, n_vertices, adj, args, eb, da):
         _, cands = ham_kpw.kpw_candidates(
             adj, k=args.kpw_candidates, work_model=args.work_model,
             expand_base=eb, density_alpha=da, max_labels=args.kpw_max_labels, dag=dag,
+            time_budget=args.kpw_time_budget,
             python=args.kpw_python, kopt_bin=args.kopt_bin)
         k = args.multi_start_validate or n_vertices // 2
         tags = {tuple(o): t for t, o in cands}
@@ -666,6 +683,7 @@ def _run_one(label, n_vertices, G, adj, args, use_pw):
             on_overflow=getattr(args, 'on_overflow', 'crt'),
             spill_dir=getattr(args, 'spill_dir', None),
             prune=getattr(args, 'prune', 'drop'),
+            worker_cap=getattr(args, 'worker_cap', 'auto'),
             crt_snap_bytes=(None if getattr(args, 'crt_snap_gb', None) is None
                             else int(args.crt_snap_gb * (1 << 30))),
         )

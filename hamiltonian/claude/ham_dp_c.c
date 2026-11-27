@@ -1852,9 +1852,10 @@ static void *sm_aligned_calloc(size_t n, size_t size) {
 
 typedef struct SM_CACHE_ALIGN {
     /* worker scratch (reused across runs) */
-    SMEntry *buf;   /* output accumulation buffer, sm_cfg.worker_cap entries */
-    SMEntry *tmp;   /* radix sort scratch,         sm_cfg.worker_cap entries */
+    SMEntry *buf;   /* output accumulation buffer, cap entries               */
+    SMEntry *tmp;   /* radix sort scratch,         cap entries               */
     size_t   buf_len;
+    size_t   cap;   /* buffer size of this step (doc/worker_cap_design.md)   */
     /* completed sorted+deduped runs */
     int      ext_runs;
     SMRun   *runs;
@@ -2582,7 +2583,7 @@ static void *sm_worker_runs(void *arg) {
             }
             ws->buf[ws->buf_len++] = (SMEntry){ nk, cnt };
             raw_out++;
-            if (ws->buf_len == sm_cfg.worker_cap) {
+            if (ws->buf_len == ws->cap) {
                 double tf0 = now_ms();
                 sm_flush_run(ws);
                 t_flush_acc += now_ms() - tf0;
@@ -3771,6 +3772,94 @@ static double sm_hwm_gb(int *is_lifetime) {
 #endif
 }
 
+/* ======================================================================
+   Per-step worker buffer size (doc/worker_cap_design.md).
+   The buffers (2P x C entries) compete with the runs for RAM.  Before the
+   workers start, the step's written output R is estimated by running the
+   transitions on an evenly spaced sample of the input (the table is in
+   hash order, so this is in effect a random sample), and C is the largest
+   power of two in [lo, sm_cfg.worker_cap] -- starting from one worker's
+   share of R -- for which input + buffers + R x 16 B (no in-run dedup) +
+   merge reserve fits the budget; if none fits, spilling is unavoidable
+   and C = lo.  C affects time and memory only, never the result.
+   ====================================================================== */
+static int    sm_cap_auto  = 1;
+static size_t sm_cap_min   = (size_t)1 << 20;
+static size_t sm_max_runs  = 1024;
+static int    sm_last_ext = 0, sm_last_runs = 0, sm_last_spilled = 0;
+
+void sm_set_cap_policy(int automatic, uint64_t cap_min, uint64_t max_runs) {
+    sm_cap_auto = automatic ? 1 : 0;
+    sm_cap_min  = cap_min  ? (size_t)cap_min  : ((size_t)1 << 20);
+    sm_max_runs = max_runs ? (size_t)max_runs : 1024;
+}
+
+#define SM_CAP_SAMPLE 65536
+/* Written outputs of an evenly spaced sample of the input (same transitions,
+   eliminations and pruning as sm_worker_runs; cycles are not counted).    */
+static size_t sm_sample_outputs(const SMEntry *in, size_t ni, int fs, int v_idx,
+                                const int *widxs, int n_back,
+                                const int *elim_desc, int n_elim,
+                                int step, int n, size_t *n_sampled) {
+    size_t S = ni < SM_CAP_SAMPLE ? ni : SM_CAP_SAMPLE;
+    *n_sampled = S;
+    if (!S) return 0;
+    size_t out = 0;
+    u128 dummy = 0;
+    int last = (step == n - 1);
+    for (size_t j = 0; j < S; j++) {
+        u64 base = in[(size_t)((double)j * (double)ni / (double)S)].key;
+        for (int Sb = 0; Sb < (1 << n_back); Sb++) {
+            u64 nk = base; int valid = 1;
+            for (int b = 0; b < n_back && valid; b++) {
+                if (!(Sb & (1 << b))) continue;
+                u64 nk2 = apply_edge(nk, fs, v_idx, widxs[b], last);
+                if (!nk2) { valid = 0; break; }
+                nk = nk2;
+            }
+            if (!valid) continue;
+            if (nk == KEY_CLOSED || n_elim > 0) {
+                nk = apply_elim_seq(nk, fs, elim_desc, n_elim, step, n, 0, &dummy);
+                if (!nk) continue;
+            }
+            if (sm_prune_mode == 2 && sm_prune.active && sm_prune_classify(nk)) continue;
+            out++;
+        }
+    }
+    return out;
+}
+
+typedef struct { size_t C, need, lo, pred, sampled; int fits; } SMCapChoice;
+
+static SMCapChoice sm_choose_cap(size_t pred, int P, size_t F, size_t Mres, size_t B) {
+    SMCapChoice r = {0};
+    size_t cmax = sm_cfg.worker_cap ? sm_cfg.worker_cap : 1;
+    r.pred = pred;
+    if (!sm_cap_auto) { r.C = cmax; r.fits = -1; return r; }
+    size_t Pz = (size_t)(P > 0 ? P : 1);
+    r.need = (pred + pred / 4 + Pz - 1) / Pz;                 /* 25% margin */
+    if (r.need < 1) r.need = 1;
+    size_t lo = sm_cap_min;
+    size_t lr = (pred + sm_max_runs - 1) / sm_max_runs;
+    if (lr > lo) lo = lr;
+    if (lo > cmax) lo = cmax;
+    r.lo = lo;
+    size_t c = 1;
+    while (c < r.need && c < cmax) c <<= 1;
+    if (c > cmax) c = cmax;
+    if (c < lo) c = lo;
+    size_t runs_b = pred * sizeof(SMEntry);
+    for (;;) {
+        size_t need_b = F + Pz * 2 * c * sizeof(SMEntry) + runs_b + Mres;
+        if (need_b <= B) { r.C = c; r.fits = 1; return r; }
+        if (c <= lo) break;
+        c >>= 1;
+        if (c < lo) c = lo;
+    }
+    r.C = lo; r.fits = 0;
+    return r;
+}
+
 static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
                             int fs, int v_idx,
                             const int *widxs, int n_back,
@@ -3790,14 +3879,28 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     const char *layout = getenv("HAM_SM_LAYOUT");
     int ext_runs = (layout && !strcmp(layout, "ext"))
                    ? sm_should_use_ext(ni, n_back, ram_bytes) : 0;
+    SMCapChoice capc = {0};
     {
         size_t pg = sm_page_bytes();
         size_t B  = sm_merge_budget(ram_bytes);
         size_t Tm = (size_t)(P > 0 ? P : 1);
-        size_t F  = curr->cap * sizeof(SMEntry)
-                  + (size_t)P * 2 * sm_cfg.worker_cap * sizeof(SMEntry);
         size_t Mres = Tm * (4 * (size_t)P) * (((size_t)64 << 10) + 2 * pg)
                     + Tm * ((size_t)32 << 20);
+        if (ext_runs) {
+            capc.C = sm_cfg.worker_cap; capc.fits = -1;
+        } else {
+            size_t samp_out = sm_sample_outputs(curr->data, ni, fs, v_idx, widxs, n_back,
+                                                elim_idxs_desc, n_elim, step, n,
+                                                &capc.sampled);
+            size_t pred = capc.sampled
+                        ? (size_t)((double)samp_out * (double)ni / (double)capc.sampled + 0.5)
+                        : 0;
+            size_t samp = capc.sampled;
+            capc = sm_choose_cap(pred, P, curr->cap * sizeof(SMEntry), Mres, B);
+            capc.sampled = samp;
+        }
+        size_t F  = curr->cap * sizeof(SMEntry)
+                  + (size_t)P * 2 * capc.C * sizeof(SMEntry);
         sm_resident_runs = 0;
         sm_spill_limit = (!ext_runs && B > F + Mres) ? B - F - Mres
                        : (ext_runs ? (size_t)-1 : 0);
@@ -3827,8 +3930,9 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
     for (int i = 0; i < P; i++) {
         size_t lo = (size_t)i * chunk;
         size_t hi = lo + chunk < ni ? lo + chunk : ni;
-        WS[i].buf      = (SMEntry*)sm_alloc(sm_cfg.worker_cap * sizeof(SMEntry));
-        WS[i].tmp      = (SMEntry*)sm_alloc(sm_cfg.worker_cap * sizeof(SMEntry));
+        WS[i].cap      = capc.C;
+        WS[i].buf      = (SMEntry*)sm_alloc(capc.C * sizeof(SMEntry));
+        WS[i].tmp      = (SMEntry*)sm_alloc(capc.C * sizeof(SMEntry));
         WS[i].buf_len    = 0;
         WS[i].ext_runs   = ext_runs;
         WS[i].n_runs     = 0;
@@ -4061,6 +4165,16 @@ static void sm_fused_sweep(SMTab *curr, SMTab *nxt,
             }
         }
     }  /* end RAM path */
+
+    sm_last_ext = ext_runs; sm_last_runs = total_runs; sm_last_spilled = spilled_runs;
+    if (instrument) {
+        fprintf(stderr,
+            "  [inst]   cap: C=%zuK (need=%zuK max=%zuK lo=%zuK) pred=%zuM actual=%zuM "
+            "sample=%zu fits=%s\n",
+            capc.C >> 10, capc.need >> 10, sm_cfg.worker_cap >> 10, capc.lo >> 10,
+            capc.pred / 1000000, raw_out_total / 1000000, capc.sampled,
+            capc.fits < 0 ? "fixed" : capc.fits ? "yes" : "no(spill)");
+    }
 
     if (instrument) {
         /* Print sm_merge_bb buffer parameters for reference. */
@@ -4383,7 +4497,7 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
                         " live=%.1f%%\n", tag, step, R->curr->cnt, nd, nc,
                         R->curr->cnt ? 100.0 * (double)(R->curr->cnt - nd - nc)
                                        / (double)R->curr->cnt : 100.0);
-            } else if (sm_prune_mode == 2) {
+            } else if (sm_prune_mode == 2 && (verbose || instrument)) {
                 fprintf(stderr, "%s  [prune] step=%d states=%zu dropped_raw=%zu\n",
                         tag, step, R->curr->cnt, (size_t)sm_prune_dropped);
             }
@@ -4424,8 +4538,12 @@ static int sm_run_steps(SMRunState *R, int s0, int n,
 
             double t_now = now_ms();
             size_t ram = ram_bytes ? (size_t)ram_bytes : (size_t)8 << 30;
-            const char *mode = sm_should_use_ext(states_in, n_back, ram)
-                               ? "[ext]" : "[sm]";
+            char mode[48];
+            (void)ram;
+            if (sm_last_ext)          snprintf(mode, sizeof mode, "[ext]");
+            else if (sm_last_spilled) snprintf(mode, sizeof mode, "[sm+spill %d/%d]",
+                                               sm_last_spilled, sm_last_runs);
+            else                      snprintf(mode, sizeof mode, "[sm]");
             fprintf(stderr,
                 "%s%4d  %6d  %2d  %6d  %5d  %9zu  %10zu  %8.1f  %8.1f  %-*s  %s\n",
                 tag, step, v, R->fs, n_back, e_bag,
