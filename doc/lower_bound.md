@@ -2926,3 +2926,311 @@ own short note, the cost form to the work-model note), or go straight
 to implementing the enumeration change, since it's small and can't
 change any result?
 
+Question
+========
+Write the design notes (for my records), but also go straight to
+implementing the enumeration change.
+
+Answer
+======
+I'll write a short note for the subset enumeration, then save per-step checksums from the current code, so the change can be compared step by step afterwards.
+
+Baseline saved. Now the change:
+
+Per-step digests and all counts (paths and cycles, sort-merge and EH backends) are identical. Now the back-edge-heavy tests and a timing comparison:
+
+The test that previously ran past the VM's 3-minute limit (`test_many_back_edges[2]`, graphs with a hub vertex of about 9 back-edges) now passes in 39 s. Remaining tests and a G_n timing:
+
+The change is in place. Now the two notes for your records:
+
+The sweep now enumerates only the back-edge subsets of size ≤ 2, and every count and per-step table is unchanged. The two design notes are written.
+
+**Why it's safe (proved in the note):** the new vertex starts with degree 0. After two accepted edges it is interior, or the key is `KEY_CLOSED` at the last step, and `apply_edge` rejects any further edge in both cases. So every subset of size ≥ 3 always failed. Cycle counting only fires on an edge with nothing after it in the subset, so those subsets never added a cycle either. Within each subset the edges are still applied in increasing order.
+
+**The change:** a mask list, the empty set, then singletons, then pairs, used in the three places that looped over all 2^{n_back} subsets:
+- `sm_worker_runs`, the sort-merge DP;
+- `fused_sweep`, the EH backend;
+- `sm_sample_outputs`, the worker-cap sampler.
+
+That's 1 + n_back + C(n_back, 2) masks: 11 instead of 16 at n_back = 4, and 37 instead of 256 at n_back = 8. The legacy15 variant is untouched.
+
+**Checks:**
+- **Identical tables:** per-step checksums are identical before and after for G_41 (BFS ordering, pruned and unpruned), G_50 (kpw ordering, both modes) and G_36.
+- **Identical totals:** paths and cycles, on both the sort-merge and EH backends.
+- **Tests:** the correctness tests (including the comparisons with Held-Karp) and the merge, CRT, worker-cap and kpw tests all pass.
+
+**Effect:**
+- **G_58, n_back ≤ 4:** generating states took 94.8 s before and 83.4 s after (−12%). Total DP time went from 131.7 s to 128.9 s, which is within noise for single VM runs.
+- **Graphs with many back-edges:** `test_many_back_edges[2]`, whose random graphs have a hub vertex with about 9 back-edges, used to exceed the VM's 3-minute limit. It now takes 39 s.
+
+**The notes:**
+- `doc/subset_enumeration_design.md` has the proof, the change, the verification and the timings.
+- `doc/work_model_redesign.md` gains a section on the per-step cost multiplier, between Phase 1 and Phase 2:
+  - 2^{n_back} no longer describes the code;
+  - the cost is better written as α·(masks per input) + β·(outputs per input), using the n = 61 data on how many outputs each input produces;
+  - the exact DAG optimiser accepts any nonnegative per-step multiplier, so no c^{n_back} form is needed;
+  - fitting α and β needs timings from runs that fit in RAM, so it has to be done on the Macs rather than in the VM.
+
+**Before your next runs:** the C source changed twice today, for the worker-cap code and then this enumeration change. Your next run will recompile automatically, and the log header shows the new build key. Your n = 64 run would be a good first test of both changes together: `--worker-cap auto`, the default, with `--instrument` to get the per-step buffer-size line.
+
+Question
+========
+Here's n=63 with the new code. It took essentially the same time as
+with the previous code, but never used external storage
+`new_63_prune_new.txt`
+
+Answer
+======
+That matches what I'd expect: no spills, a count that matches `data/b071983.txt` (121460168051419), and about the same time. That's because your yaml still caps the buffers at 16 M, so on the big steps `auto` chose exactly what the hand-set value was already giving.
+
+| n = 63, M3 Pro 18 GB | 32 M fixed | 16 M fixed | new code (`auto`, max 16 M) |
+|---|---|---|---|
+| DP time | 622.9 s | 601.1 s | 599.4 s |
+| generate | 492 s | 489 s | 479 s |
+| per-worker sorts | 82 s | 57 s | 62 s |
+| merge | 51 s | 54 s | 56 s |
+| steps that spilled | 4 | 0 | 0 |
+| peak RSS | 10.01 GB | 9.36 GB | 9.16 GB |
+
+What the log shows about the new code:
+- **The buffer choice.** It picked 16 M, the yaml maximum, on 32 steps; 25 of those wanted more than that (one worker's share reached 100 M). 1 M on 26 small steps, and 2–8 M on 5 intermediate ones. On every step it judged that the plan fit in RAM, and no step spilled. So the gain over the hand-set 16 M is only the smaller buffers on small steps, which is why peak RSS fell a little and time didn't change.
+- **The output prediction is accurate.** On all 29 steps with more than 50 M contributions, the sampled estimate was within 1% of the actual output (e.g. `pred=509M actual=509M`).
+- **The subset change gained only about 2% in state generation (489 → 479 s)**, within noise. That's expected for G_n, where n_back ≤ 4: 11 masks instead of 16 at most, and the rejected subsets were cheap anyway. The big gains are on graphs with many back-edges.
+- **Headroom.** The largest resident runs reached 6.85 GB against the smallest spill limit of 8.17 GB, so n = 63 fits with about 1.3 GB to spare.
+
+**For n = 64:** if its tables grow by the 1.3–1.7× seen from 61 to 63, the runs at the peak steps would need roughly 9–12 GB. That's more than this machine can hold even with smaller buffers. `auto` will then drop the buffer size towards 1 M on those steps, which frees about 3 GB, and the rest will spill. Expect some spilling at n = 64 on 18 GB, but less than a fixed setting would give. This is an extrapolation.
+
+You can now set `SM_WORKER_CAP` back to 32 M (or leave it out) in
+`yaml/new-machine.yaml`. `auto` treats it only as an upper limit and
+shrinks the buffers itself when memory is short, so the hand-tuned
+value is no longer needed.
+
+Question
+========
+I've wondered about the following: The inclusion-exclusion approaches
+to counting Hamiltonian paths have the advantage that they don't use
+much storage, but they have a bad dependence on n. Is there some
+possibility of using a hybrid algorithm - somehow to use
+inclusion-exclusion on small parts, and then use dynamic programming
+to reassemble them?
+
+Answer
+======
+Partly. The inclusion–exclusion part buys little here, but the "split into pieces and reassemble" part does, because the DP is linear. That gives a real way to trade time for memory, and it would also let one count be spread over several machines.
+
+**Why plain inclusion–exclusion doesn't combine well with the DP.** Karp-style inclusion–exclusion gets polynomial space because it never represents an interface: it sums, over subsets X of the vertices, walk counts that need only a current endpoint. Our DP's memory is already exactly one interface's worth: the table at the widest step is the set of frontier configurations at that cut. Any scheme that computes pieces separately and joins them by DP has to hold, at each cut where pieces meet, a value for every interface configuration that occurs there. So it cannot use less memory than our DP does at those cuts. It can only gain in one of two ways:
+
+1. **Join at narrower cuts and recompute in between.** This is the classical trade. As one survey puts it, there is a simple tradeoff trick, first observed by Lokshtanov et al. [38], which can often be used to reduce the space complexity to polynomial at the cost of increasing the time complexity.
+2. **Compress the interface algebraically**, storing fewer numbers per cut than there are configurations. This is where inclusion–exclusion-style ideas really enter. The relevant theory is sharp:
+   - The rank of M_k over the rationals is 4^k / poly(k), where M_k is the matrix recording which pairs of perfect matchings join into a single cycle.
+   - As a consequence, … Hamiltonian cycles cannot be counted in time O^*((6-ϵ)^pw) for any ϵ>0 unless SETH fails. This bound is tight due to a O∗(6^pw) time algorithm by Bodlaender et al. (ICALP 2013).
+
+   That algorithm works with a basis of size about the rank in place of all pairings. These are worst-case results, though. Our actual tables (about 1.5 × 10^8 states at pathwidth 14, after pruning) are far smaller than the worst case, so I doubt a change of basis would shrink them in practice, and it would make each state dense. This is my judgement, not a measurement.
+
+On polynomial space itself, the theory is discouraging for path decompositions. Pilipczuk and Wrochna relate the question to a conjecture that the Longest Common Subsequence problem parameterized by the number of input strings does not admit an algorithm that simultaneously uses XP time and FPT space. In other words, exponential-in-width space is probably unavoidable for any decomposition-based method. Tree-depth is the exception, but for G_n it is at least the pathwidth plus one, and the time cost of recursing to that depth would be prohibitive.
+
+**What does work for us: batching through the wide region.** Each step is a linear map, from the table at one step to the table at the next. Take two steps a < b around the peak, where the tables at a and b are smaller than the peak. Then:
+- split the table at step a into k batches;
+- run each batch separately through steps a+1 … b;
+- add the k resulting tables together at step b (one more sort-merge) and continue.
+
+The result is exactly the same, by linearity. The peak memory becomes about the step-a and step-b tables plus the largest intermediate table of one batch, instead of the full peak table. The price is duplicated work: two batches can produce the same state before step b, and the merge that would have combined them happens only at b. The duplication factor is Σ_batches |states| / |all states|, step by step. It is a measurable number, and it decides whether this beats spilling to disk.
+
+Two side benefits:
+- **Several machines.** Batches never interact until step b, so a run too large for any one machine could be split across the iMac, the M2 and the Linux box, with only the step-b tables brought together.
+- **Choosing the batches.** Splitting by hash is the default. Splitting by the status of frontier vertices that persist until step b might reduce the duplication; I haven't checked whether such a split exists.
+
+**What it depends on, honestly:**
+- **Narrow cuts.** The memory gain needs a step before the peak, and one after it, whose tables are clearly smaller than the peak. In the n = 61 and 63 logs, the tables stay at 130–176 M states for many steps around the peak, so the narrow cuts may be some distance from it. That makes the duplication worse.
+- **Duplication.** Deduplication reduces the raw output by about 1.6–1.7× per step at these sizes, so a lot of merging does happen and could be lost between batches.
+- **Exact equality.** The algebra guarantees it. Measuring the duplication factor for k = 2, 4 and 8 on n = 58–61 would show whether the scheme pays.
+
+If it helps, I can write this up as a design note: choosing a and b,
+batching, accumulation, and the duplication measurement. The
+measurement needs only a small C entry point that runs a range of
+steps from a given input table, plus a driver. Shall I?
+
+Question
+========
+Write a design note. Since this is more speculative it requires a
+deeper analysis
+
+Here's the results of n=64 with the new code on the M3Pro/18GB laptop: `new_64_prune_new.txt`
+
+Answer
+======
+Here is the design note, with the measurements from n = 63's step profile, the exact duplication runs at n = 36 and 41, and the n = 64 result folded in:
+
+**n = 64** is correct (329054896751390) and took 866.9 s on the 18 GB laptop, against 1551 s for the unpruned run on the 64-core Linux machine. **It never spilled**, and I had predicted it would. The automatic buffer sizing dropped the buffers to 2–8 M entries on the peak steps. The resident runs reached 9.95 GB against a spill limit of 10.17 GB, and peak memory was 9.75 GB. The memory limit on this machine is therefore at least one n further out than I estimated. From n = 63 to 64 the time grew 1.45× and the total number of states 1.43×.
+
+**The hybrid analysis** is in `doc/hybrid_memory_design.md`. In short, the hybrid schemes don't pay for G_n, and the sound way past RAM is to keep the tables on SSD.
+
+1. **Where savings could come from.** Joining a prefix and a suffix at a cut needs a number for every configuration that occurs at the cut, unless the join matrix is factored. So a hybrid can only save memory by joining where few configurations occur, by recomputing instead of storing, or by factoring the join. Inclusion–exclusion does the second completely, at a cost of 2^n. The factoring route is the rank theory: the matching-compatibility matrix on k slots has rank about 4^k, and at our frontier sizes that's about as large as our actual tables.
+2. **The peak is a plateau, not a spike.** At n = 63 the table stays within 17% of its peak for 13 consecutive steps (34–46). A cut-based scheme therefore needs windows of at least 14 steps.
+3. **Splitting the input into batches** is exact, since the DP is linear, but a state reached from several batches gets computed once per batch. I measured this exactly with the Python DP at n = 36 and 41. Over an 8-step window, halving the per-batch peak costs about 3× the work, and quartering it about 6×, and the cost grows with the window length. For the 14-step windows n = 63 would need, I expect it to be worse still; that's not measured.
+
+   A split with no duplicated work exists only if some vertex stays on the frontier through the whole window without gaining a neighbour. At n = 63, no window covering the plateau has such a vertex.
+4. **Meet-in-the-middle and inclusion–exclusion within blocks** don't help. The plateau makes the forward table near its peak at any interior cut, and inclusion–exclusion costs 2^{block size} per transfer entry.
+5. **What works: out-of-core sort-merge.** This keeps the per-step merge, so no work is duplicated, but streams the tables to and from SSD. RAM then no longer depends on table size. At the n = 64 peak that's about 27 GB of SSD traffic per step, roughly 5–9 s at Mac SSD speeds against about 20 s of generation. That's an estimate, not measured. Spreading a run over several machines fits the same design, partitioned by hash, but needs about 10 GB of network traffic per step, so it only pays on 10 GbE.
+
+The note ends with three experiments:
+- the duplication over a window covering the whole plateau, at n = 50–56;
+- a prototype of SSD-resident tables at n = 61 with an artificially small memory budget;
+- fitting how the plateau grows with n, to predict when each machine
+  would need the SSD version.
+  
+Question
+========
+Here's n=65 `new_65_prune_new.txt` Strangely it took less time than
+n=64.
+
+Answer
+======
+It isn't strange once you look at the tables. n = 65 had far fewer states in total, because its high-water region is much shorter, though taller. The count is correct: 780444607816976.
+
+| M3 Pro, 18 GB, same code | n = 63 | n = 64 | n = 65 |
+|---|---|---|---|
+| DP time | 599 s | 867 s | 670 s |
+| states, summed over all steps | 3.25 G | 4.65 G | 2.94 G |
+| steps with > 100 M states | 15 | 24 | 10 |
+| peak table | 176 M | 224 M (step 42) | 279 M (step 40) |
+| profile (Σ frontier sizes) | 706 | 722 | 717 |
+| steps that spilled | 0 | 0 | 2 (1.6 + 3.2 GB) |
+
+- **Why n = 65 was faster.** At n = 64 the tables stay above 100 M states for 24 steps, a long plateau. At n = 65 they climb higher (279 M) but collapse after step 42, from 248 M to 59 M at step 43, a step where four back-edges arrive and several vertices are eliminated at once. Time follows the total number of states, 4.65 G against 2.94 G, not the peak or n. The square-sum graph changes as n grows, since each new vertex adds edges to existing ones and can shorten the plateau, so the difficulty needn't be monotone in n. The old unpruned Linux runs already hinted at this: 1551 s at n = 64 and 1643 s at n = 65, only 6% apart.
+- **The work model missed this.** Its score for the chosen ordering rose from 160.6 at n = 64 to 165.5 at n = 65, while the actual state total fell by 37%. Comparing scores across different graphs isn't what it's designed for, since it is only meant to rank orderings of the same graph. Still, it's one more sign that its absolute values carry little information, which supports the validation plan in the work-model note.
+- **n = 65 is at the memory wall.** Because its peak is taller, two
+  steps spilled even with the smallest buffers (745 and 822 runs,
+  against a limit of 1024). The resident runs sat at the spill limit
+  (9.95 against 9.96 GB). The spills were small and cheap, but n = 66
+  and beyond will need either more RAM or the SSD-resident tables from
+  the hybrid note. That holds unless their tables also happen to
+  collapse early; that depends on each graph and can't be predicted
+  from n alone.
+  
+Question
+========
+In `data/linux_data` are a bunch of profile files. The three most
+recent (from today) are from running the new code.
+
+Answer
+======
+All three Linux runs give the right counts, and they are dramatically faster than before: n = 70 now takes 171 s, against 1635 s in the paper's table.
+
+| Linux, 64 threads, new code | n = 61 | n = 64 | n = 70 |
+|---|---|---|---|
+| DP time | 104.4 s | 158.8 s | 171.3 s |
+| paper's time (unpruned, older code) | 699 s | 1551 s | 1635 s |
+| speed-up | 6.7× | 9.8× | 9.5× |
+| states, summed over steps | 1.85 G | 2.91 G | 2.99 G |
+| peak table | 195 M | 226 M | 239 M |
+| generate / sort / merge | 68 / 11 / 24 s | 101 / 20 / 35 s | 110 / 21 / 39 s |
+| steps that spilled | 0 | 0 | 0 |
+| ordering stage | 29.9 s | 6.6 s | 8.0 s |
+
+**A clean pruning comparison at n = 61.** Yesterday's `new_61_sm_new.txt` used the same ordering (same profile, 627, and work value 6.878e9) without pruning. It took 248.2 s with 6.10 G states. Today's pruned run took 104.4 s with 1.85 G states: 3.3× fewer states and 2.4× faster on 64 threads. Other changes landed in between (subset enumeration, automatic buffers), so not all of the 2.4× is pruning. The state ratio, though, is due to pruning alone.
+
+**The two machines are using different work models, and so are choosing different orderings.** The ordering scores don't match: 6.878e9 and 2.938e10 on Linux, against 155 and 160.6 on the Mac. The profiles differ too: 694 on Linux against 722 on the Mac at n = 64. The `machine.yaml` path on Linux is `…/hamiltonian/claude/machine.yaml`, so its work model is presumably also the one in `hamiltonian/claude/`, while the Mac reads a different `work_model.json`. The difference matters a lot:
+
+| n = 64 | Linux ordering | Mac ordering |
+|---|---|---|
+| states, summed over steps | 2.91 G | 4.65 G |
+| steps with > 100 M states | (shorter plateau) | 24 |
+| peak table | 226 M | 224 M |
+
+**The Linux ordering is 1.6× less work, with the same peak.** That is a concrete case of the model-dependence you were worried about. It's also more evidence for the validation plan in `doc/work_model_redesign.md`: here two fits disagree by a factor of 1.6 in the actual work of the ordering they select.
+
+Two practical points:
+- **Use the same ordering on both machines.** Copy whichever work model is better, Linux's on this evidence, to both machines, or run the Mac with an explicit ordering file. Then the Mac and Linux timings can be compared directly.
+- **Compare per state, not per run.** Per billion states, Linux takes about 55 s and the Mac about 186 s, a ratio of 3.4 for about 10× the threads. That fits the sort-merge being memory-bandwidth-bound rather than core-bound. It's a rough figure, because the orderings differ.
+
+The progressive label cap behaved as designed on Linux. With its work model, n = 61 needs about 1000 labels, so stage 2 took three runs (caps 64, 512, 4096; 29.9 s in all) before reaching the exact optimum. n = 64 and n = 70 needed two.
+
+I could update the paper's results table and the talk2 timing slide
+with these Linux numbers, giving the old and new times side by
+side. Do you want that now, or after you've settled which work model
+to use?
+
+Question
+========
+Agreed: settle the model first, then update the paper and talks once. I checked what's in the repo, and it already explains part of the discrepancy. There are four different work models, fitted on very different data:
+
+| file | runs | n covered | steps | R² (in-sample) |
+|---|---|---|---|---|
+| `work_model.json` (repo root) | 9 | 60 only | 407 | 0.894 |
+| `sri_work_model.json` | 4 | 58, 60, 61, 62 | 177 | 0.872 |
+| `work_m2pro.json` | 1 | 61 | 43 | 0.947 |
+| `data/linux/linux_work_model.json` | 19 | 57–75 | 925 | 0.887 |
+
+The default path, `hamiltonian/claude/work_model.json`, doesn't exist in this checkout, so each machine is using whichever file it has been given. Judging from the scores in the logs, the Linux machine is using a model like `linux_work_model.json`, fitted on 19 runs across n = 57–75. That is the one that picked the ordering with 1.6× fewer states at n = 64. The Mac appears to use the repo-root model fitted only on n = 60. I'm inferring that from the score scales and the files present; I haven't confirmed it on either machine.
+
+Note also that the highest in-sample R² belongs to the model fitted on a single run, which shows why in-sample R² is the wrong criterion for choosing between them.
+
+Phase 1 of `doc/work_model_redesign.md` gives a direct way to settle this. The first step is cheap, because it needs no new fitting: score all four existing models by how well they rank orderings, using held-out n. Data:
+- the experiment-2 orderings at n = 50–56, which already exist;
+- new ordering samples at n = 58–64. These runs are fast on the Linux box: n = 64 takes 2.6 minutes.
+
+The measure is regret: how much worse each model's chosen ordering is than the best one sampled. A refit on that broader data comes after.
+
+Since the Linux machine is now about 5× faster per run than the
+laptop, it is the natural place to generate the n = 58–64 ordering
+samples. Shall I set up the driver for that? It would be a
+`prune_study.py` mode that writes a resumable batch of runs you can
+start there.
+
+
+Question
+========
+In `data/linux_data/new_74_sm_new_pruned.txt` is the run for n=74 on
+the linux machine.
+
+Answer
+======
+**n = 74 on Linux** is correct (2176025661130535741) and took 359.9 s: half of yesterday's 684.6 s with the same ordering, and about a tenth of the paper's 3449 s.
+
+| n = 74, Linux 64 threads, same ordering (profile 862) | yesterday, unpruned | today, pruned |
+|---|---|---|
+| DP time | 684.6 s | 359.9 s |
+| states, summed over steps | 17.0 G | 6.66 G (2.6× fewer) |
+| peak table | 798 M | 361 M |
+| generate / sort / merge | 298 / 199 / 120 s | 263 / 54 / 49 s |
+| 64-bit wrap | at step 68, recovered by a replay modulo a prime | none |
+
+- **The 64-bit wrap is gone.** The snapshots were still taken, because the safe upper bound on the counts exceeded 2^64 (it reached about 2^67), but no count actually wrapped. The likely reason is that the wrap came from counts carried by dead states, which pruning now removes. The final count is below 2^64.
+- **Sorting and merging gained most (3.7×, 2.4×); state generation barely changed (12%).** On 64 cores, generation now takes most of the time. The pruning check runs on every contribution before it's dropped, which offsets part of the saving there.
+
+**The driver** is `hamiltonian/claude/ordering_study.py`, with usage and the hardware plan added to `doc/work_model_redesign.md`. It has three subcommands.
+
+1. **`candidates`**, run once on one machine. For each n it writes `data/ordering_study/cands_<n>.json`, holding:
+   - the exact optimum under each work-model file you list, plus the v7 and v2 optima;
+   - the 3 best orderings under v2, and 16 random samples from the pathwidth-optimal orderings;
+   - every model's predicted cost for every candidate, and an md5 of each model file.
+
+   Generate these on the Linux box. In the VM, without the kpw binaries, one n took over a minute, so I stopped there, and no candidate files exist in the repo yet. Then copy or commit them, so every machine runs exactly the same orderings:
+   ```
+   python -m hamiltonian.claude.ordering_study candidates 58 66 \
+       --models work_model.json data/linux/linux_work_model.json sri_work_model.json work_m2pro.json
+   ```
+2. **`run`**, on each machine; it can be stopped and restarted. For every candidate it runs the pruned DP with full instrumentation and writes one file per run under `data/ordering_study/<host>/`. Each file holds:
+   - the per-step table and the per-step generate, sort, merge and introduce times;
+   - the outputs written, the buffer size and any spills;
+   - the count, checked against `data/b071983.txt`.
+
+   The first run also writes `host.json`: CPU, P and E core counts on macOS, RAM, cache sizes and sharing, and the `machine.yaml` used. The log headers record the compiler, build key and `SM_*` settings.
+   ```
+   python -m hamiltonian.claude.ordering_study run 58 66 --machine-yaml <yaml>
+   ```
+3. **`analyze`** writes `data/ordering_study/analysis.md`. It has two parts:
+   - **Each work model's regret per n,** taken from the state counts, which are the same on every machine:
+     - how much worse its own optimum is than the best candidate;
+     - how much worse its best-scoring candidate is;
+     - the rank correlation between its predictions and the actual counts.
+   - **Per-machine cost coefficients,** in ns per unit:
+     - generation per back-edge subset tried;
+     - generation per output;
+     - sort per output;
+     - merge per run entry.
+
+**Hardware correlation.** Those four coefficients are the machine-dependent part of the cost; the state counts are not. Comparing them across hosts against the fingerprints tests which resource limits each phase. I expect generation to follow core count and clock speed, and sorting and merging to follow memory bandwidth, with the merge also depending on cache size. The fingerprint doesn't yet include memory bandwidth; a STREAM-style probe, possibly added to `cacheprobe.c`, would supply it.
+
+**First result, from a test at n = 44 in the VM (10 candidates):** the repo-root model's optimum came within 1.09× of the best candidate, while the Linux model's optimum was 1.50× worse. That's the opposite of what n = 64 showed, where the Linux model's ordering had 1.6× fewer states. One small n settles nothing, which is why the n = 58–66 runs matter.

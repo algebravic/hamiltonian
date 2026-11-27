@@ -133,3 +133,50 @@ There is no model to bias here, but the cost is K partial runs.
 - The validation covers G_n for n ≤ 56–60 and the orderings in the kpw DAG. Extrapolating to n = 70–75 is not validated.
 - The "best" ordering is the best of about 20 samples, not the true optimum over the DAG. Regret is therefore measured against a sample, and true regret could be larger.
 - The VM has 3 GB of RAM, so its timings involve spilling. The targets are state counts, which do not depend on the machine.
+
+## Driver (implemented 2026-11-27): `hamiltonian/claude/ordering_study.py`
+
+1. **Candidates, once, on one machine.**
+   ```
+   python -m hamiltonian.claude.ordering_study candidates 58 66 \
+       --models work_model.json data/linux/linux_work_model.json sri_work_model.json work_m2pro.json
+   ```
+   - This writes `data/ordering_study/cands_<n>.json` for each n.
+   - Each file holds the exact DAG optimum under each model file, the v7 and v2 optima, the 3 best under v2 and 16 uniform DAG samples.
+   - It also stores every model's predicted work for every candidate, and the md5 of each model file.
+   - Generate these files on a machine that has the kpw binaries; the Linux box is fastest. In the VM, without them, one n took more than a minute. Copy or commit the files so that all machines run identical orderings.
+2. **Runs, on every machine, resumable.**
+   ```
+   python -m hamiltonian.claude.ordering_study run 58 66 --machine-yaml <yaml> [--host NAME]
+   ```
+   Each run is the pruned DP with `-v --instrument`. It writes `data/ordering_study/<host>/run_<n>_<tag>.json` containing:
+   - the per-step table;
+   - the per-step generate, flush, merge and introduce times;
+   - the contributions written, the buffer size and the spills;
+   - the totals, and whether the count matches `data/b071983.txt`.
+
+   The first run on a host writes `host.json`, the machine's fingerprint: CPU, cores (P/E on macOS), RAM, cache sizes and sharing, and the `machine.yaml` contents. Each run's header lines record the compiler, the build key and the `SM_*` settings. Existing results are skipped, so the driver can be stopped and restarted at any time.
+3. **Analysis.** `python -m hamiltonian.claude.ordering_study analyze` writes `data/ordering_study/analysis.md` with:
+   - for each n and each model: the regret of its DAG optimum and of its best-predicted candidate, and its Spearman rank correlation with the actual Σ states (these are machine-independent);
+   - for each host, per-step cost coefficients in ns per unit, fitted on steps with ≥ 1 M input states:
+     - a: generation per mask (s_in × (1 + nb + C(nb, 2)));
+     - b: generation per output;
+     - c: flush per output;
+     - d: merge per run entry;
+     - plus the overall ns per state.
+
+**Correlating with hardware.** The coefficients a–d are the machine-dependent part of the cost; the state counts are not machine-dependent. Comparing a–d across hosts, against the fingerprints (P-core count and frequency, memory bandwidth, L2/LLC size, NUMA), tests which resource each phase is limited by:
+- generation should scale with core count and frequency;
+- flushes and merges with memory bandwidth;
+- the merge also with LLC size, through the number of streams.
+
+Memory bandwidth is not yet in the fingerprint. `src/C/cacheprobe.c` or a STREAM-like probe could add it.
+
+**First check (VM, n = 44, 10 candidates, Σ states with pruning):**
+
+| model | regret of its optimum | Spearman |
+|---|---|---|
+| `work_model.json` | 1.09 | 0.70 |
+| `linux_work_model.json` | 1.50 | 0.49 |
+
+At n = 64 it was the other way round: the Linux model's ordering had 1.6× fewer states. One small n settles nothing, which is the point of running n = 58–66.
