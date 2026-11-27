@@ -779,6 +779,25 @@ static inline u64 apply_elim_seq(u64 nk, int cur_fs,
    No write-combining buffer is needed: EH already groups entries by hash
    prefix, so cache locality comes for free from the bucket structure.
    ====================================================================== */
+/* ======================================================================
+   Back-edge subsets that can be valid (doc/subset_enumeration_design.md).
+   The new vertex v enters with slot 0.  After one chosen edge it is a chain
+   end, after two it is interior (-1) or the key is KEY_CLOSED; apply_edge
+   rejects any further edge at v in both cases.  Hence only the subsets of
+   size <= 2 can produce an output: 1 + nb + nb(nb-1)/2 of the 2^nb.  They
+   are listed as bit masks, edges applied in increasing index order as
+   before, so every output and every cycle count is unchanged.
+   ====================================================================== */
+#define SMALL_SUBSETS_MAX (1 + MAX_NBACK + MAX_NBACK * (MAX_NBACK - 1) / 2)
+static int small_subsets(int nb, int *masks) {
+    int m = 0;
+    masks[m++] = 0;
+    for (int a = 0; a < nb; a++) masks[m++] = 1 << a;
+    for (int a = 0; a < nb; a++)
+        for (int b = a + 1; b < nb; b++) masks[m++] = (1 << a) | (1 << b);
+    return m;
+}
+
 #define FUSED_MIN_STATES 200000
 
 static void fused_sweep(EHT *curr, EHT *nxt,
@@ -787,7 +806,8 @@ static void fused_sweep(EHT *curr, EHT *nxt,
                         const int *elim_idxs_desc, int n_elim,
                         int step, int n, u128 *total, u128 *cycles_total)
 {
-    int n_subsets = 1 << n_back;
+    int masks[SMALL_SUBSETS_MAX];
+    int n_masks = small_subsets(n_back, masks);
 
     eh_reset(nxt);
 
@@ -800,7 +820,8 @@ static void fused_sweep(EHT *curr, EHT *nxt,
             u64  base = bkt->k[i];
             u128 cnt  = bkt->v[i];
 
-            for (int S = 0; S < n_subsets; S++) {
+            for (int mi = 0; mi < n_masks; mi++) {
+                int S = masks[mi];
                 u64 nk    = base;
                 int valid = 1;
 
@@ -2529,7 +2550,8 @@ static size_t sm_wq_claim(SMWorkQueue *wq) {
 static void *sm_worker_runs(void *arg) {
     SMWorker      *w  = (SMWorker*)arg;
     SMWorkerState *ws = w->ws;
-    int n_subsets = 1 << w->n_back;
+    int masks[SMALL_SUBSETS_MAX];
+    int n_masks = small_subsets(w->n_back, masks);
     u128 local_total = 0;
     size_t raw_out = 0, pruned = 0;
 
@@ -2538,7 +2560,8 @@ static void *sm_worker_runs(void *arg) {
     for (size_t i = w->lo; i < w->hi; i++) {
         u64  base = w->in[i].key;
         u64  cnt  = w->in[i].val;
-        for (int S = 0; S < n_subsets; S++) {
+        for (int mi = 0; mi < n_masks; mi++) {
+            int S = masks[mi];
             u64 nk = base; int valid = 1;
             for (int j = 0; j < w->n_back && valid; j++) {
                 if (!(S & (1 << j))) continue;
@@ -3807,9 +3830,12 @@ static size_t sm_sample_outputs(const SMEntry *in, size_t ni, int fs, int v_idx,
     size_t out = 0;
     u128 dummy = 0;
     int last = (step == n - 1);
+    int masks[SMALL_SUBSETS_MAX];
+    int n_masks = small_subsets(n_back, masks);
     for (size_t j = 0; j < S; j++) {
         u64 base = in[(size_t)((double)j * (double)ni / (double)S)].key;
-        for (int Sb = 0; Sb < (1 << n_back); Sb++) {
+        for (int mi = 0; mi < n_masks; mi++) {
+            int Sb = masks[mi];
             u64 nk = base; int valid = 1;
             for (int b = 0; b < n_back && valid; b++) {
                 if (!(Sb & (1 << b))) continue;
