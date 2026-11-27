@@ -109,6 +109,7 @@
   \item MaxSAT for exact pathwidth
   \item Simulated annealing refinement
   \item Multi-start enumeration
+  \item Now: Kobayashi's DP
 \end{itemize}
 \vspace{0.3cm}
 \textbf{\color{midblue}Practical Computation}
@@ -643,6 +644,71 @@ SA \textbf{cannot} cross between distinct topological skeletons without temporar
 \end{columns}
 \end{frame}
 
+\begin{frame}{Now: Kobayashi's DP and a DAG of Optimal Orderings}
+\scriptsize
+\begin{columns}[t]
+\column{0.52\textwidth}
+\textbf{Relevant-set DP}~[Kobayashi 2015]: states are \emph{relevant}
+vertex sets, at most $3^{\tau(G)}$ ($\tau$ = vertex cover number).
+A step's cost does not depend on $k$, so $\pw(G)$ is a
+\textbf{min-bottleneck path} in a DAG of sets.
+\begin{itemize}
+  \item \textbf{One pass}, no bound $k$ supplied; never more work than
+        one decision call at $k=\pw$
+  \item greedy rule of Coudert--Mazauric--Nisse: $2$--$6\times$ fewer sets
+\end{itemize}
+
+\vspace{0.05cm}
+\begin{block}{Keep the whole optimal layer}
+Finish the last level, prune backwards: every source-to-sink path is a
+$\pw$-optimal ordering.
+\begin{center}\vspace{-0.15cm}
+\begin{tabular}{rrrr}
+\toprule
+$n$ & $\pw$ & DAG nodes & orderings \\
+\midrule
+57 & 11 & 13{,}762  & $1.6\cdot10^{26}$ \\
+59 & 13 & 151{,}041 & $2.0\cdot10^{31}$ \\
+61 & 14 & 263{,}672 & $2.2\cdot10^{33}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{-0.15cm}
+{\tiny A strict subfamily of all optimal orderings (block boundaries
+at relevant sets); for $n\le35$ the V2 optimum over it is within
+$0.3$--$1.7\%$ of the global one.}
+\end{block}
+
+\column{0.44\textwidth}
+\textbf{Exact secondary optimisation.}
+Each DP step adds $a+p\,e$ to the cost and multiplies the carried
+state proxy $p$ by $e\,k$. A Pareto-label DP over (cost, $p$) finds the
+\textbf{exact} optimum over the whole DAG: no annealing, no multi-start.
+
+\vspace{0.05cm}
+{\tiny Label caps $64,512,4096,\infty$ with a time budget; the
+result is reported as certified or truncated.}
+
+\vspace{0.05cm}
+\begin{exampleblock}{$n=75$, ordering time}
+\begin{tabular}{lr}
+MaxSAT + SA (April) & $2179$\,s \\
+pathwidth (kpw) & $0.8$\,s \\
++ exact work-model optimum & $22$\,s \\
+\end{tabular}
+\end{exampleblock}
+
+\vspace{0.05cm}
+\textbf{The choice still matters:} over 12 optimal orderings per $n$
+($50\le n\le56$) total states vary $1.4$--$3.0\times$. At $n=75$ the V7
+optimum needed $24\%$ fewer states than the work-model optimum.
+
+\vspace{0.05cm}
+{\tiny Details: V.~Miller, \emph{One-pass bottleneck search for
+linear width parameters} (in preparation).}
+\end{columns}
+\end{frame}
+
 % ==================== PART V: PRACTICAL ====================
 {
 \setbeamercolor{background canvas}{bg=darkblue}
@@ -818,8 +884,8 @@ LP hash table & 149\,s \\
 \vspace{1pt}{\color{midblue}$\downarrow$}\vspace{1pt}
 
 \colorbox{accent!15}{\parbox{0.88\textwidth}{\centering\vspace{3pt}
-  \textbf{MaxSAT finds the exact optimal ordering; SA refines within it.}\\[1pt]
-  A small set of topologically distinct orderings covers the solution space.
+  \textbf{Kobayashi's DP gives the exact $\pw$ and a DAG of optimal orderings.}\\[1pt]
+  A secondary cost is minimised exactly over $\ge10^{26}$ optimal orderings, in seconds.
 \vspace{3pt}}}
 
 \vspace{1pt}{\color{midblue}$\downarrow$}\vspace{1pt}

@@ -98,6 +98,10 @@ of the key, and merged by threads owning disjoint ranges of hash space,
 carried the computation to $n=75$ on a $768$\,GB, $64$-core machine.
 Storing every table in hash order balances the work without any model of
 its cost.
+The orderings now come from a solver based on Kobayashi's dynamic program for
+pathwidth, which finds the exact pathwidth in seconds and represents a very
+large family of pathwidth-optimal orderings as a DAG, over which a secondary
+cost is minimised exactly.
 \end{abstract}
 
 % -------------------------------------------------------
@@ -130,6 +134,8 @@ engineering improvements, each motivated by empirical profiling.
 Section~\ref{sec:eh} describes the extendible-hashing version used up to
 $n=61$ on a laptop, and Section~\ref{sec:sm} the parallel sort--merge version
 used for $62\le n\le 75$.
+Section~\ref{sec:kpw} describes the Kobayashi-based ordering solver that
+replaced the MaxSAT ordering and the annealing.
 Section~\ref{sec:results} summarises the results obtained, and
 Section~\ref{sec:conclusion} concludes.
 
@@ -734,6 +740,85 @@ Moreover, $\Gn$ has a near-linear structure (each vertex connects to a
 bounded neighbourhood in value), so any tree decomposition resembles a
 path decomposition and provides few join nodes to exploit.
 The pathwidth-based path DP is optimal for this problem family.
+
+% -------------------------------------------------------
+\section{Exact Pathwidth and Optimisation over All Optimal Orderings}
+\label{sec:kpw}
+% -------------------------------------------------------
+
+The MaxSAT ordering of Section~\ref{sec:ordering} and the annealing of
+Section~\ref{sec:ordering2} have since been replaced by a solver built on
+Kobayashi's dynamic program for pathwidth~\cite{Kob15}.
+It computes the exact pathwidth in seconds, and, more importantly, it
+represents a very large family of pathwidth-optimal orderings in a compact
+data structure over which a secondary cost can be minimised \emph{exactly}.
+The details, with proofs, are in a separate paper~\cite{MillerPathwidth};
+here we summarise what the frontier DP uses.
+
+\paragraph{One-pass search.}
+Kobayashi's algorithm decides whether $\pw(G)\le k$ by a dynamic program over
+\emph{relevant} vertex sets (sets closed under a natural subsumption
+expansion), of which there are at most $3^{\tau(G)}$, where $\tau$ is the
+vertex cover number~\cite{Kob15,CLTV13}.
+The cost of one step of this dynamic program does not depend on~$k$, so the
+vertex separation number is the value of a minimum-bottleneck path in a DAG
+on relevant sets, and a bucketed Dijkstra-type search finds it in a single
+pass, with an optimal ordering, without any bound~$k$ being supplied.
+This pass never does more work than one call of the decision procedure at
+$k=\pw(G)$.
+A greedy rule from the branch and bound of Coudert, Mazauric and
+Nisse~\cite{CMN14} can be added to the expansion without affecting any
+guarantee; it reduces the number of sets $2$--$6$ times.
+On the benchmark graphs of~\cite{MillerPathwidth} the C implementation is
+$6$--$8$ times faster than the Sage implementation of that branch and bound,
+and $10$--$22$ times faster with the greedy rule.
+
+\paragraph{The DAG of optimal orderings.}
+If the search completes the last level instead of stopping at the first
+optimal ordering, and then discards the sets from which the full vertex set is
+no longer reachable within width $\pw(G)$, the remaining relevant sets form a
+DAG every source-to-sink path of which is a pathwidth-optimal ordering.
+For $G_{57}$, $G_{58}$, $G_{59}$ and $G_{61}$ the DAG has $13{,}762$,
+$45{,}056$, $151{,}041$ and $263{,}672$ nodes and represents at least
+$1.6\cdot10^{26}$, $3.6\cdot10^{28}$, $2.0\cdot10^{31}$ and
+$2.2\cdot10^{33}$ orderings (each expansion block counted once).
+This is a strict subfamily of all pathwidth-optimal orderings: in the frontier
+DP's direction, the boundaries between blocks are exactly the prefixes in
+which every introduced vertex has an eliminated neighbour.
+On small graphs the restriction costs little: for $25\le n\le35$ the optimum
+of the V2 cost of Section~\ref{sec:ordering2} over the DAG is within
+$0.3$--$1.7\%$ of its optimum over all pathwidth-optimal orderings.
+
+\paragraph{Exact secondary optimisation.}
+Every cost used in Section~\ref{sec:ordering2}, and the fitted work model,
+is local to one step of the frontier DP: a step contributes $a+p\,e$ to the
+cost, where $p$ is the carried state-count proxy, and multiplies $p$ by
+$e\,k$.
+Such a cost is minimised exactly over all paths of the DAG by a dynamic
+program that keeps, at each node, the Pareto-optimal pairs (cost so far,
+carried proxy).
+This replaces the simulated annealing: the ordering used for each run is the
+exact optimum of the chosen cost over the DAG, not a local optimum.
+For $G_{75}$ the work-model optimum needs at most $884$ labels at a node.
+On graphs with very many equivalent orderings the label sets can grow large
+(about $2200$ per node for the $9\times9$ grid), so by default the optimiser
+runs with label caps of $64$, $512$, $4096$ and then none, stopping at the
+first untruncated (hence exact) result or when a time budget would be
+exceeded, and reports whether the result is certified optimal.
+
+\paragraph{Effect.}
+For $n=75$ the April pipeline (MaxSAT followed by annealing) took
+$2179$\,s to produce its ordering; on the 64-thread Linux machine the new
+solver finds the pathwidth in $0.8$\,s and the exact optimum of the work model
+over the DAG in $22$\,s.
+The DAG also makes the choice among optimal orderings measurable: for
+$50\le n\le56$, the total number of DP states over $12$ distinct pathwidth-optimal
+orderings per~$n$ (optima of three costs and samples from the DAG) varies
+by a factor of $1.4$--$3.0$ without pruning and $1.4$--$2.2$ with it.
+Which cost picks the best ordering is not yet settled; at $n=75$ the $V_7$
+optimum needed $24\%$ fewer states than the work-model optimum.
+Two different optima from the DAG also gave the independent confirmation of
+$H(75)$ in Section~\ref{sec:results}.
 
 % -------------------------------------------------------
 \section{Memory Efficiency}
@@ -1345,14 +1430,19 @@ The main technical contributions are:
         that own disjoint ranges of hash space.
         Keeping every table in hash order balances the work without a cost
         model.
+  \item An ordering solver based on Kobayashi's dynamic program: exact
+        pathwidth in one pass, a DAG representing about $10^{26}$--$10^{33}$
+        pathwidth-optimal orderings of~$\Gn$, and exact minimisation of a
+        step-local secondary cost over that DAG~\cite{MillerPathwidth}.
   \item Pruning, after Zhao Hui Du, of the states that can no longer be
         completed to a Hamiltonian path (an endpoint budget and a
         connectivity test), which reduces the DP time at $n=61$ by a
         factor of $4.2$.
 \end{enumerate}
 
-The approach is general and can be applied to any sparse graph for which the
-pathwidth is known, using a MaxSAT-based pathwidth solver~\cite{Coudert}.
+The approach is general and can be applied to any sparse graph of moderate
+pathwidth: the ordering solver of Section~\ref{sec:kpw} computes the exact
+pathwidth and an optimised optimal ordering directly.
 
 \paragraph{Acknowledgements.}
 The author thanks Claude (Anthropic) for assistance with algorithm design,
