@@ -210,7 +210,7 @@ from the perturbative regime.
 \end{enumerate}
 
 \emph{What holds.} The zeroth-order predictor, by contrast, works remarkably well; see
-\cref{fig:predictor}. For $31\le n\le74$,
+\cref{fig:predictor}. For $31\le n\le75$,
 $\log\Ham(n)-\log\widehat\Ham(n)$ lies in $[1.89,3.11]$, with standard deviation $0.23$. The
 constant-$C$ formula has standard deviation $0.72$. The new residual varies smoothly, changing
 by at most $0.6$ between consecutive $n$, and usually by less than $0.15$. In particular, the
@@ -224,14 +224,15 @@ degenerates (some entries of $S$ tend to $0$), because $A_{G(n)}$ lacks total su
 \centering
 \includegraphics[width=0.85\linewidth]{../figs/predictor.pdf}
 \caption{Residuals of $\log\Ham(n)$ against the constant-$C$ formula of \cref{tab:resid} and
-against the scaling predictor $\widehat\Ham(n)$, for $31\le n\le75$. The point at $n=75$ is
-the suspect value.}
+against the scaling predictor $\widehat\Ham(n)$, for $31\le n\le75$.}
 \label{fig:predictor}
 \end{figure}
 
-\emph{The value at $n=75$.} Against $\widehat\Ham$ the residual at $n=75$ is $+6.25$, a jump of
-$+4.3$ from a curve that otherwise moves by at most $0.6$ per step. This strengthens the case
-for rechecking $\Ham(75)$.
+\emph{The value at $n=75$.} Against $\widehat\Ham$ the residual of an earlier, withdrawn value of
+$\Ham(75)$ was $+6.25$, a jump of $+4.3$ from a curve that otherwise moves by at most $0.6$ per
+step, and an earlier version of this paper suggested rechecking it. The recomputed value
+$\Ham(75)=9231885593047053408$ (two runs with different optimal orderings, after correcting the
+state encoding for frontier width $15$) has residual $+2.00$, a change of $+0.05$ from $n=74$.
 
 In terms of \eqref{eq:markov}, everything beyond \cref{prob:L1} reduces to one probabilistic
 statement:

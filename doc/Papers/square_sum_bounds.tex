@@ -44,7 +44,7 @@ survives in the limit, which naturally lives on $[0,1]\times\Zhat$ as a singular
 measure. A first-moment computation in this limit predicts
 $\log \Ham(n) = \log n! - \tfrac n2\log n + Cn + o(n)$ with
 $C=-0.632538\ldots$ given by a Schr\"odinger (entropic transport) problem. This is
-consistent with exact counts for $15\le n\le 74$ to within $O(1)$, and lies
+consistent with exact counts for $15\le n\le 75$ to within $O(1)$, and lies
 just below the rigorous Bregman upper bound, whose constant is $B=-0.614954\ldots$.
 The results of \cref{sec:lift,sec:moves} are theorems
 (with computer-verified certificates); those of \cref{sec:limits,sec:heuristic,sec:superexp}
@@ -522,23 +522,27 @@ $n$ & 15 & 25 & 30 & 35 & 40 & 45 & 50 & 55 & 60 & 65 & 70\\
 $r(n)$ & $+1.24$ & $-0.57$ & $-2.68$ & $+0.89$ & $-1.81$ & $+0.10$ & $-1.18$ & $-0.87$ & $-1.81$ & $+0.34$ & $-1.82$\\
 \midrule
 $n$ & 71 & 72 & 73 & 74 & 75\\
-$r(n)$ & $-1.18$ & $-1.50$ & $-1.12$ & $-0.75$ & $+3.92$\\
+$r(n)$ & $-1.18$ & $-1.50$ & $-1.12$ & $-0.75$ & $-0.34$\\
 \bottomrule
 \end{tabular}
 \caption{Residuals $r(n)=\log\Ham(n)-\bigl[\log(n!/2)-\frac{n-1}2\log n+Cn\bigr]$
-(natural logarithms) from \texttt{data/b071983.txt}. For $15\le n\le74$ (all $n$
-with $\Ham(n)>0$), $r(n)\in[-2.68,1.24]$, while $\log\Ham(74)\approx42.2$. On
-$40\le n\le74$ the mean is $-0.70$ and the standard deviation $0.72$. A least-squares
-fit $r=a\log n+b$ gives $a\approx-1.0$, which is consistent with an extra $-\log n$
+(natural logarithms) from \texttt{data/b071983.txt}. For $15\le n\le75$ (all $n$
+with $\Ham(n)>0$), $r(n)\in[-2.68,1.24]$, while $\log\Ham(75)\approx43.7$. On
+$40\le n\le75$ the mean is $-0.69$ and the standard deviation $0.71$. A least-squares
+fit $r=a\log n+b$ gives $a\approx-0.9$, which is consistent with an extra $-\log n$
 term, but the range is short.}
 \label{tab:resid}
 \end{table}
 
 \begin{remark}
-The value at $n=75$ is anomalous: $\Ham(75)/\Ham(74)\approx300$, whereas the ratios
-$\Ham(n+1)/\Ham(n)$ for $70\le n\le73$ are between $2.0$ and $5.2$. The residual jumps by $4.7$.
-Since vertex $75$ has degree $4$ in $G(75)$ (neighbours $6,25,46,69$), we suggest
-rechecking $\Ham(75)$.
+An earlier value of $\Ham(75)$, $652211775281872067084$, was anomalous:
+$\Ham(75)/\Ham(74)\approx300$, whereas the ratios $\Ham(n+1)/\Ham(n)$ for $70\le n\le73$
+are between $2.0$ and $5.2$, and its residual was $+3.92$. On this evidence an earlier
+version of this paper suggested rechecking it. It was wrong: $n=75$ is the first case
+with frontier width $15$, which needs $16$ slots during a step, and the state encoding
+then in use had only $15$. With a corrected encoding, two runs with different optimal
+orderings give $\Ham(75)=9231885593047053408$, so $\Ham(75)/\Ham(74)\approx4.24$ and
+$r(75)=-0.34$. The prediction flagged the error before it was found in the code.
 \end{remark}
 
 \section{Towards superexponential lower bounds}\label{sec:superexp}

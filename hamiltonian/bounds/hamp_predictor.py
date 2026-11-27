@@ -24,7 +24,7 @@ from .squares import adjacency
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data" / "b071983.txt"
-FIG = ROOT / "doc" / "figs" / "predictor.pdf"
+FIG = ROOT / "doc" / "Papers" / "figs" / "predictor.pdf"
 C = -0.632538
 
 
@@ -66,8 +66,8 @@ def main() -> None:
         rows.append((n, r_old, r_new, -pair, logdet, err))
         print(f"{n:3d} r_old={r_old:+.2f} r_scaling={r_new:+.2f}  "
               f"[pair-collision corr={-pair:+.2f}, log det'(I-S)={logdet:+.2f}]  rowerr={err:.0e}")
-    good = np.array([r for r in rows if r[5] < 1e-10 and r[0] <= 74])
-    print(f"converged, n<=74 ({int(good[0,0])}..{int(good[-1,0])}): "
+    good = np.array([r for r in rows if r[5] < 1e-10])
+    print(f"converged ({int(good[0,0])}..{int(good[-1,0])}): "
           f"r_old sd={good[:,1].std():.3f}; r_scaling mean={good[:,2].mean():.3f} sd={good[:,2].std():.3f} "
           f"range [{good[:,2].min():.2f},{good[:,2].max():.2f}]")
     try:

@@ -3233,4 +3233,194 @@ Answer
 
 **Hardware correlation.** Those four coefficients are the machine-dependent part of the cost; the state counts are not. Comparing them across hosts against the fingerprints tests which resource limits each phase. I expect generation to follow core count and clock speed, and sorting and merging to follow memory bandwidth, with the merge also depending on cache size. The fingerprint doesn't yet include memory bandwidth; a STREAM-style probe, possibly added to `cacheprobe.c`, would supply it.
 
-**First result, from a test at n = 44 in the VM (10 candidates):** the repo-root model's optimum came within 1.09× of the best candidate, while the Linux model's optimum was 1.50× worse. That's the opposite of what n = 64 showed, where the Linux model's ordering had 1.6× fewer states. One small n settles nothing, which is why the n = 58–66 runs matter.
+**First result, from a test at n = 44 in the VM (10 candidates):** the
+repo-root model's optimum came within 1.09× of the best candidate,
+while the Linux model's optimum was 1.50× worse. That's the opposite
+of what n = 64 showed, where the Linux model's ordering had 1.6× fewer
+states. One small n settles nothing, which is why the n = 58–66 runs
+matter.
+
+Question
+========
+n=75 finished: `data/linux_data/new_75_sm_new_pruned.txt`
+
+Answer
+======
+n = 75 finished in 1047 s (the paper lists 5851 s), but the count is **not** the one we have on record: 9231885593047053408, against 652211775281872067084 in `data/b071983.txt`.
+
+The value on record is the April result, the one we withdrew after finding the 16-slot bug: n = 75 is the first n with pathwidth 15, where that bug applied. It is still in `data/b071983.txt` and in the paper's table, where it is marked as a single unconfirmed run, and presumably also in the OEIS b-file you submitted. Today's run is the first n = 75 run with the fixed code. Yesterday's `new_75_sm_new.txt` was the pre-fix run that crashed at step 57.
+
+**The ratio test supports the new value** (evidence, not proof):
+
+| n | a(n) | a(n)/a(n−1) |
+|---|---|---|
+| 72 | 132407660925860729 | 2.01 |
+| 73 | 536884024745221467 | 4.05 |
+| 74 | 2176025661130535741 | 4.05 |
+| 75 new | 9231885593047053408 | 4.24 |
+| 75 April (withdrawn) | 652211775281872067084 | 300 |
+
+**Details of the run:**
+- pathwidth 15, 64 threads, nothing spilled;
+- 19.9 G states summed over the steps, with a peak table of 1.23 G states (at step 54);
+- the runs in memory peaked at 47.8 GB.
+- The safe upper bound on the counts reached about 2^69, so snapshots were taken, but no count actually wrapped, and the final value is below 2^64.
+- Choosing the ordering took 21.9 s: three runs of the label cap before the exact optimum.
+
+**Before this goes to the OEIS**, I'd want it confirmed independently. Both of these fit easily on the Linux machine:
+1. **Same ordering, `--prune none`.** This checks the pruning: the tables will be larger, roughly 5× more states going by n = 61–74, so the run should take around an hour.
+2. **A different ordering, with pruning.** For example `--kpw-cost v7`, or `--work-model` pointing at another model file. This exercises a different sequence of states and transitions, so agreement there is strong evidence for the count itself.
+
+If both agree, the record needs updating in three places: the OEIS
+b-file, `data/b071983.txt`, and the paper's table and footnote. I can
+make the last two changes once you've confirmed. I haven't touched
+them yet. The b-file change is yours to submit.
+
+Question
+========
+Is the difference between this and the old value an exact power of 2
+
+Answer
+======
+No. The difference is
+
+  652211775281872067084 − 9231885593047053408 = 642979889688825013676 = 2^2 × 160744972422206253419,
+
+and the second factor is odd. So the two values agree only modulo 4.
+
+It isn't a multiple of 2^64 either. The difference is 34.86 × 2^64, and the old value modulo 2^64 is 6575732702037760524, not the new value. So the old number isn't the new one with some 64-bit wraps added back, and a missed or misapplied wrap correction doesn't explain it. The two values also disagree modulo 2^61 − 1, the first prime used for the CRT replay.
+
+That fits the explanation we already had. The April run had the 16-slot bug: at pathwidth 15, two frontier slots could overlap in the key, so the old code counted a different set of configurations. That kind of error leaves no arithmetic signature like a power of 2 or a multiple of 2^64. It just gives a wrong count. That makes the two confirmation runs (no pruning, and a different ordering) the way to settle the new value, rather than any reconciliation of the two numbers.No. The difference is
+
+  652211775281872067084 − 9231885593047053408 = 642979889688825013676 = 2^2 × 160744972422206253419,
+
+and the second factor is odd. So the two values agree only modulo 4.
+
+It isn't a multiple of 2^64 either. The difference is 34.86 × 2^64, and the old value modulo 2^64 is 6575732702037760524, not the new value. So the old number isn't the new one with some 64-bit wraps added back, and a missed or misapplied wrap correction doesn't explain it. The two values also disagree modulo 2^61 − 1, the first prime used for the CRT replay.
+
+That fits the explanation we already had. The April run had the 16-slot bug: at pathwidth 15, two frontier slots could overlap in the key, so the old code counted a different set of configurations. That kind of error leaves no arithmetic signature like a power of 2 or a multiple of 2^64. It just gives a wrong count. That makes the two confirmation runs (no pruning, and a different ordering) the way to settle the new value, rather than any reconciliation of the two numbers.
+
+Question
+========
+Different n=75 with v7: `data/linux_data/new_75_sm_new_pruned-v7.txt`
+
+Answer
+======
+The v7 run gives exactly the same count, **9231885593047053408**, from a substantially different ordering.
+
+| n = 75, Linux 64 threads, pruned | work-model ordering | v7 ordering |
+|---|---|---|
+| count | 9231885593047053408 | 9231885593047053408 |
+| profile (Σ frontier sizes) | 922 | 911 |
+| vertex positions that differ from the work-model ordering | — | 71 of 75 (from step 0) |
+| states, summed over steps | 19.9 G | 15.2 G |
+| peak table | 1.23 G (step 54) | 1.37 G (step 48) |
+| DP time | 1047 s | 963 s |
+| 64-bit wraps | none | none |
+
+**Why this is strong confirmation.** The two runs put vertices in different positions at 71 of the 75 steps, starting with the very first vertex. So they pass through different frontiers, different state tables and different transitions, and they agree on a 19-digit number. A bug that depends on the state encoding or on particular frontier configurations would almost certainly not produce the same wrong answer on both paths. The kind of error that caused the April value, slots overlapping in the key at width 15, would show up as disagreement here.
+
+**What it doesn't independently check.** Both runs use the same code: the transition rules, the pruning and the sort-merge. A systematic error in the rules themselves would affect both. Two things guard against that, though neither is a check at n = 75 itself: the same code agrees with A071983 for every n up to 74, and with Held-Karp on random graphs of width 16. A `--prune none` run would also check the pruning at n = 75. Given this agreement, I'd consider it optional.
+
+**A side result on the work model.** At n = 75, v7's ordering needed 24% fewer states and was 8% faster than the work model's choice, even though it has the larger peak table. That's another data point that the work model's choices are not reliably the best.
+
+I'm treating a(75) = 9231885593047053408 as confirmed on this evidence. Corrections needed:
+- **OEIS b-file:** replace the old a(75). That's yours to submit.
+- **`data/b071983.txt`:** replace the line for 75.
+- **The paper:**
+  - the table entry, dropping the "single run; not confirmed" footnote;
+  - the text describing n = 75 as unconfirmed and the first total above 2^64. The new value is below 2^64, so n = 75 is no longer the first count to exceed 64 bits;
+  - mention of the withdrawn April value and its cause, the 16-slot overlap, now fixed.
+- **talk2:** the slide that lists n = 75 as not yet cross-checked, and the results slide.
+
+Shall I make the repo, paper and talk changes now? Or, as with the
+timings, would you rather wait until the work-model question is
+settled, and update the paper once?
+
+Question
+========
+Make the repo paper and talk changes now. We'll probably make other
+changes as we refine the parameters. Does the new, duplicated, value
+fit better with the predicted models from the graphops?
+
+Answer
+======
+The repo, paper and talk now carry the corrected a(75). And yes: the new value fits both asymptotic predictions from the bounds paper (the graphop limit) where the old one was a clear outlier.
+
+| n | residual vs constant-C formula r_C | residual vs scaling predictor r_S |
+|---|---|---|
+| 73 | −1.12 | +1.89 |
+| 74 | −0.75 | +1.95 |
+| 75, withdrawn April value | +3.92 | +6.25 |
+| **75, new value** | **−0.34** | **+1.99** |
+
+I recomputed r_C exactly from the paper's formula, log H(n) − [log(n!/2) − ((n−1)/2)·log n + C·n] with C = −0.632538: it gives −0.341 at n = 75, against −0.750 at n = 74.
+
+For r_S I didn't rerun the Sinkhorn predictor. The new value is smaller by a factor of 70.65, so its log is lower by exactly 4.258, and that shift applies equally to both residuals. Hence 6.25 − 4.26 = +1.99.
+
+Both residuals are now in line with their neighbours:
+- **Scaling predictor.** The appendix says r_S moves by at most 0.6 between consecutive n. The new value moves it by +0.04 from n = 74, inside its usual range [1.89, 3.11].
+- **Constant-C formula.** The new r_C of −0.34 is well inside its range of [−2.68, +1.24] for n ≤ 74.
+
+So the "anomalous n = 75" remark in the bounds paper is resolved. The prediction it flagged was right, and the number was wrong.
+
+**Changes made:**
+- **Data:**
+  - `data/b071983.txt` and `data/values.txt`: line 75 now reads 9231885593047053408. Your OEIS b-file still has the old value; that's yours to submit.
+  - `doc/parallel_dp_algorithms.md`: the April run's entry is marked as withdrawn, with the cause.
+- **`hampath_paper_full.tex`:**
+  - The abstract and the conclusion now say n ≤ 75, dropping "provisional".
+  - The table row for 75 has the new value, 1047 s, and a footnote saying it was confirmed by a second ordering.
+  - The paragraph "The value for n = 75" is rewritten. It gives the cause of the old error: at width 15 a step needs 16 slots, and in the old key the 16th slot overlapped the two flag bits. It also covers why the new 16-slot key needs no flags, the Held-Karp tests at width 16, the two orderings that differ in 71 of 75 positions, the ratio of 4.24 and the two residuals.
+  - It notes that the count is below 2^64. Intermediate counts did wrap before pruning, and those wraps were recovered exactly by the CRT replay.
+  - The April-run sentence in the tuning section points to the withdrawal.
+  - The paper compiles without errors.
+- **talk2:**
+  - The correctness slide's "Not yet cross-checked" box is now "n = 75: the April value was wrong", with the cause.
+  - The results slide has the new row and footnote, the width-15 scale bullet updated, and an "n = 75 confirmed" box.
+  - Lesson 11 now says the first answer at the new boundary was in fact wrong.
+  - I checked both slides rendered; the preview images are in `doc/Talks/_to_delete/`.
+
+**Still showing the old value or the anomaly:** the bounds paper
+(`square_sum_bounds.tex`, its long version, `sec_deterministic.tex`
+and `app_data.tex`) and its predictor figure. It reads
+`data/b071983.txt`, so the old a(75) is still in its tables, its
+"rechecking H(75)" remark, and the figure caption calling n = 75 "the
+suspect value". The tables and the remark are quick to fix with the
+residuals above. The figure needs regenerating with the
+`hamp_predictor` script. Shall I update that paper too?
+
+Question
+========
+Update the paper too.
+
+Answer
+======
+The bounds paper, its long version and its talk now use the corrected a(75), and both figures are regenerated. With the new value, n = 75 sits on both prediction curves (residual −0.34 against the constant-C formula, +2.00 against the scaling predictor), and the spike at the right of the figures is gone.
+
+**Text changes:**
+- **`square_sum_bounds.tex` and `square_sum_bounds_long.tex`:**
+  - The abstract now says the formula is consistent with the exact counts for 15 ≤ n ≤ **75**.
+  - In the residual table, r(75) changes from +3.92 to **−0.34**.
+  - The caption's statistics now cover 40 ≤ n ≤ 75: mean −0.69, standard deviation 0.71, and a log-n fit slope of about −0.9 (previously −0.70, 0.72 and −1.0). It now quotes log H(75) ≈ 43.7.
+  - The "anomalous, suggest rechecking" remark is now a short account. It gives the old value and why it was flagged, the cause (width 15 needs 16 slots during a step, and the old encoding had 15), and the confirmed value with its ratio of 4.24 and residual −0.34. It ends: "The prediction flagged the error before it was found in the code."
+- **`sec_deterministic.tex`** (included in both versions):
+  - The predictor's range statement now covers 31 ≤ n ≤ 75. Recomputing with n = 75 included leaves the quoted figures unchanged: the range is [1.89, 3.11] and the standard deviations are 0.23 and 0.72.
+  - "the suspect value" is removed from the figure caption.
+  - The paragraph on n = 75 now records the withdrawn value and the new residual, +2.00, a change of +0.05 from n = 74.
+- **`app_data.tex`:** the count table entry and caption, and the residual row for n = 75 (−0.34 and +2.00).
+- **`app_algorithms.tex`:** the "has not been repeated" sentence now says the value was confirmed by two orderings, after the 15-slot value was withdrawn.
+
+**Talk** (`doc/talk/square_sum_talk.tex`): the data slide's caption now reads 15 ≤ n ≤ 75 and log H(75) = 43.7, and explains the earlier anomaly. I removed "Recompute H(75)" from the open problems.
+
+**Figures and scripts:**
+- **`hamp_predictor.py`:**
+  - Its summary statistics no longer exclude n = 75.
+  - It was writing its figure to `doc/figs/`, but the paper uses `doc/Papers/figs/`, so it had never updated the figure the paper actually shows. I pointed it at the right folder and regenerated `doc/Papers/figs/predictor.pdf`.
+  - The stray copy it had made earlier is in `doc/Papers/_to_delete/`.
+- **`talk_figures.py`:** n = 75 was plotted as a separate red "anomalous" point. It is now an ordinary data point, and `doc/talk/figs/counts.pdf` is regenerated.
+- **`long_data.py`,** which generates `app_data.tex`: I updated its caption string so a regeneration won't bring back "suspect".
+
+**Checked:** the short paper and the talk compile without errors, and I looked at the updated figure page, the remark and the talk slide. The long version couldn't be compiled here because the VM lacks `algorithm.sty`. Its changes are the same text blocks as the short version plus the shared appendix files, but please compile it once on your machine.
+
+The preview images are in `doc/Papers/_to_delete/` and `doc/Talks/_to_delete/`.

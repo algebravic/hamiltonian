@@ -76,7 +76,7 @@ For each positive integer~$n$, define the \emph{square-sum graph}~$\Gn$ to be
 the undirected graph on vertex set $\{1,\ldots,n\}$ in which vertices $i$ and~$j$
 are adjacent if and only if $i+j$ is a perfect square.
 We describe an algorithmic journey to compute the exact number of Hamiltonian
-paths in~$\Gn$ for all~$n \le 74$, and a single unconfirmed value for $n=75$,
+paths in~$\Gn$ for all~$n \le 75$,
 a computation previously limited to $n \le 56$ by memory constraints.
 
 Starting from a \texttt{graphillion}-based ZDD enumeration paired with a
@@ -985,9 +985,10 @@ Sorting, bucketing, splitting and searching now all use $h$.
 The number of threads, \texttt{CAP}, the sizes of the merge block and stream
 buffers, the threshold below which merges are serial, and the last-level
 cache size are read from a per-machine configuration file.
-On the $768$\,GB machine, $n=75$ completed only after these parameters had
-been adjusted by hand: of fourteen attempts, the others aborted when memory
-or storage was exhausted.
+On the $768$\,GB machine, the April run of $n=75$ completed only after these
+parameters had been adjusted by hand: of fourteen attempts, the others aborted
+when memory or storage was exhausted. (Its count was later withdrawn; see
+Section~\ref{sec:results}.)
 For the orderings, the simulated-annealing cost of
 Section~\ref{sec:ordering2} was extended to charge a step that spills to SSD
 two to three times as much as a step of the same size that does not.
@@ -1223,8 +1224,9 @@ machine, and exclude the ordering computation
 (MaxSAT followed by simulated annealing, $5$--$37$ minutes).
 The values for $62\le n\le 74$ were computed with the code of mid-April,
 which used $24$-byte entries and re-sorted the table after each introduce;
-the value for $n=75$ was computed with the later code ($16$-byte entries,
-in-place introduce).
+the value for $n=75$ was computed with the current code ($16$-slot keys and
+pruning, Section~\ref{sec:prune}), twice, with two different optimal orderings
+(see below).
 For $n=74$ four runs gave the same count: the first with the earlier code
 ($3449$\,s, shown in the table), and three with the later code ($945$, $957$
 and $1205$\,s).
@@ -1265,31 +1267,36 @@ $n$ & $\pw$ & $|\text{Ham}(G_n)|$ & DP time\\
 72 & 14 & 132{,}407{,}660{,}925{,}860{,}729 & 2418\,s\\
 73 & 14 & 536{,}884{,}024{,}745{,}221{,}467 & 2079\,s\\
 74 & 14 & 2{,}176{,}025{,}661{,}130{,}535{,}741 & 3449\,s\\
-75 & 15 & 652{,}211{,}775{,}281{,}872{,}067{,}084$^{\dagger}$ & 5851\,s\\
+75 & 15 & 9{,}231{,}885{,}593{,}047{,}053{,}408$^{\dagger}$ & 1047\,s\\
 \bottomrule
-\multicolumn{4}{l}{$^{\dagger}$Single run; not confirmed (see below).}
+\multicolumn{4}{l}{$^{\dagger}$Current code, with pruning; confirmed by a second ordering (see below).}
 \end{tabular}
 \end{table}
 
 \paragraph{The value for $n=75$.}
-The count for $n=75$ comes from one completed run and should be regarded as
-provisional.
-It is the first case in which the frontier reaches width~$15$, the largest
-that the $64$-bit key encoding allows (fifteen $4$-bit slots and two flag
-bits), and the first in which the total exceeds $2^{64}$; no completed run
-before it exercised either.
-Both paths are guarded (the encoding aborts beyond width~$15$, and the
-overflow of a $64$-bit count is detected), but they have not been tested
-against a known answer.
-The value is also out of line with its neighbours:
-$H(75)/H(74)\approx 300$, whereas $H(n)/H(n-1)$ lies between $1.3$ and $6.4$
-for $62\le n\le 74$.
-Two inexpensive checks need no large machine: running a smaller~$n$ with an
-ordering of width~$15$ and comparing with the known count, and running a
-known~$n$ with every initial count multiplied by $2^{40}$ to exercise
-$64$-bit overflow.
-A conclusive check is a second run of $n=75$ with a different optimal
-ordering.
+$n=75$ is the first case in which the frontier reaches width~$15$.
+During a step the frontier briefly holds one more vertex, the one being
+introduced, so a width-$15$ ordering needs $16$ slots.
+The key encoding used in April had fifteen $4$-bit slots and two flag bits;
+the sixteenth slot overlapped the flag bits, and the count it produced,
+$652{,}211{,}775{,}281{,}872{,}067{,}084$, is wrong and is withdrawn.
+It was out of line with its neighbours ($H(75)/H(74)\approx300$, whereas
+$H(n)/H(n-1)$ lies between $1.3$ and $6.4$ for $62\le n\le74$).
+The present encoding uses sixteen $4$-bit slots and no flag bits; the flags
+are not needed (a closed chain before the last step is rejected at once, and
+a closure at the last step is counted at once).
+It agrees with Held--Karp on random graphs whose orderings need exactly
+$16$ slots.
+With it, two runs of $n=75$ with different pathwidth-optimal orderings
+(the work-model optimum and the $V_7$ optimum, which differ in $71$ of the
+$75$ positions) both give $H(75)=9{,}231{,}885{,}593{,}047{,}053{,}408$,
+in $1047$ and $963$\,s on the $64$-core machine.
+Now $H(75)/H(74)\approx4.24$, and the value lies on the asymptotic predictions
+of the companion paper (residual $-0.34$ against the constant-$C$ formula and
+$+1.99$ against the scaling predictor, against $-0.75$ and $+1.95$ at $n=74$).
+The count is below $2^{64}$; no exact count has yet exceeded $64$ bits, although
+intermediate counts did before pruning (Section~\ref{sec:prune}), and their
+wraps were recovered exactly by the Chinese remainder theorem.
 
 \subsection{Alternative formula}
 
@@ -1310,8 +1317,7 @@ dominating set has size $\approx 5n/6$.
 
 We have described an iterative process of algorithmic engineering that extended
 the frontier of exact Hamiltonian path counting in square-sum graphs from
-$n = 56$ (limited by ZDD memory) to $n = 74$, with a provisional value
-for $n=75$.
+$n = 56$ (limited by ZDD memory) to $n = 75$.
 
 The main technical contributions are:
 \begin{enumerate}[nosep]

@@ -171,6 +171,7 @@ The orderings come from the MaxSAT exact-pathwidth solver followed by simulated 
   - 8 steps spilled to disk, with up to 694 runs;
   - run on the 768 GB, 64-core Linux machine, with `machine.yaml` hand-tuned until the run completed;
   - result `ham_paths = 652211775281872067084`.
+  - **Withdrawn (2026-11-27).** This run used the old 15-slot key, in which the in-step frontier of 16 vertices at width 15 overlapped the flag bits. With the fixed 16-slot key (`ham_dp_c.c`), two runs with different optimal orderings (work model and v7) both give 9231885593047053408 (`data/linux_data/new_75_sm_new_pruned*.txt`).
 - The other 13 `profile_75*` logs are aborted attempts that ran out of storage, several of them after reaching width-15 steps. None of them produced a total, so they say nothing about the correctness of the width-15 path. Every completed run with n ≤ 74 has max width 14.
 
 ### Why n = 74 was faster than n = 62–73

@@ -102,14 +102,13 @@ def fig_counts() -> None:
     bn = np.arange(15, 3001, 5)
     bnorm = [(log_upper_bound(int(n)) - (lgamma(n + 1) - n / 2 * log(n))) / n for n in bn]
     fig, ax = plt.subplots(1, 2, figsize=(9, 3.4))
-    ax[0].plot(ns[ns < 75], [log(h) for n, h in data if n < 75], "o", ms=3, label="exact")
+    ax[0].plot(ns, [log(h) for n, h in data], "o", ms=3, label="exact")
     m = np.arange(15, 76)
     pred = [lgamma(k + 1) - log(2) - (k - 1) / 2 * log(k) + C * k for k in m]
     ax[0].plot(m, pred, "-", label="conjecture")
-    ax[0].plot(75, log(dict(data)[75]), "x", color="C3", ms=7, label="$n=75$")
     ax[0].set_xlabel("$n$"); ax[0].set_ylabel("$\\log H(n)$"); ax[0].legend(fontsize=8)
     ax[1].plot(bn, bnorm, "-", color="C2", label="Bregman upper bound (exact)")
-    ax[1].plot(ns[ns < 75], norm[ns < 75], "o", ms=3, label="exact counts")
+    ax[1].plot(ns, norm, "o", ms=3, label="exact counts")
     ax[1].axhline(B, color="C2", ls="--", lw=0.8, label=f"$B={B:.4f}$")
     ax[1].axhline(C, color="C1", ls="--", lw=0.8, label=f"$C={C:.4f}$")
     ax[1].set_xscale("log"); ax[1].set_xlabel("$n$")

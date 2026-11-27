@@ -106,8 +106,8 @@ deduplication by $P$ threads, each owning a disjoint interval of hash space chos
 splitters. Because each table is stored in hash order, a contiguous slice is in effect a random
 sample of states, so static slices balance the very uneven per-state work: the slowest worker
 was within $20\%$ of the mean on the dominant steps. The run for $n=75$ is the only one that
-reaches frontier width $15$ and the only one whose total exceeds $2^{64}$, and it has not been
-repeated. Details of the implementation will appear separately \cite{MillerEngineering}.
+reaches frontier width $15$; its value was confirmed by two runs with different optimal
+orderings, after an earlier value computed with a $15$-slot state encoding was withdrawn. Details of the implementation will appear separately \cite{MillerEngineering}.
 
 \subsection{The lifting step and the glue}
 

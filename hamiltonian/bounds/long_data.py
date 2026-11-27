@@ -92,7 +92,7 @@ For $n\le14$, $\Ham(n)=0$ since $G(n)$ is disconnected.""")
             cells += [str(ns[k]), str(H[ns[k]])] if k < len(ns) else ["", ""]
         w(" & ".join(cells) + r"\\")
     w(r"\bottomrule\end{tabular}")
-    w(r"\caption{Exact values of $\Ham(n)$, $15\le n\le 75$. The value for $n=75$ is suspect; see \cref{subsec:barvinok}.}\label{tab:counts}")
+    w(r"\caption{Exact values of $\Ham(n)$, $15\le n\le 75$. The value for $n=75$ replaces an earlier, withdrawn value; see \cref{subsec:barvinok}.}\label{tab:counts}")
     w(r"\end{table}")
 
     # --- C.2 certificates
