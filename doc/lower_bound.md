@@ -2444,4 +2444,180 @@ your values start at a(60). Your own computation agrees with his a(59)
 = 332409010079 (from `data/b071983.txt`), which is an independent
 confirmation of his term.
 
+Question
+========
+The unpruned version just finished. The log is in
+`new_61_no_prune.txt`
 
+Answer
+======
+With the same machine, build and ordering, pruning makes n = 61 4.2× faster, and the unpruned run gives the same count. Both logs record the same build key, settings, `machine.yaml` and ordering (pathwidth 14, profile 637), so pruning is the only difference between them.
+
+| n = 61, M3 Pro, 18 GB, 6 threads | no pruning | pruning | ratio |
+|---|---|---|---|
+| DP time | 1177.1 s | 282.0 s | **4.17×** |
+| contributions generated | 15.95 G | 4.39 G (of which 1.88 G dropped) | 3.6× |
+| states, summed over steps | 6.52 G | 1.50 G | 4.4× |
+| largest table (step 41) | 702 M states (11.2 GB) | 144 M states (2.3 GB) | 4.9× |
+| peak RSS | 12.08 GB | 8.66 GB | 1.4× |
+| steps that spilled to disk | 11 (up to 25 GB written) | 0 | |
+| generating states (sum of per-step maxima) | 773 s | 228 s | 3.4× |
+| per-worker sorts | 236 s | 32 s | 7.4× |
+| parallel merges | 182 s | 21 s | 8.7× |
+
+Points worth noting:
+- **The gain grows with n.** It was 2.3× at n = 57 in the VM and is 4.2× here. Dead states at one step also cut the work at every later step, and the tables get larger as n grows. The more pruning removes, the more of what remains is spared.
+- **Generating states gains least, 3.4× against 4.4× fewer states.** The pruned run pays for a check on every key, and it still generates the 1.88 G contributions that are then dropped. Applying the test to input states before generating their successors, which was idea 3 in the design note, would attack exactly this part.
+- **Sorting and merging gain more than the reduction in states.** Without pruning, 11 steps spilled to disk on this 18 GB machine, and those sorts and merges ran partly from disk. The pruned run fit in RAM throughout.
+- **Peak RSS falls much less than the tables do.** The worker buffers take a fixed 2 × 6 × 32 M × 16 B ≈ 6.4 GB in both runs. Lowering `SM_WORKER_CAP` in the yaml would now cut the pruned run's peak memory substantially.
+
+These are single runs. The 4.2× is a measurement on one machine, not a general claim.
+
+This pair is a cleaner comparison than any of the VM numbers. I'd like to make it the headline:
+- in the paper, replacing the TODO and extending Table 3;
+- in talk2's time-and-storage slide;
+- in talk1's "How much is dead?" box.
+
+Shall I make those changes now, or wait for the rest of your
+regenerated timings?
+
+Question
+========
+Make them now. When I get more timings we can edit them in. This does
+bring up a more interesting theoretical problem: is it possible to
+predict from the structure of the graph (and maybe the ordering) how
+much pruning we get - even within a small factor would be good. I also
+wonder how much the choice of the orderings achieving pathwidth affect
+that.
+
+
+Answer
+======
+Paper, talk1 and talk2 now use the n = 61 pair. Before answering the theory question, a quick computation to check a bound I want to quote:
+
+I've switched the paper, talk1 and talk2 over to the n = 61 pair; all three compile, and I looked at the changed pages.
+- **Paper:** a new Table 4 gives the time and memory comparison. The TODO is gone, with a comment where the further timings will go, and the conclusion now says 4.2× at n = 61.
+- **talk2:** the timing-and-storage slide is now built around the n = 61 table, with the reasons sorting and merging gain most and peak memory least.
+- **talk1:** the "How much is dead?" box now quotes n = 61: 4.4× fewer states and 4.2× faster.
+
+I also corrected something I had written in both places: "the saving compounds". The table-size ratio at a step is not a product over earlier steps. Without pruning, the table at a step is every reachable state, including successors of states already dead. With pruning, it is the states that passed the tests at every step so far. Their ratio grows along the run, to 4.9 at the largest step of n = 61, because path ends accumulate outside the frontier as vertices are eliminated. The new text says that instead.
+
+### Can the pruning gain be predicted?
+
+Fix the graph and the ordering, and look at one step t. Three sets of states are nested:
+
+- **L_t:** the states used by at least one Hamiltonian path. Pruning by exact completability would leave exactly these.
+- **P_t:** the states the pruned DP keeps. The two tests are only necessary conditions, so P_t ⊇ L_t.
+- **R_t:** the states the unpruned DP keeps, i.e. all reachable ones. R_t ⊇ P_t.
+
+The quantity to predict is Σ|R_t| / Σ|P_t|. The ratio Σ|R_t| / Σ|L_t| would be the ceiling for any further pruning test.
+
+**Pairings alone cannot explain the measured gain.** Every state rejected so far fails the endpoint budget (D). So start with the part of a state that the budget restricts: how the frontier vertices with one edge are paired.
+- Suppose m frontier vertices have degree 1. The unpruned DP can pair them in up to I(m) ways, where I(m) is the number of partial matchings: any number of the m can be "dangling", meaning their chain's other end has already been eliminated.
+- With pruning, at most 2 can be dangling.
+- If every pairing occurred equally often, the ratio of state counts would be:
+
+| m | 8 | 10 | 12 | 13 | 14 | 15 | 16 |
+|---|---|---|---|---|---|---|---|
+| I(m) / (pairings with ≤ 2 dangling) | 1.46 | 1.67 | 1.93 | 4.21 | 2.21 | 5.11 | 2.53 |
+
+At pathwidth 14, m ≤ 14 at any step, so the ratio from pairings is at most about 4.2 (m = 13) and no more than 2.2 for even m. The measured ratio at the largest step of n = 61 is 4.9. So, provided pairings really are near-uniform, most of the gain comes from the other two terms of the budget:
+- frontier vertices with no edges yet and only one neighbour still to come;
+- future vertices with only one usable neighbour.
+
+Both terms depend on the graph and the ordering together. G_n has many vertices of degree 2–3, especially near n. A vertex spends a stretch of the run with a single neighbour still to come before it is eliminated. That stretch is the "frontier sojourn" quantity already in the paper's cost-function section. Its length, and whether the vertex is still untouched during it, is set by the ordering.
+
+**A candidate predictor**, to be tested rather than claimed: for each state, let
+- s = the number of dangling chains;
+- z₁ = the number of untouched frontier vertices with one neighbour still to come;
+- w₁ = the number of future vertices with only one usable neighbour.
+
+A state is dead when s + z₁ + w₁ > 2. The per-step dead fraction could then be estimated from how often each frontier position is in each condition. Those frequencies are cheap to sample at small n, and could probably be approximated from the ordering alone. Whether that gets within a small factor is unknown until it is tested.
+
+### How much does the choice among pathwidth-optimal orderings matter?
+
+I expect it to matter a lot, because the forced-end terms depend on the order and the pathwidth doesn't. There is also a practical consequence. The kpw secondary cost, the fitted work model, was fitted on unpruned runs. With pruning on, it may now rank the optimal orderings in the wrong order. It probably needs refitting, and possibly a new feature: the forced-end opportunities above.
+
+### Experiments that would settle this
+
+1. **The ceiling Σ|L_t|.** At n ≤ 50, keep all the tables, then walk backwards and mark every state that has a live successor. This gives exact counts of completable states. It shows how close the two tests come to exact completability, and whether any further test could gain more.
+2. **Spread across orderings.** For n = 50–56, sample several pathwidth-optimal orderings from the kpw DAG, some k-best by the work model and some random. Run each with `--prune none` and `--prune drop`. Then relate the gain to candidate features: frontier sizes, forced-end opportunities, and sojourn lengths.
+3. **Refit the work model with pruning on,** and see whether kpw then picks different orderings, and faster ones.
+
+All three fit in the VM at these sizes. As you prefer, I'd write a
+short design note first, covering the definitions, the instrumentation
+in the C code, and the feature list, and then run 1 and 2. Shall I go
+ahead?
+
+Question
+========
+Write a design note, but go ahead also. The design note should be
+there in any case.
+
+I finished n=62 on the m3pro, 18GB laptop. Here's the log `new_62_prune.txt`
+
+Answer
+=======
+n = 62 is correct: 19133360717991, the same as `data/b071983.txt`. It took 452.1 s on the 18 GB laptop, against 1049 s on the 64-core Linux machine (the time in the paper's results table, without pruning).
+
+| M3 Pro, 18 GB, 6 threads, pruned | n = 61 | n = 62 | 62/61 |
+|---|---|---|---|
+| DP time | 282.0 s | 452.1 s | 1.60 |
+| states, summed over steps | 1.50 G | 2.51 G | 1.67 |
+| contributions generated | 4.39 G | 7.45 G (3.17 G dropped, 43%) | 1.70 |
+| largest table | 144 M (step 41) | 158 M (step 42) | 1.10 |
+| peak RSS | 8.66 GB | 9.23 GB | |
+| steps that spilled to disk | 0 | 0 | |
+| Linux 64-core time, unpruned | 699 s | 1049 s | 1.50 |
+
+Both runs used the same build and settings. Generating states is again about 80% of the time (367 s), with 53 s in the per-worker sorts and 32 s in the merges. The time grows with the number of states (1.60× against 1.67×), and the largest table barely grows. So n = 63 and 64 at pathwidth 14 should still fit in RAM on this machine. An unpruned n = 62 run would very likely spill, as n = 61 did, so I wouldn't spend 30 minutes on it unless you want the ratio for the paper.
+
+**Where experiment 1 stands.** The study code is written, `prune_study.py`, a Python version of the DP that also finds the live states, with the design note in `doc/prune_prediction_design.md`. Its per-step counts match the C DP exactly at n = 36, 40 and 44, with and without pruning. Before you stopped the last call, it had finished n = 30–42 and n = 44 with the work-optimal ordering. In the table below:
+- ρ is the gain from pruning (total states without pruning, divided by with);
+- the gap is how many states pruning keeps compared with the states that actually lie on a Hamiltonian path (the "live" states);
+- the ceiling, ρ × gap, is the most that any pruning test could gain.
+
+| n | 34 | 36 | 38 | 40 | 41 | 42 | 44 |
+|---|---|---|---|---|---|---|---|
+| ρ | 1.79 | 1.81 | 2.29 | 2.64 | 2.49 | 2.75 | 2.28 |
+| gap | 1.34 | 1.22 | 1.57 | 1.34 | 1.54 | 1.92 | 1.33 |
+| ceiling | 2.39 | 2.20 | 3.58 | 3.55 | 3.82 | 5.29 | 3.04 |
+
+So far the two pruning tests capture most of what is possible: the remaining gap is mostly 1.2–1.6, and 1.9 at n = 42. At most a further factor of about 1.3–1.9 remains for any better test at these n. Whether that gap grows with n is the open question; the Python code is too slow beyond about n = 44 to answer it directly.
+
+The per-step results for each n are only in the VM, under `~/ps`; nothing is in your repo yet. Nothing is running now.
+
+Shall I resume? The plan would be: copy those results into
+`data/prune_study/`, write up experiment 1, including how well the
+independence predictor does, and then run experiment 2, the spread
+over pathwidth-optimal orderings for n = 50–56, using the C code.
+
+Question
+========
+Yes, please resume.
+
+Answer
+======
+Both experiments are done. Writing up the results:
+
+Experiments 1 and 2 are done. The main answer to your question: the pruning gain comes down to how many states have too many path ends, and a simple model of that predicts the gain to within a few percent. I can't yet predict it from the graph and ordering alone. All of this is in the VM at n ≤ 56; the write-up is `doc/prune_prediction_results.md`, beside the design note.
+
+**Experiment 1: exact sets of completable states, n = 30–44, work-optimal ordering**
+
+1. **Predicting the gain reduces to predicting the dead fraction.** At every step of every n, the pruned table is exactly the set of reachable states that pass the tests, with zero difference. So the gain is ρ = Σ|R_t| / Σ|R_t|(1 − d_t), where d_t is the fraction of reachable states that fail. Nothing about how earlier pruning propagates needs to be modelled. This is an empirical observation at these n.
+2. **Dangling chains do most of it.** A dangling chain is one whose other end has already left the frontier, so that end is one of the path's two ends. States with more than two dangling chains make up 31–75% of all dead states, and the share rises with n. Both other terms, frontier vertices with one neighbour left and future vertices with one usable neighbour, rarely kill a state on their own.
+
+   One fact here is proved: **the number of dangling chains never decreases before the last step**, because any transition that removed one would close the path. So a state with three dangling chains has only dead descendants. This explains why the dead fraction rises along a run.
+3. **The independence predictor is accurate.** Treat the three terms of the endpoint budget as independent, using each one's distribution over the reachable states. This predicts the dead fraction to within 0.5–2.9 percentage points, and ρ to within 1–6% for n ≥ 31 (13% at n = 30). The open step is predicting those three distributions from the graph and ordering without running the DP. I suggest a model for that in the results file, but haven't tried it.
+4. **Our tests are close to exact completability.** The pruned DP keeps 1.2–2.2 times as many states as actually lie on a Hamiltonian path, mostly 1.2–1.7. So no better necessary condition could reduce the states by more than that. Whether this gap grows with n needs a C version of the backward pass; the Python code stops being practical around n = 44.
+
+**Experiment 2: 14 pathwidth-optimal orderings per n, n = 50, 52, 54, 56**
+
+5. **The choice of ordering matters.** Summed over all steps, the number of states varies by 1.4–3.0× across these orderings without pruning, and 1.4–2.2× with it. The gain itself varies by about ±15% around its mean at fixed n.
+6. **Pruning narrows the differences.** Orderings that are worse without pruning gain more from it.
+7. **The ranking barely changes.** The rank correlation between unpruned and pruned state counts is 0.89–0.96. The best ordering is the same with and without pruning at 3 of the 4 n; at n = 54 the two best differ by 3.5%. So refitting the work model for pruning (experiment 3) looks low-value at these n, although its time predictions are now off by the factor ρ.
+8. **No ordering-only feature predicts the gain well yet.** The best is the number of forced-end opportunities, rank correlation 0.52–0.87 with ρ. That gets the direction right but is too weak to give ρ within a small factor.
+
+The code is `hamiltonian/claude/prune_study.py`, and the raw results and tables are in `data/prune_study/`; the analysis file can be regenerated from the raw results.
+
+One problem with the file transfer to your machine: an earlier copy of `prune_study.py` arrived on your machine stale, without my last edits. Experiment 1 was run with that copy. It differs only in skipping one sanity check (that every completable state is also in the pruned table) and doing a redundant extra pass, so the numbers stand. The file in the repo is now the current version, and I confirmed the copies match.

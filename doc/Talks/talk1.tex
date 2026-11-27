@@ -372,11 +372,11 @@ frontier: no path has three ends.
 \begin{exampleblock}{How much is dead?}
 \begin{itemize}
   \item $n=52$: \textbf{55\%} of all states
-  \item large steps of $n=58$: 53--75\%
   \item all fail (D); (C) never adds anything here
 \end{itemize}
-Dead states also have no live successors, so the saving compounds:
-$n=58$ needs $2.9\times$ fewer states in total.
+The unpruned table also holds every successor of an earlier dead state:
+at $n=61$, \textbf{4.4$\times$} fewer states in total and the DP is
+\textbf{4.2$\times$} faster (1177\,s $\to$ 282\,s, M3 Pro laptop).
 \end{exampleblock}
 \end{columns}
 \end{frame}

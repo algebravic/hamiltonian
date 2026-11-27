@@ -1109,10 +1109,29 @@ Table~\ref{tab:prune} compares the DP times with and without pruning on a
 four-thread Linux virtual machine; at $n=57$ pruning halves the largest
 table, and at step~$37$ of $n=58$ it reduces the table from $24.5$ to $7.5$
 million states.
-On the M3 iMac with four threads, $n=58$ takes $49.5$\,s of DP time with
-pruning.
-% TODO: add the unpruned time on the iMac with the same ordering
-% (ham_count 58 --sort-merge --prune none --machine-yaml machine.yaml).
+The cleanest comparison is Table~\ref{tab:prune61}: $n=61$ on an M3~Pro
+laptop with $18$\,GB, twice with the same build, configuration and
+ordering, once without and once with pruning.
+Pruning reduces the DP time by a factor of $4.2$, and the states summed
+over all steps by $4.4$.
+Generating the contributions gains least ($3.4\times$), since every key is
+tested and the dropped contributions are still generated; sorting and
+merging gain more than the number of states ($7.4\times$ and $8.7\times$),
+because without pruning eleven steps did not fit in RAM and wrote their
+runs to SSD.
+Peak memory falls by only $1.4\times$: the worker buffers
+($2P\cdot\texttt{CAP}$ entries, $6.4$\,GB here) are the same in both runs.
+The gain grows with~$n$, from $1.5$--$2.3\times$ at $55\le n\le 57$ to
+$4.2\times$ at $n=61$.
+The ratio of table sizes at a step is not a product over earlier steps:
+the unpruned table holds every reachable state, including all successors
+of states that are already dead, and the pruned table holds the states
+that pass the tests at every step so far.
+That ratio grows along the run (at $n=61$ it is $4.9$ at the largest
+step) because the proportion of dead states grows as vertices are
+eliminated and path ends accumulate outside the frontier.
+All of these are single runs.
+% Further timings (n=58 on the iMac, larger n) to be added.
 The runs for $62\le n\le 75$ reported in Section~\ref{sec:results} were made
 without pruning.
 
@@ -1135,6 +1154,30 @@ $n$ & without & with & ratio\\
 \noindent
 For $n=58$ the run without pruning was stopped after step~$37$, at $158.0$\,s;
 the run with pruning reached that step at $64.6$\,s.
+
+\begin{table}[H]
+\centering
+\caption{$n=61$ with and without pruning (M3 Pro, $18$\,GB, $6$ threads,
+same build and ordering, pathwidth $14$; one run each).
+Phase times are sums over the steps of the slowest worker.}
+\label{tab:prune61}
+\begin{tabular}{lrrr}
+\toprule
+ & without & with & ratio\\
+\midrule
+DP time & $1177.1$\,s & $282.0$\,s & $4.17$\\
+contributions generated & $15.95$\,G & $4.39$\,G & $3.6$\\
+\quad of which dropped by pruning & -- & $1.88$\,G & \\
+states, summed over steps & $6.52$\,G & $1.50$\,G & $4.4$\\
+largest table (step 41) & $702$\,M & $144$\,M & $4.9$\\
+peak resident memory & $12.08$\,GB & $8.66$\,GB & $1.4$\\
+steps spilling runs to SSD & $11$ & $0$ & \\
+generate & $773$\,s & $228$\,s & $3.4$\\
+sort (worker flushes) & $236$\,s & $32$\,s & $7.4$\\
+merge & $182$\,s & $21$\,s & $8.7$\\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % -------------------------------------------------------
 \section{Results}
@@ -1298,7 +1341,8 @@ The main technical contributions are:
         model.
   \item Pruning, after Zhao Hui Du, of the states that can no longer be
         completed to a Hamiltonian path (an endpoint budget and a
-        connectivity test), which halves the DP time at $n=57$.
+        connectivity test), which reduces the DP time at $n=61$ by a
+        factor of $4.2$.
 \end{enumerate}
 
 The approach is general and can be applied to any sparse graph for which the
