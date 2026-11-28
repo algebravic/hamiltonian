@@ -109,7 +109,7 @@
   \item MaxSAT for exact pathwidth
   \item Simulated annealing refinement
   \item Multi-start enumeration
-  \item Now: Kobayashi's DP
+  \item New: Kobayashi's DP
 \end{itemize}
 \vspace{0.3cm}
 \textbf{\color{midblue}Practical Computation}
@@ -120,7 +120,7 @@
 \vspace{0.3cm}
 \textbf{\color{midblue}New Results}
 \begin{itemize}
-  \item $|\mathrm{Ham}(G_{61})|$ computed for the first time
+  \item $|\mathrm{Ham}(G_n)|$ for $n\le 75$
   \item What comes next
 \end{itemize}
 \end{columns}
@@ -175,12 +175,13 @@ $n$ & $|\mathrm{Ham}(G_n)|$ \\
 35 & 17{,}175 \\
 45 & 12{,}220{,}138 \\
 57 & 68{,}092{,}497{,}615 \\
-\rowcolor{dkgreen!15}
 61 & 3{,}711{,}439{,}128{,}718 \\
+\rowcolor{dkgreen!15}
+75 & 9{,}231{,}885{,}593{,}047{,}053{,}408 \\
 \bottomrule
 \end{tabular}
 \end{center}
-{\small\color{dkgreen} $n=61$: computed for the first time}
+{\small\color{dkgreen} New values for $n\le 75$ (Part VI)}
 \end{columns}
 \end{frame}
 
@@ -644,7 +645,7 @@ SA \textbf{cannot} cross between distinct topological skeletons without temporar
 \end{columns}
 \end{frame}
 
-\begin{frame}{Now: Kobayashi's DP and a DAG of Optimal Orderings}
+\begin{frame}{New: Kobayashi's DP and a DAG of Optimal Orderings}
 \scriptsize
 \begin{columns}[t]
 \column{0.52\textwidth}
@@ -757,7 +758,8 @@ deduplicate and aggregate.
 
 \vspace{0.15cm}
 {\small $n=61$: 97\,min on M3 Pro.
-Without Talk II engineering: killed by OS.}
+Without Talk II engineering: killed by OS.\\
+Now, with pruning: 282\,s (M3 Pro laptop).}
 \end{columns}
 \end{frame}
 
@@ -811,57 +813,55 @@ Without Talk II engineering: killed by OS.}
 \end{frame}
 }
 
-\begin{frame}{New Values and Computation Summary}
-\begin{columns}[c]
-\column{0.52\textwidth}
-\begin{center}
-\begin{tabular}{rrrr}
+\begin{frame}{New Values: $|\mathrm{Ham}(G_n)|$ for $n\le 75$}
+\footnotesize
+\begin{columns}[t]
+\column{0.50\textwidth}
+\centering
+{\scriptsize
+\renewcommand{\arraystretch}{0.9}
+\begin{tabular}[t]{rrr}
 \toprule
-$n$ & $\pw$ & $|\mathrm{Ham}(G_n)|$ & Time \\
+$n$ & $\pw$ & $|\mathrm{Ham}(G_n)|$ \\
 \midrule
-57 & 11 & 68{,}092{,}497{,}615 & 25\,s \\
-58 & 12 & (computed) & 117\,s \\
-59 & 13 & (computed) & 8.5\,min \\
-60 & 13 & (computed) & $\sim$20\,min \\
+57 & 11 & 68{,}092{,}497{,}615 \\
+58 & 12 & 123{,}092{,}214{,}818 \\
+59 & 13 & 332{,}409{,}010{,}079 \\
+60 & 13 & 783{,}175{,}077{,}980 \\
+61 & 14 & 3{,}711{,}439{,}128{,}718 \\
+62 & 14 & 19{,}133{,}360{,}717{,}991 \\
+63 & 14 & 121{,}460{,}168{,}051{,}419 \\
+64 & 14 & 329{,}054{,}896{,}751{,}390 \\
+65 & 14 & 780{,}444{,}607{,}816{,}976 \\
+66 & 14 & 1{,}389{,}466{,}102{,}344{,}323 \\
+67 & 14 & 2{,}317{,}807{,}210{,}864{,}530 \\
+68 & 14 & 5{,}019{,}822{,}900{,}252{,}036 \\
+69 & 14 & 6{,}697{,}388{,}275{,}608{,}246 \\
+70 & 14 & 12{,}684{,}480{,}251{,}402{,}254 \\
+71 & 14 & 65{,}830{,}124{,}660{,}217{,}873 \\
+72 & 14 & 132{,}407{,}660{,}925{,}860{,}729 \\
+73 & 14 & 536{,}884{,}024{,}745{,}221{,}467 \\
+74 & 14 & 2{,}176{,}025{,}661{,}130{,}535{,}741 \\
 \rowcolor{dkgreen!15}
-61 & 14 & \textbf{3{,}711{,}439{,}128{,}718} & 97\,min \\
+75 & 15 & \textbf{9{,}231{,}885{,}593{,}047{,}053{,}408} \\
 \bottomrule
-\end{tabular}
-\end{center}
+\end{tabular}}
 
-\vspace{0.3cm}
-\textbf{n=61 DP structure:}\\
-Two separate peaks in the step profile:
-\begin{itemize}
-  \item Step 36: $619$M states (25\% of runtime)
-  \item Step 39: $466$M states (13\% of runtime)
-  \item Top 4 steps: 55\% of total runtime
-\end{itemize}
-
-\column{0.44\textwidth}
-\textbf{Algorithmic speedup chain:}
+\column{0.46\textwidth}
+\textbf{Width:} $\pw$ rises $13\to14$ at $n=61$ and $14\to15$ at
+$n=75$; the state count is governed by $\pw$, not by $n$.
 
 \vspace{0.1cm}
-{\small
-\begin{tabular}{lr}
-Naive BFS ordering + byte states & 134\,s \\
-+ Packed \texttt{u64} states & 71\,s \\
-+ Fused B+C sweeps & 43\,s \\
-+ MaxSAT ordering & 43\,s \\
-+ SA refinement & 25\,s \\
-\end{tabular}}
-{\small\color{midblue} (all for $n=57$; $5.4\times$ total)}
+\textbf{Later gains:} storage engineering (Talk~II), pruning dead
+states ($4.2\times$ at $n=61$), and orderings optimised exactly over the
+Kobayashi DAG.
 
-\vspace{0.3cm}
-\textbf{Storage engineering:}\\
-{\small
-\begin{tabular}{lr}
-LP hash table & 149\,s \\
-+ Write-combining buffer & 117\,s \\
-+ Extendible hashing & feasible \\
-+ OS page reclaim & $<2$\,GB RAM \\
-\end{tabular}}
-{\small\color{midblue} (for $n=58$; enables $n=61$)}
+\vspace{0.1cm}
+\begin{block}{Checks}
+{\scriptsize $n=75$: two different optimal orderings give the same count
+(an earlier value, from a run with too few key slots, is withdrawn).
+All values are computed modulo $2^{64}$ with CRT replay when a count wraps.}
+\end{block}
 \end{columns}
 \end{frame}
 
@@ -892,7 +892,7 @@ LP hash table & 149\,s \\
 
 \colorbox{dkgreen!15}{\parbox{0.88\textwidth}{\centering\vspace{3pt}
   \textbf{At scale, the record-merging step dominates.}\\[1pt]
-  Storage-hierarchy-aware engineering enables $n=61$ in 97 minutes.\\[1pt]
+  Storage-aware engineering plus pruning reaches $n=75$ (17\,min DP, 64 cores).\\[1pt]
   Without it, the computation would exhaust RAM and never complete.
 \vspace{3pt}}}
 }
@@ -911,8 +911,8 @@ LP hash table & 149\,s \\
     \begin{tikzpicture}
     \node[fill=midblue,rounded corners,inner sep=10pt,text=white,
           text width=9.5cm,align=center]{
-      \textbf{New result}\\[4pt]
-      $|\mathrm{Ham}(G_{61})| = 3{,}711{,}439{,}128{,}718$\\[6pt]
+      \textbf{New results:} \mbox{$|\mathrm{Ham}(G_n)|$ for $n\le 75$}\\[4pt]
+      $|\mathrm{Ham}(G_{75})| = 9{,}231{,}885{,}593{,}047{,}053{,}408$\\[6pt]
       \textcolor{lightblue}{Talk II: The record-merging engineering problem —\\
       extendible hashing, radix-sort locality, and storage-hierarchy design}};
     \end{tikzpicture}

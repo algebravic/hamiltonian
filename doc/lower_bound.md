@@ -3423,4 +3423,154 @@ The bounds paper, its long version and its talk now use the corrected a(75), and
 
 **Checked:** the short paper and the talk compile without errors, and I looked at the updated figure page, the remark and the talk slide. The long version couldn't be compiled here because the VM lacks `algorithm.sty`. Its changes are the same text blocks as the short version plus the shared appendix files, but please compile it once on your machine.
 
-The preview images are in `doc/Papers/_to_delete/` and `doc/Talks/_to_delete/`.
+The preview images are in `doc/Papers/_to_delete/` and
+`doc/Talks/_to_delete/`.
+
+Question
+========
+Shouldn't the paper mention the much better pathwidth solver derived
+from Kobayashi? Especially the fact that we can now represent all
+orderings of minimal pathwidth in a compact data structure that allows
+us to optimize. The details will be in a separate paper about the
+Kobayashi inspired algorithm.
+
+Answer
+======
+Yes, it should. I've added a new Section 10 to `hampath_paper_full.tex`, "Exact Pathwidth and Optimisation over All Optimal Orderings", just before Memory Efficiency, and it points to your separate pathwidth paper for the details. The paper compiles cleanly: 23 pages, no undefined references.
+
+The wording needs one correction. The DAG does not hold *all* the orderings of minimal pathwidth. It holds a strict subfamily: the ones whose block boundaries fall at relevant sets. In the frontier DP's direction, those are the prefixes where every introduced vertex already has an eliminated neighbour. The paper says this and gives the measured cost: for 25 ≤ n ≤ 35, the V2 optimum over the DAG is within 0.3–1.7% of the optimum over all pathwidth-optimal orderings. The family is still enormous, at least 2.2·10^33 orderings for G_61.
+
+**What the section covers:**
+- **One-pass search:** Kobayashi's relevant-set DP, at most 3^τ sets. Because a step's cost doesn't depend on k, the pathwidth and an optimal ordering come out of one bottleneck search, never more work than one decision call at k = pw. The Coudert–Mazauric–Nisse greedy rule cuts the number of sets 2–6×. Against Sage's branch and bound, the C code is 6–8× faster, or 10–22× with the greedy rule.
+- **The DAG of optimal orderings:**
+  - how it is built: complete the last level, then prune backward;
+  - node counts and ordering counts for n = 57, 58, 59, 61;
+  - the subfamily caveat above.
+- **Exact secondary optimisation:** a step-local cost with a multiplicative carry is minimised exactly over the DAG by a Pareto-label DP, which replaces the simulated annealing. At n = 75 it needs at most 884 labels at a node. Graphs with many equivalent orderings need more (about 2200 for the 9×9 grid), so the default runs with label caps of 64, 512, 4096, then none, and reports whether the result is certified optimal.
+- **Effect:**
+  - n = 75 ordering time drops from 2179 s (April, MaxSAT plus annealing) to 0.8 s for the pathwidth and 22 s for the work-model optimum, on the 64-thread Linux machine. I didn't have a record of which machine the April run used, so the text doesn't claim it was the same one.
+  - For 50 ≤ n ≤ 56, state totals vary 1.4–3.0× across 12 distinct optimal orderings per n (1.4–2.2× with pruning).
+  - At n = 75 the V7 optimum needed 24% fewer states than the work-model optimum (1.52·10^10 vs 1.99·10^10, summed from the two logs).
+  - The two DAG optima also gave the independent confirmation of H(75).
+
+I checked each number against the logs and docs. The draft I wrote before checking had three errors, now fixed: the Sage speedup, "a few hundred labels" (it's 884), and "14 orderings" (12 are distinct).
+
+**Other edits:**
+- The abstract, the intro roadmap and the contributions list now mention the solver.
+- The conclusion's last sentence no longer says the method relies on a MaxSAT pathwidth solver.
+- `square_sum.bib` has four new entries: Kob15, CLTV13 (Chapelle et al., for the 3^τ bound), CMN14, and MillerPathwidth (marked "in preparation").
+
+There are stale `hampath_paper_full.aux` and `.bbl` files in `doc/Papers` from an earlier build. They don't cite the new entries, so run bibtex once when you build locally.
+
+I can add a matching slide to talk1 if you want one.
+
+Question
+========
+Add a matching slide to talk1.
+
+So can the DAG produced by the kobayashi inspired method be used to calculate an exact count of orderings yielding minimum pathwidth?
+
+Answer
+======
+The slide is in place: talk1 slide 17, "Now: Kobayashi's DP and a DAG of Optimal Orderings", placed after the simulated-annealing slide. I also added "Now: Kobayashi's DP" to the outline and rewrote the MaxSAT box of the "Key Insight Cascade" slide. The slide fits on the page.
+
+**Your question: not from the relevant-set DAG.** That DAG can't give the exact number of minimum-pathwidth orderings, for two separate reasons:
+
+1. **Its paths are a strict subfamily.** Many optimal orderings never decompose into blocks that end at relevant sets. Weighting each arc by the number of valid orders inside its block would still miss them, because they aren't on any path. A Kobayashi-style normalisation does map every optimal ordering onto a DAG path, but it's many-to-one, and I don't know a way to count its preimages.
+2. **Even inside the subfamily, the path count is an undercount.** Each expansion block is counted as one fixed order. So 2.2·10^33 for G_61 is the number of DAG paths, a lower bound.
+
+**But an exact count is easy with a different, larger DAG.** In the solver's convention, an ordering has width ≤ pw exactly when each of its prefixes S has at most pw vertices outside S with a neighbour in S. So the number of optimal orderings is the number of paths from ∅ to V through the "feasible" prefix sets. `census.py` in kobayashi-pw already computes this, and I ran it just now:
+
+| n | pw | relevant-DAG paths | exact number of optimal orderings |
+|---|---|---|---|
+| 25 | 4 | 2.1e9 | 8.3e12 |
+| 30 | 5 | 2.6e12 | 1.5e18 |
+| 35 | 5 | 7.6e9 | 2.0e13 |
+| 36 | 6 | 1.0e14 | 4.7e19 |
+| 38 | 7 | 1.2e17 | 5.7e24 |
+| 40 | 7 | 2.9e16 | 1.6e23 |
+
+The DAG paths cover between a few times 10^-4 and 10^-8 of the optimal orderings. Even so, the V2 optimum over the DAG was within 1.7% of the global one, because most of the missing orderings are reshufflings of the same structure.
+
+**How far the exact count can go.** `fullcount.c` stores every layer, which ran out of memory at n=58 on a 7 GB machine (n=57 has 51.7M feasible sets, with a largest layer of 12.8M). For counting alone, a forward pass that keeps only two layers is enough: add each set's count into its successors and read off the count at V. Peak memory is then about two layers, so I'd expect n in the low 60s to fit on the Linux machine. That's an estimate I haven't measured. The counts would pass 2^128 at some point, so the pass would need two 64-bit primes and CRT, as in the main DP. Sizing the family exactly would also make "the DAG is a subfamily" quantitative at the n you actually run.
+
+I can write that forward counter if you want those numbers. It's a
+self-contained C change to kobayashi-pw, so I'd put a short design
+note there first.
+
+Question
+========
+Add the forward counter as a separate program. I intend to submit
+these counts as a new sequence for the OEIS.
+
+On slide 17 of talk1 in the heading should "Now" be "New"? Also the
+numbers in the table on slide 22 should be update to the new values
+through 75, with appropriate changes to the rest of the slide.
+
+And slide 24 should also be updated to n=75.
+
+
+Answer
+======
+Both parts are done. `optcount` is a new standalone program in kobayashi-pw, and it has the counts for G_1 through G_56. The three talk1 slides are fixed too.
+
+## optcount (`src/C/optcount.c`)
+
+It computes pw(G) and the exact number of vertex orderings whose width equals pw(G), for graphs with up to 64 vertices.
+
+- **Method:** it walks forward through the "feasible" prefix sets one layer at a time, keeping only two layers in memory. The count for a set is the sum of the counts of the sets one smaller that lead into it, and the answer is the count for the full vertex set.
+- **Exact integers:** counts are stored with enough 64-bit words to hold n! (5 words at n=64), so there is no modular arithmetic and overflow can't happen.
+- **pw is certified both ways:** the program shows that an ordering of width pw exists and that none of width pw − 1 does. `-p P` starts the search at P, after first checking that P−1 gives 0.
+- **Usage:**
+  - `optcount -s A-B` prints `n a(n)` lines (b-file format); `-l` adds pw and the time.
+  - `-k K` counts orderings of width at most K, with no claim that K is the minimum.
+- **Convention:** the count is the same in your Hamiltonian-path DP's convention, because reversing an ordering maps each prefix's boundary to the other convention's frontier exactly.
+- **Checks** (15 tests, all pass):
+  - brute force over all permutations for G_1 to G_8 and for 12 random graphs;
+  - the independent Python implementation (`census.full_dag`) at n = 26, 30 and 33, plus agreement with the earlier census numbers for 25 ≤ n ≤ 40;
+  - the number of feasible sets matches the older `fullcount` program at n = 50 and n = 55.
+- **Registration:** it's added to `native.py`, the `pyproject` wheel list, the `src/C` Makefile and the README. Nothing is committed.
+
+The first terms (n = 1 onward) are 1, 2, 6, 24, 40, 96, 96, 96, 192, 192, 384, 384, 564960, 257952, …. On the VM every n ≤ 56 took at most 52 s, but n = 57 needs more than its 3 GB. On the Linux machine, memory rather than time should be the limit.
+
+Before you submit to the OEIS:
+- I couldn't search the OEIS from here (its search page blocks automated access), so please search the first terms yourself.
+- The companion sequence pw(G_n) may also be new: 0,0,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,3,…. It's the second column of the data file.
+- The first terms are degenerate: a(1), a(2) = n! because G_1 and G_2 have no edges, and pw = 1 for n = 3..12.
+
+## talk1
+
+- **Slide 17:** the title now says "New:" instead of "Now:", and the outline item matches.
+- **Slide 22**, "New Values: |Ham(G_n)| for n ≤ 75":
+  - the table lists n, pw and |Ham(G_n)| for 57–75, with the n=75 row highlighted;
+  - I removed the n=61 step profile and the speedup chain from the April n=57 runs;
+  - in their place are a note on where pw rises (at n = 61 and n = 75), a short "later gains" note (pruning gave 4.2× at n=61), and a box saying the n=75 value was checked with two different orderings and the earlier value is withdrawn;
+  - I left out per-row times, since you want to wait on timings until the work model is settled.
+- **Slide 24:** it now says "New results: |Ham(G_n)| for n ≤ 75" and gives |Ham(G_75)|.
+
+Two other slides still describe the April state. The graph slide says "n=61: computed for the first time", and the Key Insight Cascade says "enables n=61 in 97 minutes". Tell me if you want those updated too.
+
+Files are in kobayashi-pw:
+- src/C/optcount.c
+- tests/test_optcount.py
+- doc/optcount.md (design, verification, results and a draft OEIS entry)
+- data/optcount_sq.txt
+- data/b_optcount_sq.txt (b-file for n = 1–56)
+
+Question
+========
+Update the other slides
+
+Answer
+======
+I've updated the three other talk1 slides that still described the April state. The talk compiles to 24 pages and I checked each changed slide visually.
+
+- **Slide 4 (The Square-Sum Graph):**
+  - The value table now ends with n = 61 and n = 75, with the n = 75 row highlighted.
+  - The caption "n=61: computed for the first time" now reads "New values for n ≤ 75 (Part VI)".
+- **Slide 19 (The Record-Merging Bottleneck):** I kept the n = 61 scale numbers (619M states, about 20 GB), because they motivate Talk II. After "97 min on M3 Pro" I added "Now, with pruning: 282 s (M3 Pro laptop)". I didn't say "same laptop" because I don't know whether the April 97-minute run used the same machine.
+- **Slide 23 (Key Insight Cascade):** the last box now says "Storage-aware engineering plus pruning reaches n = 75 (17 min DP, 64 cores)". The 17 minutes is the 1047 s DP-only time from the work-model-ordering run.
+
+Both times are measured values from the logs, but they will change once the work model is settled. They're the only timings I added to talk1.
+
+I left the Part IV slides on MaxSAT and simulated annealing as they were. They're the historical pipeline, and the new Kobayashi slide follows them. Say if you want them labelled as the earlier method or shortened.
